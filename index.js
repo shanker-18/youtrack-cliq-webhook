@@ -1,44 +1,55 @@
+// Enable CommonJS in ES Module Mode
 import express from "express";
-import axios from "axios";
+import bodyParser from "body-parser";
+import fetch from "node-fetch";
 
 const app = express();
-app.use(express.json());
+const PORT = process.env.PORT || 10000;
 
-app.get("/", (req, res) => {
-  res.send("Webhook Server Running 🚀");
-});
+app.use(bodyParser.json());
 
-// Zoho Cliq Webhook URL
-const CLIQ_WEBHOOK_URL =
+// Your Zoho Cliq Webhook URL
+const cliqWebhookUrl =
   "https://cliq.zoho.com/company/906676903/api/v2/channelsbyname/youtracknotificationsw/message?zapikey=1001.48f465d42dd92edf2c111a4c3bfe1e91.a24a042a7cba86673608f042feb2aa18";
 
+// ➜ GET Route - Browser shows service running
+app.get("/", (req, res) => {
+  res.send(`Webhook Server Running 🚀`);
+});
+
+// ➜ POST Route - Receive YouTrack webhooks here
 app.post("/webhook", async (req, res) => {
   console.log("📩 Webhook received from YouTrack:", req.body);
 
+  const issue = req.body; // Payload from YouTrack workflow
+
+  const cliqPayload = {
+    text: `🆕 Issue Update:\n` +
+      `ID: ${issue.id || "N/A"}\n` +
+      `Title: ${issue.summary || "N/A"}\n` +
+      `Status: ${issue.status || "N/A"}\n` +
+      `Priority: ${issue.priority || "N/A"}\n` +
+      `Assignee: ${issue.assignee || "N/A"}\n` +
+      `Type: ${issue.type || "N/A"}`
+  };
+
+  // Send to Zoho Cliq
   try {
-    const issue = req.body;
+    const response = await fetch(cliqWebhookUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(cliqPayload),
+    });
 
-    const message = {
-      text: `🆕 Issue Update:
-ID: ${issue.id}
-Title: ${issue.summary}
-Status: ${issue.status}
-Priority: ${issue.priority}
-Assignee: ${issue.assignee}
-Type: ${issue.type}`
-    };
-
-    const response = await axios.post(CLIQ_WEBHOOK_URL, message);
-
-    console.log("📤 Sent to Zoho Cliq:", response.data);
-
-    res.status(200).send("Message forwarded to Zoho Cliq!");
+    console.log("📤 Sent to Zoho Cliq");
+    res.send("Message forwarded to Zoho Cliq!");
   } catch (err) {
-    console.error("❌ Error sending to Cliq:", err.message);
-    res.status(500).send("Failed to forward to Zoho Cliq");
+    console.error("❌ Error sending to Cliq:", err);
+    res.status(500).send("Failed to deliver message to Cliq");
   }
 });
 
-// Render assigned PORT
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`🚀 Server Live on PORT ${PORT}`));
+// Start Server
+app.listen(PORT, () =>
+  console.log(`🚀 Server Live on PORT ${PORT}`)
+);
