@@ -5,7 +5,7 @@ const axios = require("axios");
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// parse JSON coming from YouTrack
+
 app.use(bodyParser.json());
 
 // ✅ Your Zoho Cliq webhook URL
