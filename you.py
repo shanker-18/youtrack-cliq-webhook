@@ -1,14 +1,15 @@
 from dash import html
 import dash_bootstrap_components as dbc
-try:
-    from auth.session import get_current_user, is_authenticated
-except ImportError:
-    def get_current_user(): return {}
-    def is_authenticated(): return False
 
 def render_global_header():
-    user = get_current_user() or {}
-    authenticated = is_authenticated()
+    try:
+        from auth.session import get_current_user, is_authenticated
+        user = get_current_user() or {}
+        authenticated = is_authenticated()
+    except Exception:
+        user = {}
+        authenticated = False
+
     user_name = user.get("display_name", "Guest User")
     user_email = user.get("email", "")
     gbu_name = user.get("gbu_name", "No GBU")
@@ -56,8 +57,6 @@ def render_global_header():
             user_section
         ]
     )
-
-
 
 
 
