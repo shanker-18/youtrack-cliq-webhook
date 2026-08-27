@@ -3,6 +3,8 @@ from dash import html, dcc
 import dash_bootstrap_components as dbc
 from components.header import render_global_header
 
+dash.register_page(__name__, path="/", name="Home", title="Home - NA IBP Planning")
+
 TRUST_GREEN = "#019881"
 DARK_TEAL = "#006857"
 LIGHT_MINT = "#E6F5F2"
@@ -152,20 +154,9 @@ def make_table(title, headers, rows_data, is_bb=False):
     ])
 
 def build_sidebar():
-    brand = html.Div(
-        style={"height": "64px", "padding": "0 18px", "display": "flex", "alignItems": "center", "gap": "10px", "borderBottom": f"1px solid {BORDER}", "boxSizing": "border-box"},
-        children=[
-            html.Div("K", style={"width": "32px", "height": "32px", "background": TRUST_GREEN, "borderRadius": "6px", "display": "flex", "alignItems": "center", "justifyContent": "center", "color": "#ffffff", "fontWeight": "900", "fontSize": "1.1rem"}),
-            html.Div([
-                html.Div("KENVUE", style={"fontSize": "1rem", "fontWeight": "900", "color": TRUST_GREEN, "letterSpacing": "0.02em"}),
-                html.Div("IBP Planning", style={"fontSize": "0.72rem", "fontWeight": "700", "color": TEXT_DARK})
-            ])
-        ]
-    )
-
     nav = html.Div(
-        style={"display": "flex", "alignItems": "center", "gap": "8px", "padding": "9px 14px", "color": DARK_TEAL, "backgroundColor": LIGHT_MINT, "borderRadius": "8px", "fontSize": "0.84rem", "fontWeight": "800", "margin": "12px 10px", "boxSizing": "border-box"},
-        children=[html.I(className="bi bi-house-door-fill", style={"fontSize": "0.95rem"}), html.Span("Home")]
+        style={"display": "flex", "alignItems": "center", "gap": "8px", "padding": "10px 16px", "color": DARK_TEAL, "backgroundColor": LIGHT_MINT, "borderRadius": "8px", "fontSize": "0.88rem", "fontWeight": "800", "margin": "16px 12px", "boxSizing": "border-box"},
+        children=[html.I(className="bi bi-house-door-fill", style={"fontSize": "1rem"}), html.Span("Home")]
     )
 
     footer = html.Div(
@@ -174,8 +165,8 @@ def build_sidebar():
     )
 
     return html.Div(
-        style={"width": "280px", "minWidth": "280px", "backgroundColor": SIDEBAR_BG, "borderRight": f"1px solid {BORDER}", "display": "flex", "flexDirection": "column", "position": "fixed", "top": "0", "bottom": "0", "left": "0", "zIndex": "100", "boxSizing": "border-box"},
-        children=[brand, nav, html.Div(style={"flex": "1"}), footer]
+        style={"width": "280px", "minWidth": "280px", "backgroundColor": SIDEBAR_BG, "borderRight": f"1px solid {BORDER}", "display": "flex", "flexDirection": "column", "position": "fixed", "top": "64px", "bottom": "0", "left": "0", "zIndex": "100", "boxSizing": "border-box"},
+        children=[nav, html.Div(style={"flex": "1"}), footer]
     )
 
 def build_home_content():
@@ -189,18 +180,37 @@ def build_home_content():
     doc_container = html.Div(style={"backgroundColor": "#FFFFFF", "border": f"1px solid {BORDER}", "borderRadius": "10px", "padding": "28px 32px", "width": "100%", "maxWidth": "100%", "boxSizing": "border-box", "boxShadow": "0 4px 20px -2px rgba(1, 152, 129, 0.06)", "overflowX": "hidden"}, children=[hero, purpose, divider(), scope, divider(), make_table("Key Terms:", ["Term", "Definition"], KEY_TERMS), divider(), make_table("Roles and Responsibilities", ["Role", "Responsibilities"], ROLES_AND_RESPONSIBILITIES), divider(), list_box("POS-Based Forecasting", POS_BASED_FORECASTING), divider(), eq_box("Consumption:", CONSUMPTION_EQ), divider(), eq_box("Shipments:", SHIPMENT_EQ), divider(), future, divider(), list_box("Value to the Business:", VALUE_TO_BUSINESS), divider(), make_table("1) Consumer POS Consumption Building Blocks (Marketing)", ["Building Block Name", "Definition", "Standardized Methodology/Approach"], CONSUMER_POS_BUILDING_BLOCKS, is_bb=True), divider(), make_table("2) Retailer POS & Shipment Building Blocks (Sales Strategy)", ["Building Block Name", "Definition", "Standardized Methodology/Approach"], RETAILER_POS_BUILDING_BLOCKS, is_bb=True), divider(), make_table("3) Operational/Conversion Shipment Building Blocks (All)", ["Building Block Name", "Definition", "Standardized Methodology/Approach"], OPERATIONAL_CONVERSION_BUILDING_BLOCKS, is_bb=True), divider(), make_table("4) Portfolio Changes POS & Shipment Building Blocks (Marketing)", ["Building Block Name", "Definition", "Standardized Methodology/Approach"], PORTFOLIO_CHANGES_BUILDING_BLOCKS, is_bb=True)])
     return html.Div(style={"padding": "20px 24px", "width": "100%", "maxWidth": "100%", "boxSizing": "border-box"}, children=[doc_container])
 
-app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP, dbc.icons.BOOTSTRAP], suppress_callback_exceptions=True)
-app.title = "Kenvue Integrated Business Planning"
-app.layout = html.Div(
-    style={"display": "flex", "minHeight": "100vh", "width": "100%", "maxWidth": "100%", "backgroundColor": BG, "fontFamily": "'Inter', 'Kenvue Sans', system-ui, -apple-system, sans-serif", "color": TEXT_DARK, "overflowX": "hidden", "boxSizing": "border-box"},
-    children=[
-        build_sidebar(),
-        html.Div(
-            style={"marginLeft": "280px", "flex": "1", "display": "flex", "flexDirection": "column", "backgroundColor": BG, "minHeight": "100vh", "width": "calc(100% - 280px)", "maxWidth": "calc(100% - 280px)", "overflowX": "hidden", "boxSizing": "border-box"},
-            children=[render_global_header(), html.Div(id="content", children=build_home_content(), style={"flex": "1", "width": "100%", "maxWidth": "100%", "boxSizing": "border-box"})]
-        )
-    ]
-)
-
-if __name__ == "__main__":
-    app.run(debug=False, host="127.0.0.1", port=8050)
+def layout():
+    return html.Div(
+        style={
+            "display": "flex",
+            "minHeight": "100vh",
+            "width": "100%",
+            "backgroundColor": BG,
+            "fontFamily": "'Inter', 'Kenvue Sans', system-ui, -apple-system, sans-serif",
+            "color": TEXT_DARK,
+            "overflowX": "hidden",
+            "boxSizing": "border-box",
+        },
+        children=[
+            build_sidebar(),
+            html.Div(
+                style={
+                    "marginLeft": "280px",
+                    "flex": "1",
+                    "minHeight": "100vh",
+                    "backgroundColor": BG,
+                    "overflowX": "hidden",
+                    "boxSizing": "border-box",
+                },
+                children=[
+                    render_global_header(),
+                    html.Div(
+                        id="content",
+                        children=build_home_content(),
+                        style={"flex": "1", "width": "100%", "boxSizing": "border-box"},
+                    ),
+                ],
+            ),
+        ],
+    )
