@@ -1,3 +1,20 @@
+import os
+
+# Kenvue NA IBP Validation Dashboard Stylesheet (Python Module)
+
+COLOR_TRUST_GREEN = "#005A38"
+COLOR_TRUST_GREEN_DARK = "#004229"
+COLOR_CARE_YELLOW = "#FFB800"
+COLOR_EMPATHY_PURPLE = "#6A2676"
+COLOR_COURAGE_CORAL = "#E05A47"
+COLOR_BG_LIGHT = "#F8F9FA"
+COLOR_CARD_BG = "#FFFFFF"
+COLOR_TEXT_MAIN = "#212529"
+COLOR_TEXT_MUTED = "#6C757D"
+COLOR_BORDER = "#E9ECEF"
+
+# Raw CSS string for Dash application
+RAW_CSS = """
 :root {
   --kenvue-trust-green: #005A38;
   --kenvue-trust-green-dark: #004229;
@@ -255,3 +272,13 @@ body {
   font-weight: 600 !important;
   border-radius: 6px !important;
 }
+"""
+
+def generate_css_file():
+    assets_dir = os.path.join(os.path.dirname(__file__), "assets")
+    os.makedirs(assets_dir, exist_ok=True)
+    css_path = os.path.join(assets_dir, "style.css")
+    with open(css_path, "w", encoding="utf-8") as f:
+        f.write(RAW_CSS.strip())
+
+generate_css_file()
