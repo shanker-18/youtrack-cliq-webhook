@@ -1,3 +1,14 @@
+dash>=2.14.0
+dash-bootstrap-components>=1.5.0
+pandas>=2.0.0
+plotly>=5.18.0
+snowflake-connector-python>=3.5.0
+psycopg2-binary>=2.9.9
+python-dotenv>=1.0.0
+
+
+
+
 # Snowflake Source Database Configuration
 SNOWFLAKE_ACCOUNT=KIPOMDM-FU17930
 SNOWFLAKE_USER=MANI
@@ -18,6 +29,34 @@ POSTGRES_PORT=5433
 POSTGRES_DATABASE=kenvue_ibp
 POSTGRES_USER=postgres
 POSTGRES_PASSWORD=Manian@18
+
+# Target Table Unique Keys for UPSERT (Normalized Lowercase)
+POSTGRES_PLANNING_KEY=planning_id
+POSTGRES_CONSUMPTION_KEY=consumption_id
+POSTGRES_SHIPMENT_KEY=shipment_id
+
+
+
+# Snowflake Source Database Configuration
+SNOWFLAKE_ACCOUNT=
+SNOWFLAKE_USER=
+SNOWFLAKE_PASSWORD=
+SNOWFLAKE_WAREHOUSE=
+SNOWFLAKE_DATABASE=
+SNOWFLAKE_SCHEMA=
+SNOWFLAKE_ROLE=
+
+# Snowflake Source Table Names
+SNOWFLAKE_PLANNING_TABLE=PLANNING_DATA
+SNOWFLAKE_CONSUMPTION_TABLE=CONSUMPTION_DATA
+SNOWFLAKE_SHIPMENT_TABLE=SHIPMENT_DATA
+
+# PostgreSQL Application Database Configuration
+POSTGRES_HOST=localhost
+POSTGRES_PORT=5432
+POSTGRES_DATABASE=kenvue_ibp
+POSTGRES_USER=postgres
+POSTGRES_PASSWORD=
 
 # Target Table Unique Keys for UPSERT (Normalized Lowercase)
 POSTGRES_PLANNING_KEY=planning_id
