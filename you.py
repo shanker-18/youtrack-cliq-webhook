@@ -377,6 +377,25 @@ def update_dashboard(n_clicks, gbu, squad, model, c_clicks, s_clicks, active_tab
             "opacity": "1.0" if can_refresh else "0.6"
         }
 
+        active_nav_style = {
+            "backgroundColor": "#019881", "color": "#ffffff", "width": "134px", "padding": "12px 8px",
+            "minHeight": "105px", "borderRadius": "12px", "display": "flex", "flexDirection": "column",
+            "alignItems": "center", "justifyContent": "center", "cursor": "pointer",
+            "boxShadow": "0 2px 6px rgba(0,0,0,0.2)", "border": "none", "textDecoration": "none"
+        }
+        inactive_nav_style = {
+            "backgroundColor": "transparent", "color": "#ffffff", "width": "134px", "padding": "12px 8px",
+            "minHeight": "105px", "borderRadius": "12px", "display": "flex", "flexDirection": "column",
+            "alignItems": "center", "justifyContent": "center", "cursor": "pointer",
+            "opacity": "0.85", "border": "none", "textDecoration": "none"
+        }
+
+        if active_tab == "shipments":
+            nav_cons_style = inactive_nav_style
+            nav_ship_style = active_nav_style
+        else:
+            nav_cons_style = active_nav_style
+            nav_ship_style = inactive_nav_style
 
         if triggered_id in ["filter-gbu", "filter-squad", "filter-model"]:
             print(f"\nFilter changed ('{triggered_id}') -> returning lightweight dropdown updates")
