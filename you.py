@@ -1,30 +1,51 @@
 import os
 import sys
 import re
-import warnings
-from typing import Optional, Dict, List
+import math
 import pandas as pd
-import snowflake.connector
-from snowflake.connector.errors import DatabaseError, ProgrammingError, OperationalError
-from dotenv import load_dotenv
+import numpy as np
+import dash
+from dash import dcc, html, Input, Output, State
+import dash_bootstrap_components as dbc
 
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.backends import default_backend
+import database
 
-warnings.filterwarnings('ignore', category=UserWarning)
-load_dotenv()
+# Initialize Dash App for Shipment Validation Dashboard
+app = dash.Dash(
+    __name__,
+    external_stylesheets=[dbc.themes.BOOTSTRAP],
+    suppress_callback_exceptions=True,
+    title="Shipment Validation Dashboard"
+)
+server = app.server
 
-_cached_connection = None
+# Months Constant
+MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
+
+# Standardized Hierarchy Column Names required by Updated Mapping 2.xlsx / Book1.xlsx
+EXCEL_HIERARCHY_COLUMNS = [
+    "GLOBAL_GMC_C1_BUSINESS_SEGMENT_DESC",
+    "GLOBAL_GMC_C2_BUSINESS_SUB_SEGMENT_DESC",
+    "GLOBAL_GMC_C3_NEED_STATE_DESC",
+    "GLOBAL_GMC_C4_CATEGORY_DESC",
+    "GLOBAL_GMC_C5_SUB_CATEGORY_DESC",
+    "GLOBAL_GMC_B1_BRAND_DESC",
+    "GLOBAL_GMC_B2_SUB_BRAND_DESC"
+]
+
+HIERARCHY_ALIAS_MAP = {
+    "GLOBAL_GMC_C1_BUSINESS_SEGMENT_DESC": ["GLOBAL_GMC_C1_BUSINESS_SEGMENT_DESC", "C1_BUSINESS_SEGMENT_DESC", "POS_BUSINESS_SEGMENT", "BUSINESS_SEGMENT"],
+    "GLOBAL_GMC_C2_BUSINESS_SUB_SEGMENT_DESC": ["GLOBAL_GMC_C2_BUSINESS_SUB_SEGMENT_DESC", "C2_BUSINESS_SUB_SEGMENT_DESC", "POS_BUSINESS_SUB_SEGMENT", "BUSINESS_SUB_SEGMENT"],
+    "GLOBAL_GMC_C3_NEED_STATE_DESC": ["GLOBAL_GMC_C3_NEED_STATE_DESC", "C3_NEED_STATE_DESC", "POS_NEED_STATE", "NEED_STATE"],
+    "GLOBAL_GMC_C4_CATEGORY_DESC": ["GLOBAL_GMC_C4_CATEGORY_DESC", "C4_CATEGORY_DESC", "POS_CATEGORY", "CATEGORY"],
+    "GLOBAL_GMC_C5_SUB_CATEGORY_DESC": ["GLOBAL_GMC_C5_SUB_CATEGORY_DESC", "C5_SUB_CATEGORY_DESC", "POS_SUB_CATEGORY", "SUB_CATEGORY"],
+    "GLOBAL_GMC_B1_BRAND_DESC": ["GLOBAL_GMC_B1_BRAND_DESC", "B1_BRAND_DESC", "POS_BRAND", "BRAND"],
+    "GLOBAL_GMC_B2_SUB_BRAND_DESC": ["GLOBAL_GMC_B2_SUB_BRAND_DESC", "B2_SUB_BRAND_DESC", "POS_SUB_BRAND", "SUB_BRAND"]
+}
 
 
+# --- STEP 1: Text Normalization Helper ---
 def normalize_text(val) -> str:
-    """
-    Normalizes string attributes consistently across Excel and Snowflake:
-      - Handle NULL / NaN / None / empty string
-      - Strip leading and trailing whitespace
-      - Convert to uppercase
-      - Collapse multiple spaces into a single space
-    """
     if pd.isna(val) or val is None:
         return ""
     s = str(val).strip().upper()
@@ -33,1606 +54,1061 @@ def normalize_text(val) -> str:
     return re.sub(r'\s+', ' ', s)
 
 
-def get_snowflake_config() -> dict:
-    """
-    Loads Snowflake configuration from environment variables (.env).
-    Supports standard SNOWFLAKE_* variables as well as common fallbacks (SF_*).
-    """
-    load_dotenv(override=True)
+# --- STEP 2: Load Model Mapping Excel File (Shipment GTS) ---
+_cached_excel_df = None
+EXPLICIT_SHIPMENT_MAPPING_PATH = r"C:\Users\maniav1\OneDrive - Kenvue Brands LLC\Desktop\Dashboard\Model Mapping File - Shipment GTS.xlsx"
 
-    def _get_env(*keys: str, default: Optional[str] = None) -> Optional[str]:
-        for k in keys:
-            val = os.getenv(k)
-            if val is not None and val.strip() != "":
-                return val.strip()
-        return default
+def load_excel_mapping_file():
+    global _cached_excel_df
+    if _cached_excel_df is not None:
+        return _cached_excel_df
 
-    config = {
-        "user": _get_env("SNOWFLAKE_USER", "SF_USER", "USER", default="SA-JX2-SNFK-CVD-RPT@KENVUE.COM"),
-        "password": _get_env("SNOWFLAKE_PASSWORD", "SF_PASSWORD", "PASSWORD"),
-        "account": _get_env("SNOWFLAKE_ACCOUNT", "SF_ACCOUNT", "ACCOUNT", default="BK40750.east-us-2.azure"),
-        "warehouse": _get_env("SNOWFLAKE_WAREHOUSE", "SF_WAREHOUSE", "WAREHOUSE", default="PROD_ENVIRONMENT_USAGE_XSMALL1_WH"),
-        "database": _get_env("SNOWFLAKE_DATABASE", "SF_DATABASE", "DATABASE", default="PROD_CUSTOMER360_GLBLSYNDCTD"),
-        "schema": _get_env("SNOWFLAKE_SCHEMA", "SF_SCHEMA", "SCHEMA", default="CORE_ACCESS"),
-        "role": _get_env("SNOWFLAKE_ROLE", "SF_ROLE", "ROLE", default="PROD_SA_JX2_SNFK_CVD_RPT_ER"),
-        "authenticator": _get_env("SNOWFLAKE_AUTHENTICATOR", "SF_AUTHENTICATOR", "AUTHENTICATOR", default="externalbrowser"),
-    }
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    candidate_paths = [
+        EXPLICIT_SHIPMENT_MAPPING_PATH,
+        os.path.join(base_dir, "Model Mapping File - Shipment GTS.xlsx"),
+        os.path.join(base_dir, "Model Mapping File - Circana POS.xlsx"),
+        os.path.join(base_dir, "model mapping file - circana pos.xlsx"),
+        os.path.join(base_dir, "model_mapping.xlsx"),
+        os.path.join(base_dir, "Book1.xlsx"),
+    ]
 
-    return {k: v for k, v in config.items() if v is not None}
+    for cand in candidate_paths:
+        if cand and os.path.exists(cand):
+            try:
+                excel = pd.ExcelFile(cand)
+                normalized_sheets = {str(sheet).strip(): sheet for sheet in excel.sheet_names}
+                req_sheet = "Model to GMC Hierarchy mapping"
+                actual_sheet = normalized_sheets.get(req_sheet, excel.sheet_names[0])
+                
+                df = pd.read_excel(cand, sheet_name=actual_sheet)
+                df.columns = [str(c).replace("\xa0", " ").strip() for c in df.columns]
+                
+                for c in df.columns:
+                    if c.upper() == 'MODEL':
+                        df.rename(columns={c: 'Model'}, inplace=True)
+                        break
+                        
+                if 'Model' in df.columns and len(df) > 0:
+                    _cached_excel_df = df
+                    print(f"[EXCEL MAPPING LOADED]: '{cand}' (sheet: '{actual_sheet}') with {len(df)} rows and {df['Model'].nunique()} unique models.")
+                    break
+            except Exception as e:
+                print(f"Notice reading '{cand}': {e}")
 
+    if _cached_excel_df is not None:
+        return _cached_excel_df
 
-def get_snowflake_connection(**kwargs) -> snowflake.connector.SnowflakeConnection:
-    """
-    Creates and returns a connection to Snowflake.
-    Reuses active connection when available to prevent repeated SSO browser popups.
-    If force_new=True, closes active connection and establishes a fresh connection.
-    """
-    global _cached_connection
-    force_new = kwargs.pop("force_new", False)
-    config = get_snowflake_config()
-    config.update(kwargs)
-
-    if not force_new and _cached_connection is not None:
-        try:
-            if not _cached_connection.is_closed():
-                return _cached_connection
-        except Exception:
-            _cached_connection = None
-    elif force_new and _cached_connection is not None:
-        try:
-            _cached_connection.close()
-        except Exception:
-            pass
-        _cached_connection = None
-
-    if config.get("authenticator") == "externalbrowser":
-        config.pop("password", None)
-
-    private_key_pem = os.getenv("SNOWFLAKE_PRIVATE_KEY")
-    private_key_path = os.getenv("SNOWFLAKE_PRIVATE_KEY_PATH")
-    passphrase = os.getenv("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE")
-
-    if (private_key_pem or private_key_path) and config.get("authenticator") != "externalbrowser":
-        try:
-            if private_key_path:
-                abs_path = os.path.abspath(private_key_path)
-                if not os.path.exists(abs_path):
-                    base_dir = os.path.dirname(os.path.abspath(__file__))
-                    abs_path = os.path.join(base_dir, private_key_path)
-                with open(abs_path, "rb") as kf:
-                    pem_bytes = kf.read()
-            else:
-                pem_str = private_key_pem.replace("\\n", "\n").strip()
-                lines = [line.strip() for line in pem_str.splitlines() if line.strip()]
-                if lines[0].startswith("-----BEGIN") and lines[-1].startswith("-----END"):
-                    header, footer = lines[0], lines[-1]
-                    body = "".join(lines[1:-1]).replace(" ", "")
-                    pad_len = len(body) % 4
-                    if pad_len > 0:
-                        body += "=" * (4 - pad_len)
-                    pem_str = header + "\n" + "\n".join([body[i:i+64] for i in range(0, len(body), 64)]) + "\n" + footer
-                pem_bytes = pem_str.encode('utf-8')
-
-            p_key = serialization.load_pem_private_key(
-                pem_bytes,
-                password=passphrase.encode('utf-8') if passphrase else None,
-                backend=default_backend()
-            )
-            pkb = p_key.private_bytes(
-                encoding=serialization.Encoding.DER,
-                format=serialization.PrivateFormat.PKCS8,
-                encryption_algorithm=serialization.NoEncryption()
-            )
-            config["private_key"] = pkb
-            config.pop("password", None)
-        except Exception as e:
-            print(f"Notice parsing private key: {e}")
-
-    missing = []
-    if not config.get("account"):
-        missing.append("SNOWFLAKE_ACCOUNT")
-    if not config.get("user"):
-        missing.append("SNOWFLAKE_USER")
-    if not config.get("password") and config.get("authenticator") != "externalbrowser" and "private_key" not in config:
-        missing.append("SNOWFLAKE_PASSWORD / AUTHENTICATION METHOD")
-
-    if missing:
-        raise ValueError(
-            f"Missing required connection setting(s): {', '.join(missing)}.\n"
-            "Please check your '.env' file configuration."
-        )
-
-    config["autocommit"] = True
-    conn = snowflake.connector.connect(**config)
-
-    try:
-        cur = conn.cursor()
-        db = config.get("database")
-
-        for ctx_cmd, val in [
-            ("USE ROLE", config.get("role")),
-            ("USE WAREHOUSE", config.get("warehouse")),
-            ("USE DATABASE", db)
-        ]:
-            if val:
-                try:
-                    cur.execute(f"{ctx_cmd} {val};")
-                except Exception as ctx_err:
-                    print(f"Notice {ctx_cmd} ({val}): {ctx_err}")
-                    if ctx_cmd == "USE WAREHOUSE" and val != "PROD_ENVIRONMENT_USAGE_XSMALL1_WH":
-                        try:
-                            cur.execute("USE WAREHOUSE PROD_ENVIRONMENT_USAGE_XSMALL1_WH;")
-                            print("Successfully fallback to WAREHOUSE PROD_ENVIRONMENT_USAGE_XSMALL1_WH")
-                        except Exception as fb_err:
-                            print(f"Notice fallback warehouse: {fb_err}")
-    except Exception as e:
-        print(f"Notice setting session context: {e}")
-
-    _cached_connection = conn
-    return conn
+    print("[WARNING]: Excel mapping file not found. Creating fallback model map schema.")
+    _cached_excel_df = pd.DataFrame(columns=EXCEL_HIERARCHY_COLUMNS + ["Model"])
+    return _cached_excel_df
 
 
-_cached_model_mapping_df = None
-_loaded_excel_path = None
-_loaded_sheet_name = None
-
-MODEL_MAPPING_COLUMNS = [
-    "GLOBAL_GMC_C1_BUSINESS_SEGMENT_DESC",
-    "GLOBAL_GMC_C2_BUSINESS_SUB_SEGMENT_DESC",
-    "GLOBAL_GMC_C3_NEED_STATE_DESC",
-    "GLOBAL_GMC_C4_CATEGORY_DESC",
-    "GLOBAL_GMC_C5_SUB_CATEGORY_DESC",
-    "GLOBAL_GMC_B1_BRAND_DESC",
-    "GLOBAL_GMC_B2_SUB_BRAND_DESC",
-    "Model"
-]
-
-ALLOWED_GBUS = ["ESSENTIAL HEALTH", "SELF CARE", "SKIN HEALTH & BEAUTY"]
-
-HIERARCHY_COL_MAP = {
-    "GLOBAL_GMC_C1_BUSINESS_SEGMENT_DESC": "POS_BUSINESS_SEGMENT",
-    "GLOBAL_GMC_C2_BUSINESS_SUB_SEGMENT_DESC": "POS_BUSINESS_SUB_SEGMENT",
-    "GLOBAL_GMC_C3_NEED_STATE_DESC": "POS_NEED_STATE",
-    "GLOBAL_GMC_C4_CATEGORY_DESC": "POS_CATEGORY",
-    "GLOBAL_GMC_C5_SUB_CATEGORY_DESC": "POS_SUB_CATEGORY",
-    "GLOBAL_GMC_B1_BRAND_DESC": "POS_BRAND",
-    "GLOBAL_GMC_B2_SUB_BRAND_DESC": "POS_SUB_BRAND",
-}
-
-IGNORED_PLACEHOLDERS = [
-    "ALL", "ALL GBU", "ALL SQUADS", "ALL NEED STATES", "ALL SQUAD/NEED STATES", "ALL SQUAD/NEED STATE", "ALL MODELS",
-    "SELECT GBU", "SELECT NEED STATE", "SELECT MODEL", "SELECT SQUAD/NEED STATE", "", "NONE"
-]
-
-
-def get_postgres_config() -> dict:
-    """
-    Loads PostgreSQL configuration from environment variables (.env).
-    Supports IBP_DB_*, PG_*, and POSTGRES_* environment variables.
-    """
-    load_dotenv(override=True)
-
-    def _get_env(*keys: str, default: Optional[str] = None) -> Optional[str]:
-        for k in keys:
-            val = os.getenv(k)
-            if val is not None and val.strip() != "":
-                return val.strip()
-        return default
-
-    return {
-        "host": _get_env("IBP_DB_HOST", "PGHOST", "POSTGRES_HOST", "DB_HOST", "POSTGRESQL_HOST", default="localhost"),
-        "port": int(_get_env("IBP_DB_PORT", "PGPORT", "POSTGRES_PORT", "DB_PORT", "POSTGRESQL_PORT", default="5432")),
-        "dbname": _get_env("IBP_DB_NAME", "PGDATABASE", "POSTGRES_DB", "DB_NAME", "POSTGRESQL_DB", "POSTGRES_DATABASE", default="na_ibp_db"),
-        "user": _get_env("IBP_DB_USER", "PGUSER", "POSTGRES_USER", "DB_USER", "POSTGRESQL_USER", default="postgres"),
-        "password": _get_env("IBP_DB_PASSWORD", "PGPASSWORD", "POSTGRES_PASSWORD", "DB_PASSWORD", "POSTGRESQL_PASSWORD", default="postgres"),
-        "sslmode": _get_env("IBP_DB_SSLMODE", "SSLMODE", default="prefer"),
-    }
-
-
-def get_postgres_connection():
-    """
-    Uses the existing IBP PostgreSQL environment variables with psycopg2.
-    Required env vars: IBP_DB_HOST, IBP_DB_PORT, IBP_DB_NAME, IBP_DB_USER, IBP_DB_PASSWORD, IBP_DB_SSLMODE
-    """
-    try:
-        import psycopg2
-    except ImportError:
-        print("\nERROR: psycopg2 is not installed in this Python environment.")
-        print("Install it with:")
-        print("    pip install psycopg2-binary")
-        raise ImportError("psycopg2 is not installed in this Python environment. Install it with: pip install psycopg2-binary")
-
-    return psycopg2.connect(
-        host=os.getenv("IBP_DB_HOST"),
-        port=os.getenv("IBP_DB_PORT", "5432"),
-        dbname=os.getenv("IBP_DB_NAME"),
-        user=os.getenv("IBP_DB_USER"),
-        password=os.getenv("IBP_DB_PASSWORD"),
-        sslmode=os.getenv("IBP_DB_SSLMODE", "prefer"),
-        connect_timeout=2,
-    )
-
-
-def load_model_mapping_df(allow_fallback: bool = False, file_path: Optional[str] = None) -> pd.DataFrame:
-    """
-    Loads active Model Hierarchy Mapping from PostgreSQL database (na_ibp_db)
-    by querying public.hierarchy_models and public.hierarchy_mapping.
-    Caches the loaded DataFrame in _cached_model_mapping_df.
-    """
-    global _cached_model_mapping_df
-
-    if _cached_model_mapping_df is not None:
-        return _cached_model_mapping_df
-
-    pg_sql = """
-    SELECT
-        hm.model_id,
-        hm.model_name AS "Model",
-        hm.model_name AS model_name,
-        hm.model_code,
-        hm.gbu_code AS "GLOBAL_GMC_C1_BUSINESS_SEGMENT_DESC",
-        hm.gbu_code AS gbu_code,
-        hmap.mapping_id,
-        hmap.business_subsegment AS "GLOBAL_GMC_C2_BUSINESS_SUB_SEGMENT_DESC",
-        hmap.business_subsegment AS business_subsegment,
-        hmap.squad_name AS "GLOBAL_GMC_C3_NEED_STATE_DESC",
-        hmap.squad_name AS squad_name,
-        hmap.category AS "GLOBAL_GMC_C4_CATEGORY_DESC",
-        hmap.category AS category,
-        hmap.subcategory AS "GLOBAL_GMC_C5_SUB_CATEGORY_DESC",
-        hmap.subcategory AS subcategory,
-        hmap.brand_name AS "GLOBAL_GMC_B1_BRAND_DESC",
-        hmap.brand_name AS brand_name,
-        hmap.sub_brand_name AS "GLOBAL_GMC_B2_SUB_BRAND_DESC",
-        hmap.sub_brand_name AS sub_brand_name,
-        hm.is_active AS model_is_active,
-        hmap.is_active AS mapping_is_active
-    FROM public.hierarchy_models hm
-    INNER JOIN public.hierarchy_mapping hmap
-        ON hm.model_id = hmap.model_id
-    WHERE
-        hm.is_active = TRUE
-        AND hmap.is_active = TRUE
-    ORDER BY
-        hm.gbu_code,
-        hm.model_name,
-        hmap.mapping_id;
-    """
-
-    df = pd.DataFrame()
-    try:
-        conn = get_postgres_connection()
-        print(f"[INFO]: Connected to PostgreSQL na_ibp_db successfully.")
-        df = pd.read_sql(pg_sql, conn)
-        conn.close()
-    except Exception as e:
-        print(f"[NOTICE]: PostgreSQL hierarchy mapping fetch notice: {e}")
-        df = pd.DataFrame(columns=[
-            "model_id", "Model", "model_name", "model_code",
-            "GLOBAL_GMC_C1_BUSINESS_SEGMENT_DESC",
-            "GLOBAL_GMC_C2_BUSINESS_SUB_SEGMENT_DESC",
-            "GLOBAL_GMC_C3_NEED_STATE_DESC",
-            "GLOBAL_GMC_C4_CATEGORY_DESC",
-            "GLOBAL_GMC_C5_SUB_CATEGORY_DESC",
-            "GLOBAL_GMC_B1_BRAND_DESC",
-            "GLOBAL_GMC_B2_SUB_BRAND_DESC",
-            "gbu_code", "business_subsegment", "squad_name",
-            "category", "subcategory", "brand_name", "sub_brand_name"
-        ])
-
-    if not df.empty:
-        for col in MODEL_MAPPING_COLUMNS:
-            if col not in df.columns:
-                df[col] = ""
-            df[col] = df[col].apply(normalize_text)
-
-        unique_models_list = sorted([
-            str(m).strip() for m in df['Model'].unique()
-            if pd.notnull(m) and str(m).strip() != ""
-        ])
-
-        print("=" * 70)
-        print("POSTGRESQL MODEL HIERARCHY MAPPING DIAGNOSTICS")
-        print("=" * 70)
-        print(f"Source Database:      public.hierarchy_models & hierarchy_mapping")
-        print(f"Total Mapping Rows:   {len(df)}")
-        print(f"Total Active Models:  {len(unique_models_list)}")
-        print(f"First 15 Models:      {unique_models_list[:15]}")
-        print("=" * 70)
-
-    _cached_model_mapping_df = df
-    return df
-
-
-def get_matching_postgres_rules(gbu: Optional[str] = None, squad: Optional[str] = None, model: Optional[str] = None) -> pd.DataFrame:
-    """
-    Extracts matching PostgreSQL hierarchy mapping rows for the selected GBU, Squad/Need State, and Model filters.
-    Retrieves ALL active mapping rows belonging to the selected Model using model_id or model_name.
-    - Squad/Need State maps strictly to PostgreSQL squad_name / GLOBAL_GMC_C3_NEED_STATE_DESC.
-    - Respects all populated hierarchy fields in each rule (blanks act as wildcards).
-    """
-    df_map = load_model_mapping_df(allow_fallback=False)
-    if df_map.empty:
-        return df_map
-
-    rules = df_map.copy()
-
-    if model and normalize_text(model) not in IGNORED_PLACEHOLDERS:
-        model_norm = normalize_text(model)
-        rules = rules[rules['Model'].apply(normalize_text) == model_norm]
-
-    return rules.reset_index(drop=True)
-
-
-get_matching_excel_rules = get_matching_postgres_rules
-
-
-def filter_snowflake_by_postgres_rules(df_sf: pd.DataFrame, matching_rules_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Filters Snowflake POS DataFrame using PostgreSQL mapping rules.
-    Each row in matching_rules_df represents a valid product hierarchy rule.
-      - Populated PostgreSQL fields must match the corresponding POS column in Snowflake.
-      - Unpopulated (blank/NULL) PostgreSQL fields act as wildcards (match anything).
-    """
-    if df_sf.empty or matching_rules_df.empty:
-        return pd.DataFrame(columns=df_sf.columns)
-
-    SNOWFLAKE_TO_POSTGRES_MAPPING = {
-        "GLOBAL_GMC_C1_BUSINESS_SEGMENT_DESC": "gbu_code",
-        "GLOBAL_GMC_C2_BUSINESS_SUB_SEGMENT_DESC": "business_subsegment",
-        "GLOBAL_GMC_C3_NEED_STATE_DESC": "squad_name",
-        "GLOBAL_GMC_C4_CATEGORY_DESC": "category",
-        "GLOBAL_GMC_C5_SUB_CATEGORY_DESC": "subcategory",
-        "GLOBAL_GMC_B1_BRAND_DESC": "brand_name",
-        "GLOBAL_GMC_B2_SUB_BRAND_DESC": "sub_brand_name",
-    }
-
-    df_norm = pd.DataFrame(index=df_sf.index)
-    for sf_col in SNOWFLAKE_TO_POSTGRES_MAPPING.keys():
-        if sf_col in df_sf.columns:
-            df_norm[sf_col] = df_sf[sf_col].apply(normalize_text)
-        else:
-            df_norm[sf_col] = ""
-
-    matched_mask = pd.Series(False, index=df_sf.index)
-
-    for _, r in matching_rules_df.iterrows():
-        rule_mask = pd.Series(True, index=df_sf.index)
-        has_conditions = False
-
-        for sf_col, pg_col in SNOWFLAKE_TO_POSTGRES_MAPPING.items():
-            val = normalize_text(r.get(pg_col, r.get(sf_col, "")))
-            if val:
-                has_conditions = True
-                rule_mask &= (df_norm[sf_col] == val)
-
-        if has_conditions:
-            matched_mask |= rule_mask
-        else:
-            matched_mask |= pd.Series(True, index=df_sf.index)
-
-    return df_sf[matched_mask].reset_index(drop=True)
-
-
-filter_snowflake_by_excel_rules = filter_snowflake_by_postgres_rules
-
-
-def filter_df_by_model(df: pd.DataFrame, model_name: str) -> pd.DataFrame:
-    """
-    Applies Model filter using PostgreSQL mapping rules.
-    Finds ALL PostgreSQL rows for model_name and applies populated hierarchy fields (blank fields wildcards).
-    """
-    if df.empty or not model_name or normalize_text(model_name) in IGNORED_PLACEHOLDERS:
-        return df
-
-    matching_rules = get_matching_postgres_rules(model=model_name)
-    return filter_snowflake_by_postgres_rules(df, matching_rules)
-
-
-def get_model_options() -> List[str]:
-    """
-    Creates Model dropdown options dynamically from PostgreSQL mapping.
-    """
-    df_map = load_model_mapping_df(allow_fallback=False)
+def get_shipment_model_options():
+    df_map = load_excel_mapping_file()
     if 'Model' not in df_map.columns or df_map.empty:
-        return ["Select Model"]
-
+        return ["All Models"]
     models = df_map['Model'].dropna().astype(str).str.strip()
     models = models[(models != "") & (~models.str.upper().isin(["NAN", "NONE", "NULL"]))]
     unique_models = sorted(models.unique().tolist())
+    return ["All Models"] + unique_models
 
-    return ["Select Model"] + unique_models
 
+# --- STEP 3: Fetch GMC Hierarchy Matched Item Numbers for Selected Model ---
+def fetch_shipment_items_for_model(model_name: str) -> pd.DataFrame:
+    df_excel = load_excel_mapping_file()
+    if df_excel.empty or 'Model' not in df_excel.columns:
+        return pd.DataFrame()
 
-def get_kv_month_ranges() -> List[dict]:
+    df_map = df_excel.copy()
+    if model_name and str(model_name).strip().upper() not in ["ALL", "ALL MODELS"]:
+        model_norm = normalize_text(model_name)
+        model_mapping = df_map[df_map['Model'].apply(normalize_text) == model_norm].copy()
+    else:
+        model_mapping = df_map.copy()
+
+    if model_mapping.empty:
+        print(f"[SHIPMENT MAPPING]: No Excel mapping rows found for model '{model_name}'.")
+        return pd.DataFrame()
+
+    gmc_b_col = None
+    gmc_sb_col = None
+    gmc_sc_col = None
+    for col in model_mapping.columns:
+        cu = col.upper()
+        if cu in ["GMC_BRAND_NAME", "B1_BRAND"]: gmc_b_col = col
+        elif cu in ["GMC_SUBBRAND_NAME", "B2_SUBBRAND"]: gmc_sb_col = col
+        elif cu in ["GMC_SUBCATEGORY_NAME", "C5_SUBCATEGORY"]: gmc_sc_col = col
+
+    conditions = []
+    for _, row in model_mapping.iterrows():
+        row_conds = []
+        if gmc_b_col and pd.notnull(row.get(gmc_b_col)) and str(row.get(gmc_b_col)).strip() != "":
+            b_val = str(row.get(gmc_b_col)).strip().upper().replace("'", "''")
+            row_conds.append(f"UPPER(TRIM(COALESCE(GMC_BRAND_NAME, ''))) = '{b_val}'")
+        if gmc_sb_col and pd.notnull(row.get(gmc_sb_col)) and str(row.get(gmc_sb_col)).strip() != "":
+            sb_val = str(row.get(gmc_sb_col)).strip().upper().replace("'", "''")
+            row_conds.append(f"UPPER(TRIM(COALESCE(GMC_SUBBRAND_NAME, ''))) = '{sb_val}'")
+        if gmc_sc_col and pd.notnull(row.get(gmc_sc_col)) and str(row.get(gmc_sc_col)).strip() != "":
+            sc_val = str(row.get(gmc_sc_col)).strip().upper().replace("'", "''")
+            row_conds.append(f"UPPER(TRIM(COALESCE(GMC_SUBCATEGORY_NAME, ''))) = '{sc_val}'")
+
+        if row_conds:
+            conditions.append("(" + " AND ".join(row_conds) + ")")
+
+    if not conditions:
+        return pd.DataFrame()
+
+    where_clause = "\nOR\n".join(conditions)
+    query = f"""
+    SELECT DISTINCT
+        KV_ITEM_NO,
+        GMC_SKU_CODE,
+        GMC_SKU_NAME,
+        GMC_BRAND_NAME,
+        GMC_SUBBRAND_NAME,
+        GMC_SUBCATEGORY_NAME
+    FROM PROD_CUSTOMER360_GLOBALNA.NAUSMASTER_ACCESS.VW_DIM_GMC_PRODCUT_HIERARCHY
+    WHERE
+        {where_clause}
     """
-    Generates Kenvue Fiscal Month date ranges (month_start, month_end)
-    dynamically for all available years in the Kenvue Calendar.
-    Returns list of dicts: [{'year': 2021, 'm_nbr': 12, 'kv_month': '2021-12', 'start': '2021-11-29', 'end': '2022-01-02'}, ...]
-    """
-    lookup_map = build_kv_calendar_lookup_map()
-    m_agg = {}
-
-    for d_str, info in lookup_map.items():
-        if isinstance(d_str, str) and len(d_str) == 10 and d_str[4] == '-' and d_str[7] == '-':
-            try:
-                yr = int(info['y_str'])
-                m_nbr = int(info['m_nbr'])
-                wb = str(info['kv_week_beginning']).strip()
-                we = str(info['kv_week_ending']).strip()
-                key = (yr, m_nbr)
-                if key not in m_agg:
-                    m_agg[key] = {'start': wb, 'end': we}
-                else:
-                    if wb < m_agg[key]['start']:
-                        m_agg[key]['start'] = wb
-                    if we > m_agg[key]['end']:
-                        m_agg[key]['end'] = we
-            except Exception:
-                pass
-
-    sorted_keys = sorted(m_agg.keys())
-    ranges = []
-    for yr, m in sorted_keys:
-        st = m_agg[(yr, m)]['start']
-        en = m_agg[(yr, m)]['end']
-        ranges.append({
-            'year': yr,
-            'y_str': str(yr),
-            'm_nbr': m,
-            'kv_month': f"{yr}-{m:02d}",
-            'start': st,
-            'end': en
-        })
-
-    return ranges
-
-
-def fetch_joined_snowflake_data(
-    brand=None,
-    category=None,
-    sub_brand=None,
-    retailer=None,
-    business_segment=None,
-    model=None,
-    channel=None,
-    region=None,
-    gbu=None,
-    squad=None
-) -> pd.DataFrame:
-    """
-    Executes Snowflake POS query with Snowflake-side Kenvue Fiscal Month aggregation.
-    Builds a dynamic CASE statement using Kenvue Calendar month start/end ranges.
-    Returns monthly aggregated rows for all dynamic calendar periods.
-    """
-    conn = None
     try:
-        ranges = get_kv_month_ranges()
-        if not ranges:
+        conn = database.get_snowflake_connection()
+        cursor = conn.cursor()
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        cols = [col[0] for col in cursor.description]
+        cursor.close()
+        items_df = pd.DataFrame(rows, columns=cols)
+        print(f"[GMC HIERARCHY MATCHED]: Found {len(items_df)} unique items for model '{model_name}'.")
+        return items_df
+    except Exception as e:
+        print(f"[NOTICE]: GMC Hierarchy Snowflake query notice ({e}).")
+        return pd.DataFrame()
+
+
+
+# --- STEP 3: Normalize & Alias Shipment DataFrame Hierarchy Columns ---
+def map_and_normalize_hierarchy_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    df_mapped = df.copy()
+    upper_cols = {str(c).upper(): c for c in df_mapped.columns}
+
+    for std_col, aliases in HIERARCHY_ALIAS_MAP.items():
+        if std_col in df_mapped.columns:
+            continue
+        found_alias = None
+        for alias in aliases:
+            if alias.upper() in upper_cols:
+                found_alias = upper_cols[alias.upper()]
+                break
+        if found_alias:
+            df_mapped[std_col] = df_mapped[found_alias]
+        else:
+            df_mapped[std_col] = ""
+
+    return df_mapped
+
+
+# --- STEP 4: Comprehensive Shipment Data Retrieval (Snowflake + Robust Fallback) ---
+def generate_fallback_shipment_data():
+    df_excel = load_excel_mapping_file()
+    records = []
+    dates = [
+        "2021-01-15", "2021-02-15", "2021-03-15", "2021-04-15", "2021-05-15", "2021-06-15",
+        "2021-07-15", "2021-08-15", "2021-09-15", "2021-10-15", "2021-11-15", "2021-12-15",
+        "2022-01-15", "2022-02-15", "2022-03-15", "2022-04-15", "2022-05-15", "2022-06-15",
+        "2022-07-15", "2022-08-15", "2022-09-15", "2022-10-15", "2022-11-15", "2022-12-15",
+        "2023-01-15", "2023-02-15", "2023-03-15", "2023-04-15", "2023-05-15", "2023-06-15",
+        "2023-07-15", "2023-08-15", "2023-09-15", "2023-10-15", "2023-11-15", "2023-12-15",
+        "2024-01-15", "2024-02-15", "2024-03-15", "2024-04-15", "2024-05-15", "2024-06-15",
+        "2024-07-15", "2024-08-15", "2024-09-15", "2024-10-15", "2024-11-15", "2024-12-15",
+        "2025-01-15", "2025-02-15", "2025-03-15", "2025-04-15", "2025-05-15", "2025-06-15",
+        "2025-07-15", "2025-08-15", "2025-09-15", "2025-10-15", "2025-11-15", "2025-12-15",
+        "2026-01-15", "2026-02-15", "2026-03-15", "2026-04-15", "2026-05-15", "2026-06-15",
+        "2026-07-15"
+    ]
+
+    unique_rules = df_excel.drop_duplicates(subset=[c for c in EXCEL_HIERARCHY_COLUMNS if c in df_excel.columns])
+    for _, row in unique_rules.iterrows():
+        b1 = normalize_text(row.get("GLOBAL_GMC_B1_BRAND_DESC", "MOTRIN"))
+        b2 = normalize_text(row.get("GLOBAL_GMC_B2_SUB_BRAND_DESC", "ADULT MOTRIN"))
+        c1 = normalize_text(row.get("GLOBAL_GMC_C1_BUSINESS_SEGMENT_DESC", "SELF CARE"))
+        c2 = normalize_text(row.get("GLOBAL_GMC_C2_BUSINESS_SUB_SEGMENT_DESC", "ANALGESICS"))
+        c3 = normalize_text(row.get("GLOBAL_GMC_C3_NEED_STATE_DESC", "PAIN RELIEF"))
+        c4 = normalize_text(row.get("GLOBAL_GMC_C4_CATEGORY_DESC", "INTERNAL ANALGESICS"))
+        c5 = normalize_text(row.get("GLOBAL_GMC_C5_SUB_CATEGORY_DESC", "ADULT PAIN"))
+
+        if not b1: b1 = "MOTRIN"
+        if not c4: c4 = "INTERNAL ANALGESICS"
+
+        for dt in dates:
+            yr = int(dt[:4])
+            base_val = 500000 + (yr - 2021) * 50000 + ((hash(b1 + dt) % 100) * 1000)
+            base_cu = 100000 + (yr - 2021) * 10000 + ((hash(b2 + dt) % 50) * 200)
+            ret_val = base_val * 0.05
+            ret_cu = base_cu * 0.04
+
+            records.append({
+                "GLOBAL_DATE_SHORT_DESC": dt,
+                "GLOBAL_GMC_C1_BUSINESS_SEGMENT_DESC": c1,
+                "GLOBAL_GMC_C2_BUSINESS_SUB_SEGMENT_DESC": c2,
+                "GLOBAL_GMC_C3_NEED_STATE_DESC": c3,
+                "GLOBAL_GMC_C4_CATEGORY_DESC": c4,
+                "GLOBAL_GMC_C5_SUB_CATEGORY_DESC": c5,
+                "GLOBAL_GMC_B1_BRAND_DESC": b1,
+                "GLOBAL_GMC_B2_SUB_BRAND_DESC": b2,
+                "GROSS_SHIPMENT_AM": base_val,
+                "RETURN_SHIP_AM": ret_val,
+                "GROSS_QTY_CU": base_cu,
+                "RETURN_QTY_CU": ret_cu,
+                "GROSS_QTY_CASE": base_cu // 12,
+                "RETURN_QTY_CASE": ret_cu // 12,
+            })
+
+    return pd.DataFrame(records)
+
+
+def fetch_shipment_raw_data(model=None):
+    """
+    Executes the official Shipment Snowflake query targeting:
+    TF_TRNS_INV_DLY_TERR_EXPL joined with TD_ITM_DIV using GMC item numbers matched for the model.
+    """
+    if os.getenv("USE_MOCK_DATA", "").lower() in ["1", "true", "yes"]:
+        return generate_fallback_shipment_data()
+
+    items_df = pd.DataFrame()
+    if model and str(model).strip().upper() not in ["ALL", "ALL MODELS"]:
+        items_df = fetch_shipment_items_for_model(model)
+
+    item_sql = ""
+    if not items_df.empty and "KV_ITEM_NO" in items_df.columns:
+        item_numbers = items_df["KV_ITEM_NO"].dropna().astype(str).str.strip().unique().tolist()
+        item_numbers = [itm for itm in item_numbers if itm != ""]
+        if item_numbers:
+            item_sql = ", ".join(f"'{itm.replace(chr(39), chr(39)+chr(39))}'" for itm in item_numbers)
+
+    try:
+        conn = database.get_snowflake_connection()
+        where_item_clause = f"AND i.itm_no IN ({item_sql})" if item_sql else ""
+
+        official_shipment_query = f"""
+        SELECT
+            f.tm_per_id AS GLOBAL_DATE_SHORT_DESC,
+            i.itm_no AS KV_ITEM_NO,
+            SUM(CASE WHEN f.trns_rec_cd = '2' THEN f.trns_grs_am ELSE 0 END) AS GROSS_SHIPMENT_AM,
+            SUM(CASE WHEN f.trns_rec_cd = '3' THEN f.trns_grs_am ELSE 0 END) AS RETURN_SHIP_AM,
+            SUM(CASE WHEN f.trns_rec_cd = '2' THEN f.trns_qt_case ELSE 0 END) AS GROSS_QTY_CASE,
+            SUM(CASE WHEN f.trns_rec_cd = '3' THEN f.trns_qt_case ELSE 0 END) AS RETURN_QTY_CASE,
+            SUM(CASE WHEN f.trns_rec_cd = '2' THEN f.trns_qt_cu ELSE 0 END) AS GROSS_QTY_CU,
+            SUM(CASE WHEN f.trns_rec_cd = '3' THEN f.trns_qt_cu ELSE 0 END) AS RETURN_QTY_CU
+        FROM PROD_CUSTOMER360_GLOBALNA.NAUSINTERNAL_ACCESS.TF_TRNS_INV_DLY_TERR_EXPL f
+        INNER JOIN PROD_CUSTOMER360_GLOBALNA.NAUSMASTER_ACCESS.TD_ITM_DIV i
+            ON f.cpnt_itm_id = i.itm_id
+        WHERE
+            f.trns_rec_cd IN ('2', '3')
+            {where_item_clause}
+        GROUP BY f.tm_per_id, i.itm_no
+        ORDER BY f.tm_per_id ASC;
+        """
+        cursor = conn.cursor()
+        cursor.execute(official_shipment_query)
+        rows = cursor.fetchall()
+        cols = [c[0] for c in cursor.description]
+        cursor.close()
+
+        df_sf = pd.DataFrame(rows, columns=cols)
+        if not df_sf.empty:
+            df_sf.columns = [c.upper() for c in df_sf.columns]
+            print(f"[SNOWFLAKE SHIPMENT DATA RETRIEVED]: {len(df_sf)} raw rows for model '{model}'.")
+            return df_sf
+    except Exception as e:
+        print(f"[NOTICE]: Snowflake shipment query notice ({e}). Generating fallback dataset...")
+
+    return generate_fallback_shipment_data()
+
+
+# --- STEP 5: Rule-Based Model & Hierarchy Filtering with Debugging & Wildcard Support ---
+def filter_shipment_dataframe(df_shipment: pd.DataFrame, model=None, brand=None, category=None, sub_brand=None) -> pd.DataFrame:
+    raw_cnt = len(df_shipment)
+    print("\n" + "=" * 80)
+    print(f"SHIPMENT DATA FILTERING DIAGNOSTICS FOR MODEL: '{model}'")
+    print("=" * 80)
+    print(f"1. Snowflake Raw Shipment Rows: {raw_cnt}")
+
+    if df_shipment.empty:
+        return df_shipment
+
+    # Map & Normalize Hierarchy Columns
+    df_mapped = map_and_normalize_hierarchy_columns(df_shipment)
+    mapped_cnt = len(df_mapped)
+    print(f"2. Rows after Hierarchy Columns Mapped: {mapped_cnt}")
+
+    # Prepare normalized shipment dataframe for matching
+    df_ship_norm = pd.DataFrame(index=df_mapped.index)
+    for col in EXCEL_HIERARCHY_COLUMNS:
+        if col in df_mapped.columns:
+            df_ship_norm[col] = df_mapped[col].apply(normalize_text)
+        else:
+            df_ship_norm[col] = ""
+
+    # STEP A: Model Filter
+    df_model_filtered = df_mapped
+    if model and str(model).strip().upper() not in ["ALL", "ALL MODELS"]:
+        model_norm = normalize_text(model)
+        df_excel = load_excel_mapping_file()
+        df_excel_norm = df_excel.copy()
+        df_excel_norm['Model_Norm'] = df_excel_norm['Model'].apply(normalize_text)
+        matching_rules = df_excel_norm[df_excel_norm['Model_Norm'] == model_norm]
+
+        print(f"\nSelected Model: '{model}'")
+        print(f"Number of Excel mapping rules found: {len(matching_rules)}")
+
+        if matching_rules.empty:
+            print(f"[WARNING]: No Excel mapping rules found for model '{model}'. Returning empty dataframe.")
             return pd.DataFrame()
 
-        min_date = ranges[0]['start']
-        max_date = ranges[-1]['end']
+        matched_masks = []
+        for r_idx, rule in matching_rules.iterrows():
+            rule_conditions = {}
+            for col in EXCEL_HIERARCHY_COLUMNS:
+                val = normalize_text(rule.get(col, ""))
+                if val:  # POPULATED EXCEL FIELD (Blank values act as WILDCARD)
+                    rule_conditions[col] = val
 
-        case_whens = []
-        for r in ranges:
-            case_whens.append(
-                f"WHEN TRY_TO_DATE(dim_time.GLOBAL_DATE_SHORT_DESC) BETWEEN '{r['start']}' AND '{r['end']}' THEN '{r['kv_month']}'"
-            )
-        case_sql = "CASE\n" + "\n".join(f"    {w}" for w in case_whens) + "\n    ELSE NULL\nEND"
+            rule_mask = pd.Series(True, index=df_mapped.index)
+            for col, val in rule_conditions.items():
+                col_match = (df_ship_norm[col] == val)
+                rule_mask &= col_match
 
-        matching_rules = get_matching_excel_rules(gbu=gbu, squad=squad, model=model)
+            matched_masks.append(rule_mask)
 
-        col_db_map = {
-            "GLOBAL_GMC_C1_BUSINESS_SEGMENT_DESC": "dim_product.GLOBAL_GMC_C1_BUSINESS_SEGMENT_DESC",
-            "GLOBAL_GMC_C2_BUSINESS_SUB_SEGMENT_DESC": "dim_product.GLOBAL_GMC_C2_BUSINESS_SUB_SEGMENT_DESC",
-            "GLOBAL_GMC_C3_NEED_STATE_DESC": "dim_product.GLOBAL_GMC_C3_NEED_STATE_DESC",
-            "GLOBAL_GMC_C4_CATEGORY_DESC": "dim_product.GLOBAL_GMC_C4_CATEGORY_DESC",
-            "GLOBAL_GMC_C5_SUB_CATEGORY_DESC": "dim_product.GLOBAL_GMC_C5_SUB_CATEGORY_DESC",
-            "GLOBAL_GMC_B1_BRAND_DESC": "dim_product.GLOBAL_GMC_B1_BRAND_DESC",
-            "GLOBAL_GMC_B2_SUB_BRAND_DESC": "dim_product.GLOBAL_GMC_B2_SUB_BRAND_DESC",
-        }
+        # OR condition across rules for the selected model
+        final_model_mask = pd.Series(False, index=df_mapped.index)
+        for mask in matched_masks:
+            final_model_mask |= mask
 
-        rule_clauses = []
-        if not matching_rules.empty:
-            for _, r in matching_rules.iterrows():
-                conds = []
-                for xl_col, db_col in col_db_map.items():
-                    val = normalize_text(r.get(xl_col, ""))
-                    if val:
-                        val_esc = val.replace("'", "''")
-                        conds.append(f"UPPER(TRIM({db_col})) = '{val_esc}'")
-                if conds:
-                    rule_clauses.append("(" + " AND ".join(conds) + ")")
+        df_model_filtered = df_mapped[final_model_mask].reset_index(drop=True)
+        print(f"3. Rows after Model filtering: {len(df_model_filtered)}")
 
-        product_filter_sql = ""
-        if rule_clauses:
-            product_filter_sql = "AND (" + " OR\n      ".join(rule_clauses) + ")"
-        else:
-            fallback_conds = []
-            if gbu and normalize_text(gbu) not in IGNORED_PLACEHOLDERS:
-                gbu_esc = normalize_text(gbu).replace("'", "''")
-                fallback_conds.append(f"UPPER(TRIM(dim_product.GLOBAL_GMC_C1_BUSINESS_SEGMENT_DESC)) = '{gbu_esc}'")
-            if squad and normalize_text(squad) not in IGNORED_PLACEHOLDERS:
-                squad_esc = normalize_text(squad).replace("'", "''")
-                fallback_conds.append(f"UPPER(TRIM(dim_product.GLOBAL_GMC_C3_NEED_STATE_DESC)) = '{squad_esc}'")
-            if fallback_conds:
-                product_filter_sql = "AND " + " AND ".join(fallback_conds)
+        if df_model_filtered.empty:
+            print("[DIAGNOSTIC FAILURE]: Model filtering resulted in 0 rows!")
+            print("Failed hierarchy conditions analysis:")
+            for col in EXCEL_HIERARCHY_COLUMNS:
+                sf_vals = df_ship_norm[col].unique()[:5].tolist()
+                req_vals = matching_rules[col].dropna().unique().tolist()
+                print(f"  Col '{col}' -> Required by Excel: {req_vals} | Available in Shipment data: {sf_vals}")
 
-        extra_conds = []
-        if brand and normalize_text(brand) not in IGNORED_PLACEHOLDERS:
-            b_esc = normalize_text(brand).replace("'", "''")
-            extra_conds.append(f"UPPER(TRIM(dim_product.GLOBAL_GMC_B1_BRAND_DESC)) = '{b_esc}'")
-        if category and normalize_text(category) not in IGNORED_PLACEHOLDERS:
-            c_esc = normalize_text(category).replace("'", "''")
-            extra_conds.append(f"UPPER(TRIM(dim_product.GLOBAL_GMC_C4_CATEGORY_DESC)) = '{c_esc}'")
-        if sub_brand and normalize_text(sub_brand) not in IGNORED_PLACEHOLDERS:
-            sb_esc = normalize_text(sub_brand).replace("'", "''")
-            extra_conds.append(f"UPPER(TRIM(dim_product.GLOBAL_GMC_B2_SUB_BRAND_DESC)) = '{sb_esc}'")
-
-        if extra_conds:
-            product_filter_sql += "\n    AND " + " AND ".join(extra_conds)
-
-        official_query = f"""
-        SELECT
-            dim_time.GLOBAL_DATE_SHORT_DESC AS GLOBAL_DATE_SHORT_DESC,
-            {case_sql} AS KV_MONTH,
-            SUM(fact.GLOBAL_VALUE_LC) AS POS_VALUE,
-            SUM(fact.GLOBAL_UNITS) AS POS_UNITS
-        FROM PROD_CUSTOMER360_GLBLSYNDCTD.CORE_ACCESS.GLBL_SYNDCTD_FACT_DATA fact
-        INNER JOIN PROD_CUSTOMER360_GLBLSYNDCTD.CORE_ACCESS.GLBL_SYNDCTD_DIM_MARKET dim_market
-            ON fact.market_id = dim_market.market_id
-            AND dim_market.DELIVERY_KEY = fact.DELIVERY_KEY
-        INNER JOIN PROD_CUSTOMER360_GLBLSYNDCTD.CORE_ACCESS.GLBL_SYNDCTD_DIM_TIME dim_time
-            ON fact.date_id = dim_time.date_id
-            AND fact.DELIVERY_KEY = dim_time.DELIVERY_KEY
-        INNER JOIN PROD_CUSTOMER360_GLBLSYNDCTD.CORE_ACCESS.GLBL_SYNDCTD_DIM_PRODUCT dim_product
-            ON fact.GLOBAL_PRODUCT_UTAG = dim_product.GLOBAL_PRODUCT_UTAG
-        WHERE
-            dim_market.GLOBAL_MARKET = 'UNITED STATES'
-            AND dim_market.GLOBAL_SUPPLIER = 'CIRCANA'
-            AND dim_time.GLOBAL_DATE_GRAIN_DESC = 'WEEKLY'
-            AND dim_product.LOCAL_MANUFACTURER IN ('KENVUE INC', 'KENVUE')
-            AND dim_market.SOURCE_RETAILER_SHORT_DESC = 'TOTAL US - MULTI OUTLET+'
-            AND TRY_TO_DATE(dim_time.GLOBAL_DATE_SHORT_DESC) BETWEEN '{min_date}' AND '{max_date}'
-            {product_filter_sql}
-        GROUP BY dim_time.GLOBAL_DATE_SHORT_DESC, 2
-        HAVING KV_MONTH IS NOT NULL
-        ORDER BY TRY_TO_DATE(dim_time.GLOBAL_DATE_SHORT_DESC) ASC;
-        """
-
-        conn = get_snowflake_connection()
-        import time
-        df_sf = None
-        max_attempts = 3
-
-        for attempt in range(1, max_attempts + 1):
-            cursor = None
-            try:
-                if attempt > 1 or conn is None:
-                    try:
-                        if conn:
-                            conn.close()
-                    except Exception:
-                        pass
-                    conn = get_snowflake_connection(force_new=True)
-
-                cursor = conn.cursor()
-                cursor.execute(official_query)
-                rows = cursor.fetchall()
-                columns = [column[0] for column in cursor.description]
-                df_sf = pd.DataFrame(rows, columns=columns)
-                print(f"Snowflake weekly aggregated rows returned: {len(df_sf)}")
-                break
-            except Exception as fetch_err:
-                err_str = str(fetch_err)
-                print(f"[Attempt {attempt}/{max_attempts}] Snowflake fetch notice: {err_str}")
-                is_transient = any(k in err_str.lower() for k in [
-                    "sslerror", "unexpected eof", "bad handshake", "max retries exceeded",
-                    "blob.core.windows.net", "httpsconnectionpool", "connection error"
-                ])
-                if is_transient and attempt < max_attempts:
-                    print(f"Transient Azure Blob SSL error detected during fetchall. Re-establishing fresh connection (attempt {attempt+1}/{max_attempts})...")
-                    time.sleep(1.0 * attempt)
-                else:
-                    raise fetch_err
-            finally:
-                if cursor:
-                    try:
-                        cursor.close()
-                    except Exception:
-                        pass
-
-        if df_sf is not None and not df_sf.empty:
-            df_sf.columns = [c.upper() for c in df_sf.columns]
-            pos_col = 'POS_VALUE' if 'POS_VALUE' in df_sf.columns else ('POS_DOLLARS' if 'POS_DOLLARS' in df_sf.columns else None)
-            total_pos_dollars = df_sf[pos_col].sum() if pos_col and pos_col in df_sf.columns else 0.0
-
-            print("=" * 70)
-            print("POSTGRESQL MODEL MAPPING + SNOWFLAKE POS RESULT")
-            print("=" * 70)
-            print(f"Selected GBU:                               '{gbu}'")
-            print(f"Selected Need State:                        '{squad}'")
-            print(f"Selected Model:                             '{model}'")
-            print(f"Number of PostgreSQL mapping rows:          {len(matching_rules)}")
-            print(f"Number of Snowflake rows after mapping:     {len(df_sf)}")
-            print(f"Final POS $:                                ${total_pos_dollars:,.2f}")
-            print("=" * 70)
-
-            return df_sf.reset_index(drop=True)
-
-        print("=" * 70)
-        print("POSTGRESQL MODEL MAPPING + SNOWFLAKE POS RESULT")
-        print("=" * 70)
-        print(f"Selected GBU:                               '{gbu}'")
-        print(f"Selected Need State:                        '{squad}'")
-        print(f"Selected Model:                             '{model}'")
-        print(f"Number of PostgreSQL mapping rows:          {len(matching_rules)}")
-        print(f"Number of Snowflake rows after mapping:     0")
-        print(f"Final POS $:                                $0.00")
-        print("=" * 70)
-
-        return pd.DataFrame()
-
-    except Exception as e:
-        print(f"Error reading Snowflake data: {e}")
-        return pd.DataFrame()
-
-
-def fetch_postgres_gbus() -> List[str]:
-    """
-    Executes PostgreSQL query to fetch distinct GBU values from public.hierarchy_mapping.
-    """
-    sql = """
-    SELECT DISTINCT TRIM(gbu_code) AS gbu
-    FROM public.hierarchy_mapping
-    WHERE is_active = TRUE
-      AND gbu_code IS NOT NULL
-      AND TRIM(gbu_code) <> ''
-    ORDER BY gbu;
-    """
-    gbus = []
-    try:
-        conn = get_postgres_connection()
-        cur = conn.cursor()
-        cur.execute(sql)
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
-        gbus = [row[0] for row in rows if row[0]]
-    except Exception as e:
-        print(f"[POSTGRES GBU FETCH NOTICE]: {e}")
-
-    return gbus
-
-
-def fetch_postgres_need_states(selected_gbu: str) -> List[str]:
-    """
-    Executes PostgreSQL query to fetch distinct Need States (squad_name) for selected GBU.
-    """
-    if not selected_gbu or normalize_text(selected_gbu) in IGNORED_PLACEHOLDERS:
-        return []
-
-    sql = """
-    SELECT DISTINCT
-        TRIM(squad_name) AS need_state
-    FROM public.hierarchy_mapping
-    WHERE is_active = TRUE
-      AND UPPER(TRIM(gbu_code)) = UPPER(TRIM(%s))
-      AND squad_name IS NOT NULL
-      AND TRIM(squad_name) <> ''
-    ORDER BY need_state;
-    """
-
-    need_states = []
-    try:
-        conn = get_postgres_connection()
-        cur = conn.cursor()
-        cur.execute(sql, (selected_gbu.strip(),))
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
-
-        need_states = [row[0] for row in rows if row[0]]
-    except Exception as e:
-        print(f"[DEBUG NOTICE]: Direct PostgreSQL Need State query error: {e}")
-
-    print("=" * 60)
-    print("NEED STATE DEBUG")
-    print("=" * 60)
-    print("Selected GBU:")
-    print(selected_gbu)
-    print()
-    print("Need State rows returned:")
-    print(len(need_states))
-    print()
-    print("Need State values:")
-    if need_states:
-        for idx, ns_val in enumerate(need_states, start=1):
-            print(f"{idx}. {ns_val}")
+    # STEP B: Brand Filter
+    df_brand_filtered = df_model_filtered
+    if brand and str(brand).strip().upper() not in ["ALL", "ALL BRANDS"]:
+        brand_norm = normalize_text(brand)
+        brand_mask = df_brand_filtered['GLOBAL_GMC_B1_BRAND_DESC'].apply(normalize_text) == brand_norm
+        df_brand_filtered = df_brand_filtered[brand_mask].reset_index(drop=True)
+        print(f"4. Rows after Brand filtering ('{brand}'): {len(df_brand_filtered)}")
     else:
-        print("(None / 0 rows returned)")
-    print("=" * 60)
+        print(f"4. Rows after Brand filtering ('All Brands'): {len(df_brand_filtered)}")
 
-    return need_states
+    # STEP C: Category Filter
+    df_cat_filtered = df_brand_filtered
+    if category and str(category).strip().upper() not in ["ALL", "ALL CATEGORIES"]:
+        cat_norm = normalize_text(category)
+        cat_mask = df_cat_filtered['GLOBAL_GMC_C4_CATEGORY_DESC'].apply(normalize_text) == cat_norm
+        df_cat_filtered = df_cat_filtered[cat_mask].reset_index(drop=True)
+        print(f"5. Rows after Category filtering ('{category}'): {len(df_cat_filtered)}")
+    else:
+        print(f"5. Rows after Category filtering ('All Categories'): {len(df_cat_filtered)}")
 
+    # STEP D: Sub-Brand Filter
+    df_sb_filtered = df_cat_filtered
+    if sub_brand and str(sub_brand).strip().upper() not in ["ALL", "ALL SUB-BRANDS"]:
+        sb_norm = normalize_text(sub_brand)
+        sb_mask = df_sb_filtered['GLOBAL_GMC_B2_SUB_BRAND_DESC'].apply(normalize_text) == sb_norm
+        df_sb_filtered = df_sb_filtered[sb_mask].reset_index(drop=True)
+        print(f"6. Rows after Sub-Brand filtering ('{sub_brand}'): {len(df_sb_filtered)}")
+    else:
+        print(f"6. Rows after Sub-Brand filtering ('All Sub-Brands'): {len(df_sb_filtered)}")
 
-def fetch_postgres_models(selected_gbu: str, selected_need_state: str) -> List[str]:
-    """
-    Executes PostgreSQL query to fetch active Models for selected GBU and Need State.
-    """
-    if not selected_gbu or normalize_text(selected_gbu) in IGNORED_PLACEHOLDERS or not selected_need_state or normalize_text(selected_need_state) in IGNORED_PLACEHOLDERS:
-        return []
-
-    sql = """
-    SELECT DISTINCT
-        hm.model_id,
-        hm.model_name
-    FROM public.hierarchy_models hm
-    INNER JOIN public.hierarchy_mapping hmap
-        ON hm.model_id = hmap.model_id
-    WHERE hm.is_active = TRUE
-      AND hmap.is_active = TRUE
-      AND UPPER(TRIM(hmap.gbu_code)) = UPPER(TRIM(%s))
-      AND UPPER(TRIM(hmap.squad_name)) = UPPER(TRIM(%s))
-    ORDER BY hm.model_name;
-    """
-
-    models = []
-    try:
-        conn = get_postgres_connection()
-        cur = conn.cursor()
-        cur.execute(sql, (selected_gbu.strip(), selected_need_state.strip()))
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
-
-        models = [row[1] for row in rows if row[1]]
-    except Exception as e:
-        print(f"[POSTGRES MODEL FETCH NOTICE]: {e}")
-
-    return models
+    print(f"Final Filtered Row Count: {len(df_sb_filtered)}")
+    print("=" * 80 + "\n")
+    return df_sb_filtered
 
 
-def get_filter_options(model=None, brand=None, category=None, sub_brand=None, gbu=None, squad=None, df_sf=None):
-    """
-    Dynamically generates valid options for GBU, Squad/Need State, Model, Brand, Category, and Sub-Brand dropdowns.
-    GBU, Need State (C3 ONLY), and Model dropdowns are generated strictly from the PostgreSQL database mapping (na_ibp_db).
-    Brand, Category, and Sub-Brand options are generated from df_sf IF supplied.
-    DOES NOT execute Snowflake queries internally.
-    """
-    df_map = load_model_mapping_df(allow_fallback=False)
+# --- STEP 6: Dynamic Filter Options for Dropdowns ---
+def get_cascading_shipment_filter_options(model=None, brand=None, category=None, sub_brand=None):
+    models = get_shipment_model_options()
+    df_raw = fetch_shipment_raw_data()
+    df_mapped = map_and_normalize_hierarchy_columns(df_raw)
 
-    raw_gbus = fetch_postgres_gbus()
-    if not raw_gbus and not df_map.empty:
-        raw_gbus = sorted([str(g).strip().upper() for g in df_map['GLOBAL_GMC_C1_BUSINESS_SEGMENT_DESC'].dropna().unique() if normalize_text(g) != ""])
-    if not raw_gbus:
-        raw_gbus = ALLOWED_GBUS
-    gbu_opts = ["Select GBU"] + raw_gbus
+    # Apply Model filter first
+    df_mod = df_mapped
+    if model and str(model).strip().upper() not in ["ALL", "ALL MODELS"]:
+        model_norm = normalize_text(model)
+        df_excel = load_excel_mapping_file()
+        df_excel_norm = df_excel.copy()
+        df_excel_norm['Model_Norm'] = df_excel_norm['Model'].apply(normalize_text)
+        rules = df_excel_norm[df_excel_norm['Model_Norm'] == model_norm]
+        if not rules.empty:
+            df_norm = pd.DataFrame(index=df_mapped.index)
+            for col in EXCEL_HIERARCHY_COLUMNS:
+                df_norm[col] = df_mapped[col].apply(normalize_text) if col in df_mapped.columns else ""
+            
+            masks = []
+            for _, r in rules.iterrows():
+                r_mask = pd.Series(True, index=df_mapped.index)
+                for col in EXCEL_HIERARCHY_COLUMNS:
+                    v = normalize_text(r.get(col, ""))
+                    if v:
+                        r_mask &= (df_norm[col] == v)
+                masks.append(r_mask)
+            
+            f_mask = pd.Series(False, index=df_mapped.index)
+            for m in masks: f_mask |= m
+            df_mod = df_mapped[f_mask]
 
-    clean_squads = []
-    if gbu and normalize_text(gbu) not in IGNORED_PLACEHOLDERS:
-        clean_squads = fetch_postgres_need_states(gbu)
-        if not clean_squads and not df_map.empty:
-            df_gbu = df_map[df_map['GLOBAL_GMC_C1_BUSINESS_SEGMENT_DESC'].apply(normalize_text) == normalize_text(gbu)]
-            squads_c3 = df_gbu['GLOBAL_GMC_C3_NEED_STATE_DESC'].dropna().unique()
-            clean_squads = sorted([str(s).strip().upper() for s in squads_c3 if normalize_text(s) != ""])
-
-    squad_opts = ["Select Need State"] + clean_squads
-
-    clean_models = []
-    if gbu and normalize_text(gbu) not in IGNORED_PLACEHOLDERS and squad and normalize_text(squad) not in IGNORED_PLACEHOLDERS:
-        clean_models = fetch_postgres_models(gbu, squad)
-        if not clean_models and not df_map.empty:
-            selected_gbu_norm = normalize_text(gbu)
-            selected_need_state_norm = normalize_text(squad)
-            group_col = "model_id" if "model_id" in df_map.columns else "Model"
-            for _, model_group in df_map.groupby(group_col):
-                model_valid = False
-                for _, rule in model_group.iterrows():
-                    rule_gbu = normalize_text(rule.get("GLOBAL_GMC_C1_BUSINESS_SEGMENT_DESC", ""))
-                    rule_need_state = normalize_text(rule.get("GLOBAL_GMC_C3_NEED_STATE_DESC", ""))
-                    gbu_match = (selected_gbu_norm == "" or rule_gbu == "" or rule_gbu == selected_gbu_norm)
-                    need_state_match = (selected_need_state_norm == "" or rule_need_state == "" or rule_need_state == selected_need_state_norm)
-                    if gbu_match and need_state_match:
-                        model_valid = True
-                        break
-                if model_valid:
-                    m_name = model_group["Model"].iloc[0]
-                    if normalize_text(m_name) != "":
-                        clean_models.append(str(m_name).strip())
-            clean_models = sorted(list(set(clean_models)))
-
-    model_opts = ["Select Model"] + clean_models
-
-    print("=" * 70)
-    print("FILTER DROPDOWN DIAGNOSTICS (SOURCE: POSTGRESQL MAPPING ONLY)")
-    print("=" * 70)
-    print(f"Selected GBU:                 '{gbu}'")
-    print(f"Selected Need State:          '{squad}'")
-    print(f"Selected Model:               '{model}'")
-    print(f"GBU Options ({len(gbu_opts)}):            {gbu_opts}")
-    print(f"Need State Options ({len(squad_opts)}):     {squad_opts}")
-    print(f"Model Options ({len(model_opts)}):          {model_opts[:10]}...")
-    print("=" * 70)
-
-    if df_sf is not None and isinstance(df_sf, pd.DataFrame) and not df_sf.empty:
-        df_sf_copy = df_sf.copy()
-        df_sf_copy.columns = [c.upper() for c in df_sf_copy.columns]
-
-        avail_brands = sorted([str(b).upper() for b in df_sf_copy['POS_BRAND'].dropna().unique() if normalize_text(b) != ""])
-        brand_opts = ["All Brands"] + avail_brands
-
-        df_brand = df_sf_copy
-        if brand and normalize_text(brand) not in IGNORED_PLACEHOLDERS:
-            brand_norm = normalize_text(brand)
-            df_brand = df_sf_copy[df_sf_copy['POS_BRAND'].apply(normalize_text) == brand_norm]
-
-        avail_categories = sorted([str(c).upper() for c in df_brand['POS_CATEGORY'].dropna().unique() if normalize_text(c) != ""])
-        category_opts = ["All Categories"] + avail_categories
-
-        df_cat = df_brand
-        if category and normalize_text(category) not in IGNORED_PLACEHOLDERS:
-            cat_norm = normalize_text(category)
-            df_cat = df_brand[df_brand['POS_CATEGORY'].apply(normalize_text) == cat_norm]
-
-        avail_sub_brands = sorted([str(sb).upper() for sb in df_cat['POS_SUB_BRAND'].dropna().unique() if normalize_text(sb) != ""])
-        sub_brand_opts = ["All Sub-Brands"] + avail_sub_brands
-
+    if df_mod.empty:
         return {
-            "gbus": gbu_opts,
-            "squads": squad_opts,
-            "models": model_opts,
-            "brands": brand_opts,
-            "categories": category_opts,
-            "sub_brands": sub_brand_opts,
-            "retailers": ["All", "TOTAL US - MULTI OUTLET+"],
-            "segments": ["All"]
+            "models": models, "brands": ["All Brands"], "categories": ["All Categories"], "sub_brands": ["All Sub-Brands"]
         }
 
+    avail_b = sorted([str(b).strip().upper() for b in df_mod['GLOBAL_GMC_B1_BRAND_DESC'].dropna().unique() if str(b).strip() != ""])
+    brand_opts = ["All Brands"] + avail_b
+
+    df_b = df_mod
+    if brand and str(brand).strip().upper() not in ["ALL", "ALL BRANDS"]:
+        b_norm = normalize_text(brand)
+        df_b = df_mod[df_mod['GLOBAL_GMC_B1_BRAND_DESC'].apply(normalize_text) == b_norm]
+
+    avail_c = sorted([str(c).strip().upper() for c in df_b['GLOBAL_GMC_C4_CATEGORY_DESC'].dropna().unique() if str(c).strip() != ""])
+    cat_opts = ["All Categories"] + avail_c
+
+    df_c = df_b
+    if category and str(category).strip().upper() not in ["ALL", "ALL CATEGORIES"]:
+        c_norm = normalize_text(category)
+        df_c = df_b[df_b['GLOBAL_GMC_C4_CATEGORY_DESC'].apply(normalize_text) == c_norm]
+
+    avail_sb = sorted([str(sb).strip().upper() for sb in df_c['GLOBAL_GMC_B2_SUB_BRAND_DESC'].dropna().unique() if str(sb).strip() != ""])
+    sb_opts = ["All Sub-Brands"] + avail_sb
+
     return {
-        "gbus": gbu_opts,
-        "squads": squad_opts,
-        "models": model_opts,
-        "brands": ["All Brands"],
-        "categories": ["All Categories"],
-        "sub_brands": ["All Sub-Brands"],
-        "retailers": ["All", "TOTAL US - MULTI OUTLET+"],
-        "segments": ["All"]
+        "models": models,
+        "brands": brand_opts,
+        "categories": cat_opts,
+        "sub_brands": sb_opts
     }
 
 
-MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
+# --- STEP 7: Pure Calculation Helpers ---
+def calc_net(gross, ret):
+    if gross is None: return None
+    return gross - (ret if ret is not None else 0.0)
 
-_cached_kv_calendar_df = None
-_cached_date_to_kv_map = None
+def calc_pct_var(actual, comparison):
+    if actual is None or comparison is None or comparison == 0: return None
+    return ((actual - comparison) / abs(comparison)) * 100.0
 
-EXPLICIT_KV_CALENDAR_PATH = r"C:\Users\maniav1\OneDrive - Kenvue Brands LLC\Desktop\Dashboard\KV Calendar Data Dump.xlsx"
+def calc_share(month_val, total_val):
+    if month_val is None or total_val is None or total_val == 0: return None
+    return (month_val / total_val) * 100.0
 
-
-_kv_calendar_load_count = 0
-_kv_completeness_calc_count = 0
-_cached_completeness_map = {}
-
-
-def reset_kv_counters():
-    global _kv_calendar_load_count, _kv_completeness_calc_count, _cached_completeness_map
-    _kv_calendar_load_count = 0
-    _kv_completeness_calc_count = 0
-    _cached_completeness_map = {}
-
-
-def get_kv_calendar_load_count() -> int:
-    global _kv_calendar_load_count
-    return max(1, _kv_calendar_load_count) if _cached_kv_calendar_df is not None else _kv_calendar_load_count
-
-
-def get_kv_completeness_calc_count() -> int:
-    global _kv_completeness_calc_count
-    return max(1, _kv_completeness_calc_count) if _cached_completeness_map else _kv_completeness_calc_count
-
-
-def load_kv_calendar_df() -> pd.DataFrame:
-    """
-    Attempts to load the actual Kenvue Calendar Excel file if present on system.
-    Returns empty DataFrame if Excel file is not found (safe runtime execution).
-    """
-    global _cached_kv_calendar_df, _kv_calendar_load_count
-    if _cached_kv_calendar_df is not None:
-        return _cached_kv_calendar_df
-
-    _kv_calendar_load_count += 1
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    candidate_paths = [
-        EXPLICIT_KV_CALENDAR_PATH,
-        os.path.join(base_dir, "KV Calendar Data Dump.xlsx"),
-        os.path.join(base_dir, "KV Calender Data Dump.xlsx"),
-        os.path.join(base_dir, "kv_calendar_data_dump.xlsx"),
-        os.path.join(base_dir, "kv_calender_data_dump.xlsx"),
-    ]
-    env_path = os.getenv("KV_CALENDAR_PATH")
-    if env_path:
-        candidate_paths.insert(0, env_path if os.path.isabs(env_path) else os.path.join(base_dir, env_path))
-
-    df_cal = None
-    loaded_path = None
-
-    for cand in candidate_paths:
-        if cand and os.path.exists(cand):
-            try:
-                xl = pd.ExcelFile(cand)
-                df_cal = xl.parse(xl.sheet_names[0])
-                loaded_path = cand
-                break
-            except Exception as e:
-                print(f"Notice reading calendar excel '{cand}': {e}")
-
-    if df_cal is None or df_cal.empty:
-        df_cal = pd.DataFrame()
-
-    if not df_cal.empty:
-        df_cal.columns = [str(c).strip().upper() for c in df_cal.columns]
-
-    _cached_kv_calendar_df = df_cal
-
-    if loaded_path:
-        print("=" * 70)
-        print("ACTUAL KENVUE CALENDAR EXCEL DIAGNOSTICS")
-        print("=" * 70)
-        print(f"Calendar Excel Path: {loaded_path}")
-        print(f"Total Calendar Rows: {len(df_cal)}")
-        print(f"Calendar Columns:   {list(df_cal.columns)}")
-        print("=" * 70)
-
-    return df_cal
+def fmt_val(val, unit, status):
+    if status == "EMPTY" or val is None or math.isnan(val):
+        return ""
+    if unit == "$":
+        if isinstance(val, float) and val != int(val) and abs(val) < 1000 and round(val, 2) != round(val, 0):
+            return f"{val:,.2f}"
+        return f"{val:,.0f}"
+    elif unit == "Units":
+        return f"{val:,.0f}"
+    elif unit == "%":
+        return f"{val:.1f}%"
+    elif unit == "Ratio":
+        return f"{val:.2f}"
+    return f"{val:,.2f}"
 
 
-
-
-
-def build_kv_calendar_lookup_map() -> dict:
-    """
-    Builds a lookup dictionary mapping every week in the KV Calendar to Kenvue Month and Year
-    directly from the authoritative Kenvue Calendar Excel file ('KV Calendar Data Dump.xlsx').
-    """
-    import datetime
-    lookup = {}
-    df_cal = load_kv_calendar_df()
-
-    if df_cal is None or df_cal.empty:
-        raise FileNotFoundError(
-            "Authoritative Kenvue Calendar Excel file ('KV Calendar Data Dump.xlsx') is missing or empty. "
-            "Please ensure the Excel calendar file is present in the project directory."
+# --- STEP 8: Sidebar & Header UI Components ---
+sidebar = html.Div([
+    dcc.Store(id="active-tab", data="shipments"),
+    html.Div([
+        dcc.Markdown(
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 40" width="76" height="24"><text x="80" y="28" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="32" font-weight="900" fill="#ffffff" letter-spacing="-1.2px">kenvue</text></svg>',
+            dangerously_allow_html=True,
+            style={"margin": "0 auto", "display": "inline-block"}
         )
+    ], style={"marginTop": "32px", "marginBottom": "70px", "textAlign": "center"}),
 
-    for _, row in df_cal.iterrows():
-        m_nbr = None
-        for m_col in ['KV_MTH_NBR', 'KV_MONTH_NBR', 'CAL_MONTH_NBR', 'MONTH']:
-            if m_col in row and pd.notnull(row[m_col]):
-                try:
-                    m_nbr = int(float(row[m_col]))
-                    break
-                except Exception:
-                    pass
+    html.Div([
+        dbc.Button([
+            dcc.Markdown(
+                '<svg viewBox="0 0 24 24" width="26" height="26"><path d="M4 19h16v2H2V3h2v16zm3-7h3v5H7v-5zm5-5h3v10h-3V7zm5 3h3v7h-3v-7z" fill="#ffffff"/></svg>',
+                dangerously_allow_html=True, style={"margin": "0", "padding": "0", "pointerEvents": "none"}
+            ),
+            html.Span("Consumption", style={"color": "#ffffff", "fontSize": "11px", "fontWeight": "600", "marginTop": "4px", "pointerEvents": "none"})
+        ], id="nav-consumption", color="link", n_clicks=0, style={
+            "width": "84px", "height": "76px", "borderRadius": "10px", "display": "flex", "flexDirection": "column", "alignItems": "center", "justifyContent": "center", "cursor": "pointer", "opacity": "0.85", "backgroundColor": "transparent", "border": "none", "textDecoration": "none"
+        }),
 
-        if m_nbr is None or m_nbr < 1 or m_nbr > 12:
-            continue
+        dbc.Button([
+            dcc.Markdown(
+                '<svg viewBox="0 0 24 24" width="26" height="26"><path d="M20 8h-3V4H3c-1.1 0-2 .9-2 2v11h2c0 1.66 1.34 3 3 3s3-1.34 3-3h6c0 1.66 1.34 3 3 3s3-1.34 3-3h2v-5l-3-4zM6 18.5c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5zm13.5-9l1.96 2.5H17V9.5h2.5zm-1 9c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5z" fill="#ffffff"/></svg>',
+                dangerously_allow_html=True, style={"margin": "0", "padding": "0", "pointerEvents": "none"}
+            ),
+            html.Span("Shipments", style={"color": "#ffffff", "fontSize": "11px", "fontWeight": "600", "marginTop": "4px", "pointerEvents": "none"})
+        ], id="nav-shipments", color="link", n_clicks=0, style={
+            "backgroundColor": "#019881", "width": "84px", "height": "76px", "borderRadius": "10px", "display": "flex", "flexDirection": "column", "alignItems": "center", "justifyContent": "center", "cursor": "pointer", "boxShadow": "0 2px 6px rgba(0,0,0,0.2)", "border": "none", "textDecoration": "none"
+        })
+    ], style={"display": "flex", "flexDirection": "column", "gap": "24px", "alignItems": "center", "width": "100%"})
+], style={
+    "position": "fixed", "top": "0", "left": "0", "bottom": "0", "width": "104px", "backgroundColor": "#019881", "zIndex": "1000", "display": "flex", "flexDirection": "column", "alignItems": "center", "boxShadow": "2px 0 10px rgba(0,0,0,0.15)"
+})
 
-        m_idx = m_nbr - 1
-        m_name = MONTHS[m_idx]
+main_content = html.Div([
+    html.Div([
+        html.Div(id="header-title-container", children=[
+            html.H1(["SHIPMENT", html.Br(), "VALIDATION"], style={
+                "color": "#ffffff", "fontWeight": "900", "fontSize": "22px", "letterSpacing": "1.5px", "margin": "0", "textTransform": "uppercase", "lineHeight": "1.2"
+            })
+        ], style={
+            "backgroundColor": "#019881", "border": "1px solid #019881", "borderRadius": "14px", "padding": "14px 40px", "display": "inline-block", "boxShadow": "0 4px 14px rgba(1, 152, 129, 0.25)"
+        })
+    ], style={"textAlign": "center", "marginBottom": "20px"}),
 
-        yr = None
-        for yr_col in ['KV_YEAR', 'CAL_YEAR', 'YEAR']:
-            if yr_col in row and pd.notnull(row[yr_col]):
-                try:
-                    yr = int(float(row[yr_col]))
-                    break
-                except Exception:
-                    pass
+    html.Div([
+        html.Span(id="live-record-count", style={"display": "none"}),
 
-        wk_beg_dt = None
-        wk_end_dt = None
-        for b_col in ['KV_WEEK_BEGINNING', 'CAL_WEEK_BEGINNING', 'WEEK_BEGINNING']:
-            if b_col in row and pd.notnull(row[b_col]):
-                dt = pd.to_datetime(row[b_col], errors='coerce')
-                if pd.notnull(dt):
-                    wk_beg_dt = dt.date()
-                    break
+        dbc.Row([
+            dbc.Col([
+                html.Label("Model:", style={"fontWeight": "600", "fontSize": "11px", "marginBottom": "2px"}),
+                dcc.Dropdown(
+                    id="filter-model",
+                    options=[{"label": m, "value": m} for m in get_shipment_model_options()],
+                    value="All Models", clearable=False, style={"fontSize": "12px"}
+                )
+            ], width=3),
+            dbc.Col([
+                html.Label("Brand:", style={"fontWeight": "600", "fontSize": "11px", "marginBottom": "2px"}),
+                dcc.Dropdown(
+                    id="filter-brand",
+                    options=[{"label": b, "value": b} for b in ["All Brands"]],
+                    value="All Brands", clearable=False, style={"fontSize": "12px"}
+                )
+            ], width=2),
+            dbc.Col([
+                html.Label("Category:", style={"fontWeight": "600", "fontSize": "11px", "marginBottom": "2px"}),
+                dcc.Dropdown(
+                    id="filter-category",
+                    options=[{"label": c, "value": c} for c in ["All Categories"]],
+                    value="All Categories", clearable=False, style={"fontSize": "12px"}
+                )
+            ], width=2),
+            dbc.Col([
+                html.Label("Sub-Brand:", style={"fontWeight": "600", "fontSize": "11px", "marginBottom": "2px"}),
+                dcc.Dropdown(
+                    id="filter-sub-brand",
+                    options=[{"label": sb, "value": sb} for sb in ["All Sub-Brands"]],
+                    value="All Sub-Brands", clearable=False, style={"fontSize": "12px"}
+                )
+            ], width=3),
+            dbc.Col([
+                html.Label("\u00a0", style={"display": "block", "marginBottom": "2px"}),
+                dbc.Button("REFRESH DATA", id="btn-refresh", color="success", n_clicks=0, style={
+                    "backgroundColor": "#019881", "color": "#ffffff", "fontWeight": "700", "fontSize": "12px", "padding": "6px 12px", "width": "100%", "border": "none"
+                })
+            ], width=2),
+        ])
+    ], style={
+        "backgroundColor": "#ffffff", "border": "1px solid #e9ecef", "borderRadius": "10px", "padding": "14px 20px", "marginBottom": "16px", "boxShadow": "0 4px 12px rgba(0,0,0,0.05)"
+    }),
 
-        for e_col in ['KV_WEEK_ENDING', 'CAL_WEEK_ENDING', 'WEEK_ENDING', 'CAL_DATE']:
-            if e_col in row and pd.notnull(row[e_col]):
-                dt = pd.to_datetime(row[e_col], errors='coerce')
-                if pd.notnull(dt):
-                    wk_end_dt = dt.date()
-                    break
+    html.Div([
+        html.Div(id="spreadsheet-container", style={"overflowX": "auto", "border": "1px solid #858585", "borderRadius": "6px"})
+    ], style={"backgroundColor": "#ffffff", "borderRadius": "10px", "boxShadow": "0 4px 12px rgba(0,0,0,0.05)", "border": "1px solid #e9ecef", "padding": "16px", "marginBottom": "16px"})
+], style={
+    "marginLeft": "104px", "padding": "16px 24px", "maxWidth": "calc(100% - 104px)", "backgroundColor": "#f8f9fa", "fontFamily": "sans-serif", "minHeight": "100vh"
+})
 
-        if not yr and wk_beg_dt:
-            yr = wk_beg_dt.year
-
-        if not yr:
-            continue
-
-        y_str = str(yr)
-        qtr = f"Q{(m_idx // 3) + 1}"
-
-        info = {
-            "m_idx": m_idx,
-            "m_nbr": m_nbr,
-            "m_name": m_name,
-            "y_str": y_str,
-            "quarter": qtr,
-            "kv_wk_id": str(row.get('KV_WK_ID', f"{y_str}{m_nbr:02d}")),
-            "kv_tm_per_id": str(row.get('KV_TM_PER_ID', f"{y_str}_{m_name}")),
-            "kv_mo_id": str(row.get('KV_MO_ID', f"{y_str}{m_nbr:02d}")),
-            "kv_week_beginning": wk_beg_dt.strftime('%Y-%m-%d') if wk_beg_dt else "",
-            "kv_week_ending": wk_end_dt.strftime('%Y-%m-%d') if wk_end_dt else ""
-        }
-
-        if wk_beg_dt and wk_end_dt:
-            cur = wk_beg_dt
-            while cur <= wk_end_dt:
-                iso_str = cur.strftime('%Y-%m-%d')
-                short_str = cur.strftime('%d-%b-%y').upper()
-                full_str = cur.strftime('%d-%b-%Y').upper()
-                slash_str = cur.strftime('%m/%d/%Y')
-
-                lookup[iso_str] = info
-                lookup[short_str] = info
-                lookup[full_str] = info
-                lookup[slash_str] = info
-                cur += datetime.timedelta(days=1)
-        elif wk_end_dt:
-            iso_str = wk_end_dt.strftime('%Y-%m-%d')
-            short_str = wk_end_dt.strftime('%d-%b-%y').upper()
-            full_str = wk_end_dt.strftime('%d-%b-%Y').upper()
-
-            lookup[iso_str] = info
-            lookup[short_str] = info
-            lookup[full_str] = info
-
-    return lookup
-
-
-def map_date_to_kv_calendar(d_str: str) -> dict:
-    """
-    Maps a Snowflake weekly date string (GLOBAL_DATE_SHORT_DESC)
-    to Kenvue Fiscal Calendar properties using ONLY the authoritative Kenvue Calendar.
-
-    REQUIRED BUSINESS RULE:
-    A Kenvue week belongs to the Kenvue month in which the WEEK STARTS (KV_WEEK_BEGINNING).
-
-    KV_WEEK_BEGINNING <= weekly date <= KV_WEEK_ENDING
-    KV_WEEK_BEGINNING determines the Kenvue Month (KV_MTH_NBR) and Year (KV_YEAR).
-
-    Returns dict with keys: m_idx (0-11), m_nbr (1-12), m_name ('JAN'..'DEC'), y_str ('2021'..), quarter ('Q1'..'Q4').
-    """
-    global _cached_date_to_kv_map
-    import datetime
-
-    if not d_str or pd.isna(d_str):
-        return None
-
-    d_clean = str(d_str).strip().upper()
-
-    if _cached_date_to_kv_map is None:
-        _cached_date_to_kv_map = build_kv_calendar_lookup_map()
-
-    if d_clean in _cached_date_to_kv_map:
-        return _cached_date_to_kv_map[d_clean]
-
-    parsed_dt = None
-    try:
-        parsed_dt = pd.to_datetime(d_clean, errors='coerce')
-    except Exception:
-        pass
-
-    if pd.isnull(parsed_dt) or parsed_dt is None:
-        return None
-
-    iso_str = parsed_dt.strftime('%Y-%m-%d')
-    if iso_str in _cached_date_to_kv_map:
-        return _cached_date_to_kv_map[iso_str]
-
-    short_str = parsed_dt.strftime('%d-%b-%y').upper()
-    if short_str in _cached_date_to_kv_map:
-        return _cached_date_to_kv_map[short_str]
-
-    full_str = parsed_dt.strftime('%d-%b-%Y').upper()
-    if full_str in _cached_date_to_kv_map:
-        return _cached_date_to_kv_map[full_str]
-
-    dt_date = parsed_dt.date()
-    for k, info in _cached_date_to_kv_map.items():
-        try:
-            wb = pd.to_datetime(info.get('kv_week_beginning')).date()
-            we = pd.to_datetime(info.get('kv_week_ending')).date()
-            if wb <= dt_date <= we:
-                return info
-        except Exception:
-            pass
-
-    # Dynamic fallback for dates outside explicit Excel calendar dump range (e.g. 2021-2025 dates)
-    m_nbr = parsed_dt.month
-    m_idx = m_nbr - 1
-    y_str = str(parsed_dt.year)
-    qtr = f"Q{(m_idx // 3) + 1}"
-    m_name = MONTHS[m_idx] if 0 <= m_idx < 12 else "JAN"
-
-    return {
-        "m_idx": m_idx,
-        "m_nbr": m_nbr,
-        "m_name": m_name,
-        "y_str": y_str,
-        "quarter": qtr,
-        "kv_wk_id": f"{y_str}{m_nbr:02d}",
-        "kv_tm_per_id": f"{y_str}_{m_name}",
-        "kv_mo_id": f"{y_str}{m_nbr:02d}",
-        "kv_week_beginning": parsed_dt.strftime('%Y-%m-%d'),
-        "kv_week_ending": parsed_dt.strftime('%Y-%m-%d')
-    }
+app.layout = html.Div([sidebar, main_content])
 
 
-def get_kv_month_completeness_status(df: pd.DataFrame, target_year: Optional[str] = None) -> dict:
-    """
-    Determines Kenvue Month completeness for loaded dataset using the authoritative Kenvue Calendar.
-    A Kenvue Month is COMPLETE if and only if ALL required Kenvue fiscal weeks for that month in the calendar
-    are present in the loaded Snowflake weekly dataset (SET comparison: available_week_ids == required_week_ids).
-    Memoized per dataframe & target_year to ensure ONCE-PER-REFRESH execution.
-    """
-    global _cached_completeness_map, _kv_completeness_calc_count
-    cache_key = (id(df), len(df) if df is not None and isinstance(df, pd.DataFrame) else 0, str(target_year))
-    if cache_key in _cached_completeness_map:
-        return _cached_completeness_map[cache_key]
+# --- STEP 9: Dashboard Callbacks ---
+@app.callback(
+    [Output("active-tab", "data"),
+     Output("live-record-count", "children"),
+     Output("spreadsheet-container", "children"),
+     Output("filter-model", "options"),
+     Output("filter-brand", "options"),
+     Output("filter-category", "options"),
+     Output("filter-sub-brand", "options"),
+     Output("filter-brand", "value"),
+     Output("filter-category", "value"),
+     Output("filter-sub-brand", "value"),
+     Output("header-title-container", "children")],
+    [Input("btn-refresh", "n_clicks"),
+     Input("filter-model", "value"),
+     Input("filter-brand", "value"),
+     Input("filter-category", "value"),
+     Input("filter-sub-brand", "value"),
+     Input("nav-consumption", "n_clicks"),
+     Input("nav-shipments", "n_clicks")],
+    [State("active-tab", "data")]
+)
+def update_shipment_dashboard(n_clicks, model, brand, category, sub_brand, c_clicks, s_clicks, active_tab_state):
+    triggered_id = dash.ctx.triggered_id if dash.ctx.triggered_id else None
+    active_tab = "shipments"
 
-    _kv_completeness_calc_count += 1
-    cal_lookup = build_kv_calendar_lookup_map()
-    
-    cal_dates = [k for k in cal_lookup.keys() if isinstance(k, str) and len(k) == 10 and k[4] == '-' and k[7] == '-']
-    cal_min_date = min(cal_dates) if cal_dates else "N/A"
-    cal_max_date = max(cal_dates) if cal_dates else "N/A"
+    # Reset behavior when parent filter changes
+    if triggered_id == "filter-model":
+        brand = "All Brands"
+        category = "All Categories"
+        sub_brand = "All Sub-Brands"
+    elif triggered_id == "filter-brand":
+        category = "All Categories"
+        sub_brand = "All Sub-Brands"
+    elif triggered_id == "filter-category":
+        sub_brand = "All Sub-Brands"
 
-    cal_weeks_by_month = {}
-    cal_years_set = set()
-    cal_months_set = set()
+    # 1. Retrieve Raw Shipment & POS Data
+    df_ship_raw = fetch_shipment_raw_data(model=model)
+    df_pos_raw = database.fetch_joined_snowflake_data(brand=brand, category=category, sub_brand=sub_brand, model=model)
 
-    for d_key, info in cal_lookup.items():
-        if isinstance(info, dict) and "y_str" in info and "m_nbr" in info:
-            y_str = info["y_str"]
-            m_nbr = int(info["m_nbr"])
-            cal_years_set.add(y_str)
-            cal_months_set.add(f"{y_str}-{m_nbr:02d}")
-            wk_id = info.get("kv_wk_id") or info.get("kv_week_beginning")
-            if wk_id:
-                key = (y_str, m_nbr)
-                if key not in cal_weeks_by_month:
-                    cal_weeks_by_month[key] = set()
-                cal_weeks_by_month[key].add(wk_id)
+    # 2. Filter Shipment Data through rule-based Model/Brand/Category/Sub-Brand pipeline
+    df_ship = filter_shipment_dataframe(df_ship_raw, model=model, brand=brand, category=category, sub_brand=sub_brand)
+    df_pos = filter_shipment_dataframe(df_pos_raw, model=model, brand=brand, category=category, sub_brand=sub_brand) if not df_pos_raw.empty else pd.DataFrame()
 
-    df_weeks_by_month = {}
-    all_sf_weeks = []
-    latest_yr_found = None
-    
-    if df is not None and isinstance(df, pd.DataFrame) and not df.empty:
+    rec_count = len(df_ship)
+    record_str = f"Shipment Snowflake Mapped Records: {rec_count}"
+
+    # 3. Dynamic Filter Dropdown Options
+    opts = get_cascading_shipment_filter_options(model=model, brand=brand, category=category, sub_brand=sub_brand)
+    model_opts = [{"label": m, "value": m} for m in opts.get("models", ["All Models"])]
+    brand_opts = [{"label": b, "value": b} for b in opts.get("brands", ["All Brands"])]
+    cat_opts = [{"label": c, "value": c} for c in opts.get("categories", ["All Categories"])]
+    sub_brand_opts = [{"label": sb, "value": sb} for sb in opts.get("sub_brands", ["All Sub-Brands"])]
+
+    # Validate selected values against dropdown options
+    valid_b = [b["value"] for b in brand_opts]
+    if brand not in valid_b: brand = "All Brands"
+    valid_c = [c["value"] for c in cat_opts]
+    if category not in valid_c: category = "All Categories"
+    valid_sb = [sb["value"] for sb in sub_brand_opts]
+    if sub_brand not in valid_sb: sub_brand = "All Sub-Brands"
+
+    # 4. Aggregation into Monthly Values per Year
+    month_idx_map = {m: i for i, m in enumerate(MONTHS)}
+    data_by_year = {}
+
+    def process_records(df, is_shipment=True):
+        if df.empty: return
         for _, r in df.iterrows():
             d_str = str(r.get('GLOBAL_DATE_SHORT_DESC', '')).strip()
-            if d_str:
-                all_sf_weeks.append(d_str)
-            
-            kv_info = map_date_to_kv_calendar(d_str) if d_str else None
+            kv_info = database.map_date_to_kv_calendar(d_str) if d_str else None
+            m_idx = None
+            y_str = "2026"
             if kv_info:
-                y_s = kv_info["y_str"]
-                m_n = int(kv_info["m_nbr"])
-                wk_id = kv_info.get("kv_wk_id") or kv_info.get("kv_week_beginning")
-                key = (y_s, m_n)
-                if key not in df_weeks_by_month:
-                    df_weeks_by_month[key] = set()
-                if wk_id:
-                    df_weeks_by_month[key].add(wk_id)
-                if not latest_yr_found or y_s > latest_yr_found:
-                    latest_yr_found = y_s
-            elif r.get('KV_MONTH'):
-                kv_m_str = str(r.get('KV_MONTH', '')).strip()
-                if '-' in kv_m_str:
-                    parts = kv_m_str.split('-')
-                    y_s = parts[0]
-                    m_n = int(parts[1])
-                    key = (y_s, m_n)
-                    if key not in df_weeks_by_month:
-                        df_weeks_by_month[key] = set()
-                    wk_id = d_str or f"{y_s}_{m_n}"
-                    df_weeks_by_month[key].add(wk_id)
-                    if not latest_yr_found or y_s > latest_yr_found:
-                        latest_yr_found = y_s
-
-    target_yr = target_year or latest_yr_found or ""
-    
-    month_details = {}
-    latest_complete_m_nbr = 0
-
-    print("=" * 80)
-    print("AUTHORITATIVE KENVUE CALENDAR & MONTH COMPLETENESS DIAGNOSTICS")
-    print("=" * 80)
-
-    for m_n in range(1, 13):
-        key = (target_yr, m_n)
-        req_set = cal_weeks_by_month.get(key, set())
-        avail_set = df_weeks_by_month.get(key, set())
-
-        req_wks = len(req_set)
-        avail_wks = len(avail_set)
-
-        # SET comparison: A month is COMPLETE only when available_week_ids == required_week_ids
-        is_comp = (avail_set == req_set) if req_wks > 0 else False
-        
-        req_ids_list = sorted(list(req_set))
-        avail_ids_list = sorted(list(avail_set))
-
-        month_details[m_n] = {
-            "required_wks": req_wks,
-            "available_wks": avail_wks,
-            "required_week_ids": req_ids_list,
-            "available_week_ids": avail_ids_list,
-            "is_complete": is_comp
-        }
-
-        m_str = f"{target_yr}-{m_n:02d}"
-        print(f"\n{m_str}")
-        print(f"Required:        {req_ids_list}")
-        print(f"Available:       {avail_ids_list}")
-        print(f"Required Count:  {req_wks}")
-        print(f"Available Count: {avail_wks}")
-        print(f"Complete:        {is_comp}")
-
-        if is_comp and m_n == latest_complete_m_nbr + 1:
-            latest_complete_m_nbr = m_n
-
-    if latest_complete_m_nbr == 0:
-        for m_n in range(1, 13):
-            if month_details[m_n]["is_complete"]:
-                latest_complete_m_nbr = m_n
-
-    if latest_complete_m_nbr == 0:
-        latest_complete_m_idx = -1
-        m_name = "NONE"
-        ytd_s = slice(0, 0)
-        ytg_s = slice(0, 12)
-        ytd_range_str = "NONE"
-        ytg_range_str = "JAN to DEC"
-    else:
-        latest_complete_m_idx = latest_complete_m_nbr - 1
-        m_name = MONTHS[latest_complete_m_idx] if 0 <= latest_complete_m_idx < 12 else "DEC"
-        ytd_s = slice(0, latest_complete_m_nbr)
-        ytg_s = slice(latest_complete_m_nbr, 12)
-        ytd_range_str = f"JAN to {m_name}"
-        ytg_range_str = f"{MONTHS[latest_complete_m_nbr] if latest_complete_m_nbr < 12 else 'NONE'} to DEC"
-
-    sf_min_wk = min(all_sf_weeks) if all_sf_weeks else "N/A"
-    sf_max_wk = max(all_sf_weeks) if all_sf_weeks else "N/A"
-
-    print("\n" + "=" * 80)
-    print(f"Calendar Minimum Date:       {cal_min_date}")
-    print(f"Calendar Maximum Date:       {cal_max_date}")
-    print(f"Calendar Years Detected:     {sorted(list(cal_years_set))}")
-    print(f"Calendar Months Count:       {len(cal_months_set)}")
-    print(f"Snowflake Min Available Wk:  {sf_min_wk}")
-    print(f"Snowflake Max Available Wk:  {sf_max_wk}")
-    print(f"Target Planning Year:        {target_yr}")
-    print(f"Latest Complete Month:       {m_name} (Month {latest_complete_m_nbr})")
-    print(f"YTD Period Range:            {ytd_range_str}")
-    print(f"YTG Period Range:            {ytg_range_str}")
-    print("=" * 80)
-
-    res = {
-        "latest_year": target_yr,
-        "latest_available_week": sf_max_wk,
-        "latest_complete_m_nbr": latest_complete_m_nbr,
-        "latest_complete_m_idx": latest_complete_m_idx,
-        "latest_complete_m_name": m_name,
-        "ytd_slice": ytd_s,
-        "ytg_slice": ytg_s,
-        "ytd_range_str": ytd_range_str,
-        "ytg_range_str": ytg_range_str,
-        "cal_min_date": cal_min_date,
-        "cal_max_date": cal_max_date,
-        "cal_years": sorted(list(cal_years_set)),
-        "sf_min_wk": sf_min_wk,
-        "sf_max_wk": sf_max_wk,
-        "month_details": month_details
-    }
-    _cached_completeness_map[cache_key] = res
-    return res
-
-
-_cached_price_index_df = None
-_cached_price_index_map = None
-_price_index_duplicates = []
-_price_index_loaded_path = None
-
-EXPLICIT_PRICE_INDEX_PATH = r"C:\Users\maniav1\OneDrive - Kenvue Brands LLC\Desktop\Dashboard\Price Index.xlsx"
-
-MONTH_NUMBER_TO_3LETTER = {
-    1: "JAN", 2: "FEB", 3: "MAR", 4: "APR", 5: "MAY", 6: "JUN",
-    7: "JUL", 8: "AUG", 9: "SEP", 10: "OCT", 11: "NOV", 12: "DEC"
-}
-
-MONTH_NAME_MAP = {
-    "JAN": "JAN", "JANUARY": "JAN",
-    "FEB": "FEB", "FEBRUARY": "FEB",
-    "MAR": "MAR", "MARCH": "MAR",
-    "APR": "APR", "APRIL": "APR",
-    "MAY": "MAY",
-    "JUN": "JUN", "JUNE": "JUN",
-    "JUL": "JUL", "JULY": "JUL",
-    "AUG": "AUG", "AUGUST": "AUG",
-    "SEP": "SEP", "SEPTEMBER": "SEP",
-    "OCT": "OCT", "OCTOBER": "OCT",
-    "NOV": "NOV", "NOVEMBER": "NOV",
-    "DEC": "DEC", "DECEMBER": "DEC",
-}
-
-
-def normalize_month_3letter(val) -> str:
-    """
-    Normalizes any month input (number, date, string) into a standard 3-letter month representation:
-    'JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'.
-    """
-    import datetime
-    if pd.isna(val) or val is None:
-        return ""
-    if isinstance(val, (int, float)):
-        try:
-            n = int(val)
-            if 1 <= n <= 12:
-                return MONTH_NUMBER_TO_3LETTER[n]
-        except Exception:
-            pass
-    if isinstance(val, (pd.Timestamp, datetime.date, datetime.datetime)):
-        return MONTH_NUMBER_TO_3LETTER.get(val.month, "")
-
-    s = str(val).strip().upper()
-    if not s or s in ["NAN", "NONE", "NULL", "N/A"]:
-        return ""
-
-    if s.isdigit():
-        n = int(s)
-        if 1 <= n <= 12:
-            return MONTH_NUMBER_TO_3LETTER[n]
-
-    tokens = re.findall(r'[A-Z0-9]+', s)
-    for t in tokens:
-        if t in MONTH_NAME_MAP:
-            return MONTH_NAME_MAP[t]
-
-    m_iso = re.search(r'(\d{4})[-/](\d{1,2})', s)
-    if m_iso:
-        mo = int(m_iso.group(2))
-        if 1 <= mo <= 12:
-            return MONTH_NUMBER_TO_3LETTER[mo]
-
-    m_us = re.search(r'(\d{1,2})[-/](\d{4})', s)
-    if m_us:
-        mo = int(m_us.group(1))
-        if 1 <= mo <= 12:
-            return MONTH_NUMBER_TO_3LETTER[mo]
-
-    return ""
-
-
-def generate_fallback_price_index_excel(target_path: str):
-    """
-    Generates a fallback Price Index Excel file on disk if no Excel file exists.
-    Supports row 2 headers (header=1):
-      Row 1 (0-indexed 0): 'Kenvue Price Index Master File'
-      Row 2 (0-indexed 1): Mnth, MODEL, INDEX
-    """
-    try:
-        months_3l = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
-        models = [
-            "Adult Sudafed", "NTG Hair", "Pediatric Sudafed", "Band-Aid", "Tylenol",
-            "Motrin", "Zyrtec", "Benadryl", "Listerine", "Neutrogena", "Aveeno"
-        ]
-
-        adult_sudafed_indices = {
-            "JAN": 0.7600, "FEB": 0.7800, "MAR": 0.7500, "APR": 0.7400,
-            "MAY": 0.7300, "JUN": 0.7200, "JUL": 0.7100, "AUG": 0.7000,
-            "SEP": 0.7500, "OCT": 0.7700, "NOV": 0.7900, "DEC": 0.8000
-        }
-
-        rows = []
-        for m_str in months_3l:
-            for mod in models:
-                norm_mod = normalize_text(mod)
-                if norm_mod == "ADULT SUDAFED":
-                    idx_val = adult_sudafed_indices.get(m_str, 0.7600)
-                else:
-                    base_idx = 1.02 + ((hash(f"{m_str}_{mod}") % 100) / 1000.0)
-                    idx_val = round(base_idx, 4)
-                rows.append({"Mnth": m_str, "MODEL": mod, "INDEX": idx_val})
-
-        df_data = pd.DataFrame(rows)
-
-        with pd.ExcelWriter(target_path, engine='openpyxl') as writer:
-            title_df = pd.DataFrame([["Kenvue Price Index Master File", "", ""]])
-            title_df.to_excel(writer, index=False, header=False, startrow=0)
-            df_data.to_excel(writer, index=False, header=True, startrow=1)
-
-        print(f"[INFO] Created fallback Price Index Excel at '{target_path}' with {len(df_data)} rows.")
-    except Exception as e:
-        print(f"Notice creating fallback Price Index excel: {e}")
-
-
-def load_price_index_df() -> pd.DataFrame:
-    """
-    Loads Price Index Excel file from explicit path or candidate local paths.
-    Tries header=1 (row 2 headers) first, then header=0 if needed.
-    Returns DataFrame containing columns: Mnth, MODEL, INDEX.
-    Caches the DataFrame in module memory.
-    """
-    global _cached_price_index_df, _price_index_loaded_path
-    if _cached_price_index_df is not None:
-        return _cached_price_index_df
-
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    candidate_paths = [
-        EXPLICIT_PRICE_INDEX_PATH,
-        r"C:\Users\mania\OneDrive - Kenvue Brands LLC\Desktop\Dashboard\Price Index.xlsx",
-        os.path.join(base_dir, "Price Index.xlsx"),
-        os.path.join(base_dir, "price_index.xlsx"),
-        os.path.join(base_dir, "Price_Index.xlsx"),
-    ]
-    env_path = os.getenv("PRICE_INDEX_PATH")
-    if env_path:
-        candidate_paths.insert(0, env_path if os.path.isabs(env_path) else os.path.join(base_dir, env_path))
-
-    df_idx = None
-    loaded_path = None
-
-    for cand in candidate_paths:
-        if cand and os.path.exists(cand):
-            try:
-                df_temp = pd.read_excel(cand, header=1)
-                cols_upper = [str(c).strip().upper() for c in df_temp.columns]
-                if any("MNTH" in c or "MONTH" in c for c in cols_upper) and any("MODEL" in c for c in cols_upper):
-                    df_idx = df_temp
-                    loaded_path = cand
-                    break
-            except Exception:
-                pass
-
-            try:
-                df_temp = pd.read_excel(cand, header=0)
-                cols_upper = [str(c).strip().upper() for c in df_temp.columns]
-                if any("MNTH" in c or "MONTH" in c for c in cols_upper) and any("MODEL" in c for c in cols_upper):
-                    df_idx = df_temp
-                    loaded_path = cand
-                    break
-            except Exception:
-                pass
-
-    if df_idx is None or df_idx.empty:
-        fallback_path = os.path.join(base_dir, "Price Index.xlsx")
-        generate_fallback_price_index_excel(fallback_path)
-        if os.path.exists(fallback_path):
-            try:
-                df_idx = pd.read_excel(fallback_path, header=1)
-                loaded_path = fallback_path
-            except Exception as e:
-                try:
-                    df_idx = pd.read_excel(fallback_path, header=0)
-                    loaded_path = fallback_path
-                except Exception:
-                    pass
-
-    if df_idx is None or df_idx.empty:
-        df_idx = pd.DataFrame()
-
-    _cached_price_index_df = df_idx
-    _price_index_loaded_path = loaded_path or EXPLICIT_PRICE_INDEX_PATH
-    return df_idx
-
-
-def normalize_month_key(val) -> str:
-    """
-    Normalizes month representation into standard 3-letter month code ('JAN'..'DEC').
-    """
-    return normalize_month_3letter(val)
-
-
-def get_price_index_lookup_map() -> dict:
-    """
-    Builds a lookup dictionary mapping (norm_3letter_month, norm_model) -> INDEX multiplier.
-    Lookup Key Rule: MONTH + MODEL (NOT YEAR + MONTH + MODEL).
-    Example key: ('JAN', 'ADULT SUDAFED') -> 0.76
-    Detects and logs duplicate Mnth + MODEL entries.
-    """
-    global _cached_price_index_map, _price_index_duplicates
-    if _cached_price_index_map is not None:
-        return _cached_price_index_map
-
-    df_idx = load_price_index_df()
-    lookup = {}
-    duplicates = []
-
-    if not df_idx.empty:
-        mnth_col = None
-        model_col = None
-        index_col = None
-
-        for c in df_idx.columns:
-            c_clean = str(c).strip().upper()
-            if "MNTH" in c_clean or "MONTH" in c_clean:
-                mnth_col = c
-            elif "MODEL" in c_clean:
-                model_col = c
-            elif "INDEX" in c_clean:
-                index_col = c
-
-        if mnth_col and model_col and index_col:
-            for _, row in df_idx.iterrows():
-                m_raw = row[mnth_col]
-                model_raw = row[model_col]
-                idx_raw = row[index_col]
-
-                norm_m = normalize_month_3letter(m_raw)
-                norm_model = normalize_text(model_raw)
-
-                if norm_m and norm_model and pd.notnull(idx_raw):
+                m_idx = kv_info["m_idx"]
+                y_str = kv_info["y_str"]
+            else:
+                parts = d_str.split('-')
+                if len(parts) == 2:
+                    p1, p2 = parts[0].upper(), parts[1]
+                    if p1[:3] in MONTHS:
+                        m_idx = month_idx_map.get(p1[:3])
+                        y_str = p2 if len(p2) == 4 else ("20" + p2 if len(p2) == 2 else p2)
+                    elif p2[:3] in MONTHS:
+                        m_idx = month_idx_map.get(p2[:3])
+                        y_str = p1 if len(p1) == 4 else ("20" + p1 if len(p1) == 2 else p1)
+                    elif p1.isdigit() and p2.isdigit():
+                        if len(p1) == 4:
+                            y_str = p1
+                            m_idx = (int(p2) - 1) if 1 <= int(p2) <= 12 else None
+                elif len(parts) == 3:
+                    p1, p2, p3 = parts[0].upper(), parts[1].upper(), parts[2]
+                    if p2[:3] in MONTHS:
+                        m_idx = month_idx_map.get(p2[:3])
+                        y_str = p3 if len(p3) == 4 else ("20" + p3 if len(p3) == 2 else p3)
+                    elif p1.isdigit() and len(p1) == 4:
+                        y_str = p1
+                        if p2.isdigit() and 1 <= int(p2) <= 12:
+                            m_idx = int(p2) - 1
+                if m_idx is None and d_str:
                     try:
-                        idx_val = float(idx_raw)
-                        key = (norm_m, norm_model)
-                        if key in lookup:
-                            duplicates.append({
-                                "norm_month": norm_m,
-                                "norm_model": norm_model,
-                                "existing_index": lookup[key],
-                                "duplicate_index": idx_val
-                            })
-                        lookup[key] = idx_val
+                        dt = pd.to_datetime(d_str, errors='coerce')
+                        if pd.notnull(dt):
+                            m_idx = dt.month - 1
+                            y_str = str(dt.year)
                     except Exception:
                         pass
 
-    _cached_price_index_map = lookup
-    _price_index_duplicates = duplicates
-    return lookup
+            if m_idx is not None:
+                if y_str not in data_by_year:
+                    data_by_year[y_str] = {
+                        "gross_ship": [None]*12, "return_ship": [None]*12,
+                        "gross_cu": [None]*12, "return_cu": [None]*12,
+                        "gross_case": [None]*12, "return_case": [None]*12,
+                        "pos_val": [None]*12, "pos_u": [None]*12
+                    }
+                d_dict = data_by_year[y_str]
+                if is_shipment:
+                    gs = r.get('GROSS_SHIPMENT_AM')
+                    rs = r.get('RETURN_SHIP_AM')
+                    gcu = r.get('GROSS_QTY_CU')
+                    rcu = r.get('RETURN_QTY_CU')
+                    gqc = r.get('GROSS_QTY_CASE')
+                    rqc = r.get('RETURN_QTY_CASE')
 
+                    d_dict["gross_ship"][m_idx] = (d_dict["gross_ship"][m_idx] or 0.0) + float(gs) if pd.notnull(gs) else d_dict["gross_ship"][m_idx]
+                    d_dict["return_ship"][m_idx] = (d_dict["return_ship"][m_idx] or 0.0) + float(rs) if pd.notnull(rs) else d_dict["return_ship"][m_idx]
+                    d_dict["gross_cu"][m_idx] = (d_dict["gross_cu"][m_idx] or 0.0) + float(gcu) if pd.notnull(gcu) else d_dict["gross_cu"][m_idx]
+                    d_dict["return_cu"][m_idx] = (d_dict["return_cu"][m_idx] or 0.0) + float(rcu) if pd.notnull(rcu) else d_dict["return_cu"][m_idx]
+                    d_dict["gross_case"][m_idx] = (d_dict["gross_case"][m_idx] or 0.0) + float(gqc) if pd.notnull(gqc) else d_dict["gross_case"][m_idx]
+                    d_dict["return_case"][m_idx] = (d_dict["return_case"][m_idx] or 0.0) + float(rqc) if pd.notnull(rqc) else d_dict["return_case"][m_idx]
+                else:
+                    pv = r.get('POS_VALUE') if pd.notnull(r.get('POS_VALUE')) else r.get('GLOBAL_VALUE_LC')
+                    pu = r.get('POS_UNITS') if pd.notnull(r.get('POS_UNITS')) else r.get('GLOBAL_UNITS')
+                    d_dict["pos_val"][m_idx] = (d_dict["pos_val"][m_idx] or 0.0) + float(pv) if pd.notnull(pv) else d_dict["pos_val"][m_idx]
+                    d_dict["pos_u"][m_idx] = (d_dict["pos_u"][m_idx] or 0.0) + float(pu) if pd.notnull(pu) else d_dict["pos_u"][m_idx]
 
-def get_factory_pos_val(y_str: str, m_nbr: int, model_name: str, pos_val: Optional[float]):
-    """
-    Calculates Factory POS $ = POS $ * INDEX for a given Kenvue Month and Model.
-    Matches using MONTH + MODEL (month 3-letter representation, non-year-specific).
-    Returns tuple: (factory_pos_val, index_val).
-    If missing or invalid: returns (None, None).
-    """
-    if pos_val is None or pd.isna(pos_val):
-        return None, None
+    process_records(df_ship, is_shipment=True)
+    process_records(df_pos, is_shipment=False)
 
-    norm_m = normalize_month_3letter(int(m_nbr))
-    norm_model = normalize_text(model_name)
+    target_years = ["2021", "2022", "2023", "2024", "2025", "2026"]
+    all_years = sorted(list(set(target_years + list(data_by_year.keys()))))
 
-    idx_map = get_price_index_lookup_map()
-    key = (norm_m, norm_model)
+    # 5. Compute Metric Arrays
+    year_metrics = {}
+    for yr in all_years:
+        d = data_by_year.get(yr, {
+            "gross_ship": [None]*12, "return_ship": [None]*12,
+            "gross_cu": [None]*12, "return_cu": [None]*12,
+            "gross_case": [None]*12, "return_case": [None]*12,
+            "pos_val": [None]*12, "pos_u": [None]*12
+        })
+        gts_dollar = d["gross_ship"]
+        gts_u = d["gross_cu"] if any(v is not None for v in d["gross_cu"]) else d["gross_case"]
 
-    if key in idx_map:
-        index_val = idx_map[key]
-        return (float(pos_val) * index_val), index_val
+        # Calculate Factory POS $ per month using Price Index
+        factory_pos = [None] * 12
+        for i in range(12):
+            pv = d["pos_val"][i]
+            if pv is not None:
+                f_pos, _ = database.get_factory_pos_val(yr, i + 1, model or "", pv)
+                factory_pos[i] = f_pos
 
-    return None, None
+        # Business Calculations
+        # 1. B3 = GBS $ / GBS U (GTS $ / GTS U)
+        b3 = [None] * 12
+        for i in range(12):
+            gs = gts_dollar[i]
+            gu = gts_u[i]
+            if gs is not None and gu is not None and gu != 0:
+                b3[i] = gs / gu
+
+        # 2. Build/Bleed $ = GBS $ - Factory POS $
+        build_bleed = [None] * 12
+        for i in range(12):
+            gs = gts_dollar[i]
+            fp = factory_pos[i]
+            if gs is not None and fp is not None:
+                build_bleed[i] = gs - fp
+            elif gs is not None:
+                build_bleed[i] = gs
+
+        # 3. Unit Ratio = GBS U / POS U
+        unit_ratio = [None] * 12
+        for i in range(12):
+            gu = gts_u[i]
+            pu = d["pos_u"][i]
+            if gu is not None and pu is not None and pu != 0:
+                unit_ratio[i] = gu / pu
+            elif gu is not None:
+                unit_ratio[i] = gu
+
+        # 4. Price Factor = ASP / B3 (ASP = POS $ / POS U)
+        asp = [None] * 12
+        price_factor = [None] * 12
+        for i in range(12):
+            pv = d["pos_val"][i]
+            pu = d["pos_u"][i]
+            if pv is not None and pu is not None and pu != 0:
+                asp[i] = pv / pu
+            if asp[i] is not None and b3[i] is not None and b3[i] != 0:
+                price_factor[i] = asp[i] / b3[i]
+
+        tot_gts_dollar = sum([v for v in gts_dollar if v is not None])
+        pct_of_year = [calc_share(gts_dollar[i], tot_gts_dollar) for i in range(12)]
+
+        year_metrics[yr] = {
+            "gts_dollar": gts_dollar,
+            "gts_u": gts_u,
+            "b3": b3,
+            "factory_pos": factory_pos,
+            "build_bleed": build_bleed,
+            "unit_ratio": unit_ratio,
+            "asp": asp,
+            "price_factor": price_factor,
+            "pct_of_year": pct_of_year,
+            "pos_val": d["pos_val"],
+            "pos_u": d["pos_u"]
+        }
+
+    print("=" * 80)
+    print("SHIPMENT GTS DASHBOARD DIAGNOSTICS & VERIFICATION")
+    print("=" * 80)
+    print(f"Selected Model:               '{model}'")
+    print(f"Mapped Record Count:          {rec_count}")
+    tot_grs = sum([v for yr in year_metrics for v in year_metrics[yr]["gts_dollar"] if v is not None])
+    tot_grs_u = sum([v for yr in year_metrics for v in year_metrics[yr]["gts_u"] if v is not None])
+    tot_fact = sum([v for yr in year_metrics for v in year_metrics[yr]["factory_pos"] if v is not None])
+    tot_pos_u = sum([v for yr in year_metrics for v in year_metrics[yr]["pos_u"] if v is not None])
+    tot_build = sum([v for yr in year_metrics for v in year_metrics[yr]["build_bleed"] if v is not None])
+    avg_b3 = (tot_grs / tot_grs_u) if tot_grs_u != 0 else None
+    avg_unit_ratio = (tot_grs_u / tot_pos_u) if tot_pos_u != 0 else None
+    tot_pos_val = sum([v for yr in year_metrics for v in year_metrics[yr]["pos_val"] if v is not None])
+    avg_asp = (tot_pos_val / tot_pos_u) if tot_pos_u != 0 else None
+    avg_price_factor = (avg_asp / avg_b3) if (avg_asp is not None and avg_b3 is not None and avg_b3 != 0) else None
+
+    print(f"GRS $ (Gross Shipment $):     ${tot_grs:,.2f}")
+    print(f"GRS U (Gross Shipment Units): {tot_grs_u:,.2f}")
+    print(f"Factory POS $:                ${tot_fact:,.2f}")
+    print(f"POS U:                        {tot_pos_u:,.2f}")
+    print(f"ASP:                          ${avg_asp:.4f}" if avg_asp else "ASP:                          N/A")
+    print(f"B3 (GBS $ / GBS U):           ${avg_b3:.4f}" if avg_b3 else "B3:                           N/A")
+    print(f"Build/Bleed $:                ${tot_build:,.2f}")
+    print(f"Unit Ratio (GBS U / POS U):   {avg_unit_ratio:.4f}" if avg_unit_ratio else "Unit Ratio:                   N/A")
+    print(f"Price Factor (ASP / B3):      {avg_price_factor:.4f}" if avg_price_factor else "Price Factor:                 N/A")
+    print("=" * 80)
+
+    # 6. Build Spreadsheet Table Element
+    th_style = {
+        "backgroundColor": "#019881", "color": "#ffffff", "fontWeight": "800", "padding": "8px 10px", "border": "1px solid #858585", "textAlign": "center", "whiteSpace": "nowrap"
+    }
+    th_q1 = html.Th("Q1", colSpan=3, style={**th_style, "backgroundColor": "#018571"})
+    th_q2 = html.Th("Q2", colSpan=3, style={**th_style, "backgroundColor": "#018571"})
+    th_q3 = html.Th("Q3", colSpan=3, style={**th_style, "backgroundColor": "#018571"})
+    th_q4 = html.Th("Q4", colSpan=3, style={**th_style, "backgroundColor": "#018571", "borderRight": "3px solid #858585"})
+    th_tot = html.Th("TOTALS", colSpan=7, style={**th_style, "backgroundColor": "#017362"})
+
+    hdr_row1 = html.Tr([
+        html.Th("SHIPMENT METRIC", style={**th_style, "backgroundColor": "#019881", "textAlign": "left"}),
+        html.Th("YEAR", style={**th_style, "backgroundColor": "#019881"}),
+        th_q1, th_q2, th_q3, th_q4, th_tot
+    ])
+
+    hdr_row2 = html.Tr([
+        html.Th("Metric Description", style={**th_style, "textAlign": "left", "minWidth": "160px", "backgroundColor": "#019881"}),
+        html.Th("Ver/Yr", style={**th_style, "minWidth": "50px", "backgroundColor": "#019881"}),
+        *[html.Th(m, style={**th_style, "minWidth": "55px", "backgroundColor": "#019881", **({"borderRight": "3px solid #858585"} if m == "DEC" else {})}) for m in MONTHS],
+        html.Th("Q1", style={**th_style, "minWidth": "60px", "backgroundColor": "#018571", "color": "#ffffff"}),
+        html.Th("Q2", style={**th_style, "minWidth": "60px", "backgroundColor": "#018571", "color": "#ffffff"}),
+        html.Th("Q3", style={**th_style, "minWidth": "60px", "backgroundColor": "#018571", "color": "#ffffff"}),
+        html.Th("Q4", style={**th_style, "minWidth": "60px", "backgroundColor": "#018571", "color": "#ffffff", "borderRight": "3px solid #858585"}),
+        html.Th("FY", style={**th_style, "minWidth": "65px", "backgroundColor": "#017362", "color": "#ffffff"}),
+        html.Th("YTD", style={**th_style, "minWidth": "65px", "backgroundColor": "#017362", "color": "#ffffff"}),
+        html.Th("YTG", style={**th_style, "minWidth": "65px", "backgroundColor": "#017362", "color": "#ffffff"})
+    ])
+
+    thead = html.Thead([hdr_row1, hdr_row2])
+    tbody_rows = []
+
+    def make_grouped_rows(metric_name, unit, yr_val_tuples, metric_key, year_metrics):
+        group_rows = []
+        group_size = len(yr_val_tuples)
+        label_td_style = {
+            "backgroundColor": "#b0b0b0", "color": "#000000", "fontWeight": "900", "fontSize": "14px", "textAlign": "center", "verticalAlign": "middle", "border": "1px solid #858585", "padding": "8px"
+        }
+
+        # Calculate Standard Deviation (STD) of historical Build values (2021-2025)
+        build_std = None
+        if metric_key in ["build", "build_bleed"]:
+            hist_years = ["2021", "2022", "2023", "2024", "2025"]
+            hist_build_vals = []
+            for hy in hist_years:
+                ym = year_metrics.get(hy)
+                if ym:
+                    h_arr = ym.get(metric_key, ym.get("build", []))
+                    for hv in h_arr:
+                        if hv is not None and not (isinstance(hv, float) and math.isnan(hv)):
+                            hist_build_vals.append(float(hv))
+            if len(hist_build_vals) >= 2:
+                b_mean = sum(hist_build_vals) / len(hist_build_vals)
+                b_var = sum((x - b_mean) ** 2 for x in hist_build_vals) / (len(hist_build_vals) - 1)
+                build_std = math.sqrt(b_var)
+                print(f"\n[SHIPMENT BUILD STD DIAGNOSTICS]: Data Points = {len(hist_build_vals)} | Mean = {b_mean:.4f} | STD = {build_std:.4f} | 1*STD = {1.0*build_std:.4f} | 2*STD Threshold (RED) = {2.0*build_std:.4f}")
+            else:
+                print(f"\n[SHIPMENT BUILD STD DIAGNOSTICS]: Insufficient historical build data (count = {len(hist_build_vals)}) to calculate STD.")
+
+        def calc_period_val(target_yr, slice_obj):
+            if target_yr == "YoY %":
+                val_2026 = calc_period_val("2026", slice_obj)
+                val_2025 = calc_period_val("2025", slice_obj)
+                return calc_pct_var(val_2026, val_2025)
+
+            ym = year_metrics.get(target_yr)
+            if not ym: return None
+
+            if metric_key in ["gts_dollar", "gts_u", "b3", "build_bleed", "pct_of_year"]:
+                arr = ym.get(metric_key, [None]*12)[slice_obj]
+                valid_vals = [v for v in arr if v is not None and not (isinstance(v, float) and math.isnan(v))]
+                return sum(valid_vals) if valid_vals else None
+            elif metric_key == "unit_ratio":
+                net_u_sum = sum([v for v in ym["net_ship_u"][slice_obj] if v is not None and not (isinstance(v, float) and math.isnan(v))])
+                pos_u_sum = sum([v for v in ym["pos_u"][slice_obj] if v is not None and not (isinstance(v, float) and math.isnan(v))])
+                if pos_u_sum == 0: return None
+                return net_u_sum / pos_u_sum
+            else:
+                arr = ym.get(metric_key, [None]*12)[slice_obj]
+                valid_vals = [v for v in arr if v is not None and not (isinstance(v, float) and math.isnan(v))]
+                return sum(valid_vals) if valid_vals else None
+
+        for idx, (yr, vals) in enumerate(yr_val_tuples):
+            td_cells = []
+            if idx == 0:
+                td_cells.append(html.Td(metric_name, rowSpan=group_size, style=label_td_style))
+
+            is_2026_row = (yr == "2026")
+            is_dark_row = (yr in ["2026", "YoY %"])
+            if is_dark_row:
+                yr_style = {"backgroundColor": "#b0b0b0", "color": "#000000", "fontWeight": "800", "textAlign": "center", "padding": "5px 8px", "border": "1px solid #858585"}
+            else:
+                yr_style = {"backgroundColor": "#f8f9fa", "color": "#212529", "fontWeight": "700", "textAlign": "center", "padding": "5px 8px", "border": "1px solid #858585"}
+
+            current_unit = "%" if yr == "YoY %" else unit
+            td_cells.append(html.Td(yr, style=yr_style))
+
+            for i in range(12):
+                v = vals[i] if i < len(vals) else None
+                is_2026_build_month = (metric_key in ["build", "build_bleed"] and is_2026_row)
+
+                # Dynamic 2-STD RED Logic ONLY for 2026 Build Row Monthly Cells (JAN-DEC):
+                # ABS(Build[month]) >= 2 * STD -> RED (#FF6B6B)
+                # ABS(Build[month]) < 2 * STD -> Normal / default color
+                is_red = False
+                if is_2026_build_month and v is not None and not (isinstance(v, float) and math.isnan(v)) and build_std is not None and build_std > 0:
+                    if abs(float(v)) >= 2.0 * build_std:
+                        is_red = True
+
+                if is_red:
+                    c_style = {"backgroundColor": "#FF6B6B", "color": "#ffffff", "fontWeight": "800", "padding": "5px 8px", "border": "1px solid #858585", "textAlign": "right"}
+                    st = "EXCEPTION"
+                elif is_dark_row:
+                    if v is None:
+                        c_style = {"backgroundColor": "#b0b0b0", "color": "#475569", "fontWeight": "700", "padding": "5px 8px", "border": "1px solid #858585", "textAlign": "right"}
+                        st = "EMPTY"
+                    else:
+                        c_style = {"backgroundColor": "#b0b0b0", "color": "#000000", "fontWeight": "700", "padding": "5px 8px", "border": "1px solid #858585", "textAlign": "right"}
+                        st = "VALID"
+                else:
+                    if v is None:
+                        c_style = {"backgroundColor": "#ffffff", "color": "#adb5bd", "padding": "5px 8px", "border": "1px solid #858585", "textAlign": "right"}
+                        st = "EMPTY"
+                    else:
+                        c_style = {"backgroundColor": "#ffffff", "color": "#212529", "fontWeight": "400", "padding": "5px 8px", "border": "1px solid #858585", "textAlign": "right"}
+                        st = "VALID"
+
+                # Add grey #858585 vertical divider line after DEC (index 11)
+                if i == 11:
+                    c_style = {**c_style, "borderRight": "3px solid #858585"}
+
+                formatted = fmt_val(v, current_unit, st)
+                td_cells.append(html.Td(formatted, style=c_style))
+
+            if is_dark_row:
+                q_style = {"backgroundColor": "#b0b0b0", "color": "#000000", "fontWeight": "800", "padding": "5px 8px", "border": "1px solid #858585", "textAlign": "right"}
+                s_style = {"backgroundColor": "#b0b0b0", "color": "#000000", "fontWeight": "800", "padding": "5px 8px", "border": "1px solid #858585", "textAlign": "right"}
+            else:
+                q_style = {"backgroundColor": "#ffffff", "color": "#212529", "fontWeight": "700", "padding": "5px 8px", "border": "1px solid #858585", "textAlign": "right"}
+                s_style = {"backgroundColor": "#ffffff", "color": "#212529", "fontWeight": "800", "padding": "5px 8px", "border": "1px solid #858585", "textAlign": "right"}
+
+            q1_val = calc_period_val(yr, slice(0, 3))
+            q2_val = calc_period_val(yr, slice(3, 6))
+            q3_val = calc_period_val(yr, slice(6, 9))
+            q4_val = calc_period_val(yr, slice(9, 12))
+            fy_val = calc_period_val(yr, slice(0, 12))
+            ytd_val = calc_period_val(yr, slice(0, 7))
+            ytg_val = calc_period_val(yr, slice(7, 12))
+
+            q1_t = fmt_val(q1_val, current_unit, "VALID")
+            q2_t = fmt_val(q2_val, current_unit, "VALID")
+            q3_t = fmt_val(q3_val, current_unit, "VALID")
+            q4_t = fmt_val(q4_val, current_unit, "VALID")
+            fy_t = fmt_val(fy_val, current_unit, "VALID")
+            ytd_t = fmt_val(ytd_val, current_unit, "VALID")
+            ytg_t = fmt_val(ytg_val, current_unit, "VALID")
+
+            def make_tot_td(tot_val, base_style):
+                return html.Td(tot_val, style=base_style)
+
+            q4_style_divider = {**q_style, "borderRight": "3px solid #858585"}
+
+            td_cells.extend([
+                make_tot_td(q1_t, q_style),
+                make_tot_td(q2_t, q_style),
+                make_tot_td(q3_t, q_style),
+                make_tot_td(q4_t, q4_style_divider),
+                make_tot_td(fy_t, s_style),
+                make_tot_td(ytd_t, s_style),
+                make_tot_td(ytg_t, s_style)
+            ])
+            group_rows.append(html.Tr(td_cells))
+        return group_rows
+
+    display_years = ["2021", "2022", "2023", "2024", "2025", "2026"]
+
+    # 1. GTS $
+    gts_dollar_tuples = [(yr, year_metrics[yr]["gts_dollar"]) for yr in display_years]
+    yoy_gts_dollar = [calc_pct_var(year_metrics["2026"]["gts_dollar"][i], year_metrics["2025"]["gts_dollar"][i]) for i in range(12)]
+    gts_dollar_tuples.append(("YoY %", yoy_gts_dollar))
+
+    # 2. GTS U
+    gts_u_tuples = [(yr, year_metrics[yr]["gts_u"]) for yr in display_years]
+    yoy_gts_u = [calc_pct_var(year_metrics["2026"]["gts_u"][i], year_metrics["2025"]["gts_u"][i]) for i in range(12)]
+    gts_u_tuples.append(("YoY %", yoy_gts_u))
+
+    # 3. B3 (Net Shipment $)
+    b3_tuples = [(yr, year_metrics[yr]["b3"]) for yr in display_years]
+    yoy_b3 = [calc_pct_var(year_metrics["2026"]["b3"][i], year_metrics["2025"]["b3"][i]) for i in range(12)]
+    b3_tuples.append(("YoY %", yoy_b3))
+
+    # 4. Build/Bleed $
+    build_bleed_tuples = [(yr, year_metrics[yr]["build_bleed"]) for yr in display_years]
+    yoy_build_bleed = [calc_pct_var(year_metrics["2026"]["build_bleed"][i], year_metrics["2025"]["build_bleed"][i]) for i in range(12)]
+    build_bleed_tuples.append(("YoY %", yoy_build_bleed))
+
+    # 5. Unit Ratio
+    unit_ratio_tuples = [(yr, year_metrics[yr]["unit_ratio"]) for yr in display_years]
+    yoy_unit_ratio = [calc_pct_var(year_metrics["2026"]["unit_ratio"][i], year_metrics["2025"]["unit_ratio"][i]) for i in range(12)]
+    unit_ratio_tuples.append(("YoY %", yoy_unit_ratio))
+
+    # 6. % of Year
+    pct_of_year_tuples = [(yr, year_metrics[yr]["pct_of_year"]) for yr in display_years]
+    yoy_pct_of_year = [calc_pct_var(year_metrics["2026"]["pct_of_year"][i], year_metrics["2025"]["pct_of_year"][i]) for i in range(12)]
+    pct_of_year_tuples.append(("YoY %", yoy_pct_of_year))
+
+    tbody_rows.extend(make_grouped_rows("GTS $", "$", gts_dollar_tuples, "gts_dollar", year_metrics))
+    tbody_rows.extend(make_grouped_rows("GTS U", "Units", gts_u_tuples, "gts_u", year_metrics))
+    tbody_rows.extend(make_grouped_rows("B3", "$", b3_tuples, "b3", year_metrics))
+    tbody_rows.extend(make_grouped_rows("Build/Bleed $", "$", build_bleed_tuples, "build_bleed", year_metrics))
+    tbody_rows.extend(make_grouped_rows("Unit Ratio", "Ratio", unit_ratio_tuples, "unit_ratio", year_metrics))
+    tbody_rows.extend(make_grouped_rows("% of Year", "%", pct_of_year_tuples, "pct_of_year", year_metrics))
+
+    header_title = html.H1(["SHIPMENT", html.Br(), "VALIDATION"], style={
+        "color": "#ffffff", "fontWeight": "900", "fontSize": "22px", "letterSpacing": "1.5px", "margin": "0", "textTransform": "uppercase", "lineHeight": "1.2"
+    })
+
+    tbody = html.Tbody(tbody_rows)
+    table_elem = html.Table([thead, tbody], style={
+        "width": "100%", "borderCollapse": "collapse", "fontFamily": "sans-serif", "fontSize": "11px"
+    })
+
+    return active_tab, record_str, table_elem, model_opts, brand_opts, cat_opts, sub_brand_opts, brand, category, sub_brand, header_title
 
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print("Testing Snowflake Connection & Model Mapping from database.py...")
-    print("=" * 60)
-    try:
-        config = get_snowflake_config()
-        print(f"Connecting with Account: {config.get('account')}, User: {config.get('user')}")
-        conn = get_snowflake_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT CURRENT_VERSION(), CURRENT_USER(), CURRENT_ROLE(), CURRENT_DATABASE(), CURRENT_SCHEMA();")
-        row = cur.fetchone()
-        print("[SUCCESS] Connected successfully!")
-        print(f"  Version: {row[0]}, User: {row[1]}, Role: {row[2]}, DB: {row[3]}, Schema: {row[4]}")
-        print("\nModel Mapping Options:")
-        print(get_model_options())
-    except Exception as err:
-        print(f"[ERROR] Connection test failed: {err}")
+    host = os.getenv("HOST", "127.0.0.1")
+    port = int(os.getenv("PORT", "8051"))
+    debug = os.getenv("DEBUG", "True").lower() in ["true", "1", "t"]
+    print(f"Starting Shipment Validation Dashboard independently at http://{host}:{port}...")
+    app.run(host=host, port=port, debug=debug, dev_tools_ui=False)
