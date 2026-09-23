@@ -284,18 +284,26 @@ def calculate_current_month_asp(
     pos_val_prev = [0.0] * 12
     pos_u_prev = [0.0] * 12
 
-    has_val_curr = [False] * 12
-    has_u_curr = [False] * 12
     has_val_prev = [False] * 12
     has_u_prev = [False] * 12
 
     for _, r in df.iterrows():
-        d_str = str(r.get('GLOBAL_DATE_SHORT_DESC', '')).strip()
-        kv_info = database.map_date_to_kv_calendar(d_str) if d_str else None
-        if not kv_info:
-            continue
-        y_str = kv_info['y_str']
-        m_idx = kv_info['m_idx']
+        kv_m_str = str(r.get('KV_MONTH', '')).strip()
+        if kv_m_str and '-' in kv_m_str:
+            parts = kv_m_str.split('-')
+            y_str = parts[0]
+            try:
+                m_nbr = int(parts[1])
+                m_idx = m_nbr - 1
+            except Exception:
+                continue
+        else:
+            d_str = str(r.get('GLOBAL_DATE_SHORT_DESC', '')).strip()
+            kv_info = database.map_date_to_kv_calendar(d_str) if d_str else None
+            if not kv_info:
+                continue
+            y_str = kv_info['y_str']
+            m_idx = kv_info['m_idx']
 
         pv = r.get('POS_VALUE') if pd.notnull(r.get('POS_VALUE')) else r.get('POS_DOLLARS')
         pu = r.get('POS_UNITS')
@@ -303,10 +311,8 @@ def calculate_current_month_asp(
         if y_str == current_year and 0 <= m_idx < 12:
             if pd.notnull(pv):
                 pos_val_curr[m_idx] += float(pv)
-                has_val_curr[m_idx] = True
             if pd.notnull(pu):
                 pos_u_curr[m_idx] += float(pu)
-                has_u_curr[m_idx] = True
         elif y_str == prev_year and 0 <= m_idx < 12:
             if pd.notnull(pv):
                 pos_val_prev[m_idx] += float(pv)
