@@ -475,11 +475,62 @@ process_monthly_summary = lambda ship_df, cal, m_df: (aggregate_shipment_monthly
 
 
 # =============================================================================
+# 5.5 FETCH FACTORY POS $ FROM CONSUMPTION FOR MODEL
+# =============================================================================
+def get_factory_pos_monthly_for_model(model_name: str) -> dict:
+    """
+    Retrieves month-by-month Factory POS $ for model_name using Consumption data source.
+    Returns dict mapping (y_str, m_idx) -> factory_pos_val (in actual dollars).
+    """
+    if not model_name:
+        return {}
+    try:
+        df = database.fetch_joined_snowflake_data(model=model_name)
+        if df.empty:
+            return {}
+
+        pos_by_year_month = {}
+        for _, r in df.iterrows():
+            kv_m_str = str(r.get('KV_MONTH', '')).strip()
+            if kv_m_str and '-' in kv_m_str:
+                parts = kv_m_str.split('-')
+                y_str = parts[0]
+                m_nbr = int(parts[1])
+                m_idx = m_nbr - 1
+            else:
+                d_str = str(r.get('GLOBAL_DATE_SHORT_DESC', '')).strip()
+                kv_info = database.map_date_to_kv_calendar(d_str)
+                if not kv_info:
+                    continue
+                m_idx = kv_info["m_idx"]
+                y_str = kv_info["y_str"]
+
+            if str(y_str).isdigit() and int(y_str) < 2022:
+                continue
+
+            pv = r.get('POS_VALUE') if pd.notnull(r.get('POS_VALUE')) else r.get('POS_DOLLARS')
+            if pd.notnull(pv):
+                key = (str(y_str), m_idx)
+                pos_by_year_month[key] = (pos_by_year_month.get(key) or 0.0) + float(pv)
+
+        factory_pos_map = {}
+        for (y_str, m_idx), pv_val in pos_by_year_month.items():
+            f_pos, _ = database.get_factory_pos_val(y_str, m_idx + 1, model_name, pv_val)
+            if f_pos is not None:
+                factory_pos_map[(str(y_str), m_idx)] = f_pos
+
+        return factory_pos_map
+    except Exception as e:
+        print(f"[SHIPMENT FACTORY POS FETCH NOTICE]: {e}")
+        return {}
+
+
+# =============================================================================
 # 6. SPREADSHEET MATRIX TABLE RENDERING (MATCHES CONSUMPTION DESIGN)
 # =============================================================================
 def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str = ""):
     """
-    Renders the spreadsheet matrix table for Shipment GRS $ and GRS U with YoY % metrics.
+    Renders the spreadsheet matrix table for Shipment GRS $, GRS U, B3, and Build/Bleed $ with YoY % metrics.
     Matches Consumption Dashboard matrix design and formula specifications exactly.
     """
     import math
@@ -545,16 +596,21 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
             return f"${val:,.2f}" if val != 0 else "$0.00"
         m_val = val / 1_000_000.0
         if unit_type == "dollar":
+            if m_val < 0:
+                return f"-${abs(m_val):,.1f}M"
             return f"${m_val:,.1f}M" if m_val != 0 else "$0.0M"
         else:
             return f"{m_val:,.1f}M" if m_val != 0 else "0.0M"
 
     tbody_rows = []
 
+    factory_pos_map = get_factory_pos_monthly_for_model(model_name)
+
     metrics_config = [
         ("GRS $ (Gross Shipment $)", "GRS_USD", "dollar"),
         ("GRS U (Gross Shipment Units)", "GRS_QTY", "qty"),
         ("B3", "B3", "b3"),
+        ("Build/Bleed $", "BUILD_BLEED", "dollar"),
     ]
 
     raw_metric_vals = {}
@@ -581,6 +637,17 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                     if usd_v[m_i] is not None and qty_v[m_i] is not None and qty_v[m_i] != 0:
                         b3_v[m_i] = usd_v[m_i] / qty_v[m_i]
                 year_vals[yr] = b3_v
+            elif col_key == "BUILD_BLEED":
+                usd_v = raw_metric_vals[yr]["GRS_USD"]
+                bb_v = [None] * 12
+                for m_i in range(12):
+                    gs = usd_v[m_i]
+                    fp = factory_pos_map.get((str(yr), m_i))
+                    if gs is not None and fp is not None:
+                        bb_v[m_i] = gs - fp
+                    elif gs is not None:
+                        bb_v[m_i] = gs
+                year_vals[yr] = bb_v
             else:
                 year_vals[yr] = raw_metric_vals[yr][col_key]
 
@@ -653,6 +720,29 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                     fy_v = calc_b3_period(yr_int, slice(0, 12))
                     ytd_v = calc_b3_period(yr_int, ytd_slice)
                     ytg_v = calc_b3_period(yr_int, ytg_slice)
+            elif col_key == "BUILD_BLEED":
+                def calc_bb_period(yr_key, slice_obj):
+                    u_sum = sum(raw_metric_vals[yr_key]["GRS_USD"][slice_obj])
+                    f_sum = sum([factory_pos_map.get((str(yr_key), i), 0.0) for i in range(12)][slice_obj])
+                    return u_sum - f_sum
+
+                if is_yoy:
+                    q1_v = calc_pct(calc_bb_period(latest_year, slice(0, 3)), calc_bb_period(prev_year, slice(0, 3)))
+                    q2_v = calc_pct(calc_bb_period(latest_year, slice(3, 6)), calc_bb_period(prev_year, slice(3, 6)))
+                    q3_v = calc_pct(calc_bb_period(latest_year, slice(6, 9)), calc_bb_period(prev_year, slice(6, 9)))
+                    q4_v = calc_pct(calc_bb_period(latest_year, slice(9, 12)), calc_bb_period(prev_year, slice(9, 12)))
+                    fy_v = calc_pct(calc_bb_period(latest_year, slice(0, 12)), calc_bb_period(prev_year, slice(0, 12)))
+                    ytd_v = calc_pct(calc_bb_period(latest_year, ytd_slice), calc_bb_period(prev_year, ytd_slice))
+                    ytg_v = calc_pct(calc_bb_period(latest_year, ytg_slice), calc_bb_period(prev_year, ytg_slice))
+                else:
+                    yr_int = int(yr_label)
+                    q1_v = calc_bb_period(yr_int, slice(0, 3))
+                    q2_v = calc_bb_period(yr_int, slice(3, 6))
+                    q3_v = calc_bb_period(yr_int, slice(6, 9))
+                    q4_v = calc_bb_period(yr_int, slice(9, 12))
+                    fy_v = calc_bb_period(yr_int, slice(0, 12))
+                    ytd_v = calc_bb_period(yr_int, ytd_slice)
+                    ytg_v = calc_bb_period(yr_int, ytg_slice)
             else:
                 if is_yoy:
                     l_m = year_vals.get(latest_year, [0.0]*12)
