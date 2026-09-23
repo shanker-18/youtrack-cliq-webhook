@@ -515,34 +515,34 @@ def update_dashboard(n_clicks, gbu, squad, model, c_clicks, s_clicks, active_tab
                         m_idx = kv_info["m_idx"]
                         y_str = kv_info["y_str"]
 
-                        if str(y_str).isdigit() and int(y_str) < 2022:
-                            continue
+                    if str(y_str).isdigit() and int(y_str) < 2022:
+                        continue
 
-                        if y_str not in data_by_year:
-                            data_by_year[y_str] = {
-                                "pos_val": [None]*12, "factory_pos": [None]*12, "pos_u": [None]*12,
-                                "gross_ship": [None]*12, "return_ship": [None]*12,
-                                "gross_case": [None]*12, "return_case": [None]*12,
-                                "gross_cu": [None]*12, "return_cu": [None]*12
-                            }
-                        d_dict = data_by_year[y_str]
-                        pv = r.get('POS_VALUE') if pd.notnull(r.get('POS_VALUE')) else r.get('POS_DOLLARS')
-                        pu = r.get('POS_UNITS')
-                        gs = r.get('GROSS_SHIPMENT_AM')
-                        rs = r.get('RETURN_SHIP_AM')
-                        gqc = r.get('GROSS_QTY_CASE')
-                        rqc = r.get('RETURN_QTY_CASE')
-                        gcu = r.get('GROSS_QTY_CU')
-                        rcu = r.get('RETURN_QTY_CU')
+                    if y_str not in data_by_year:
+                        data_by_year[y_str] = {
+                            "pos_val": [None]*12, "factory_pos": [None]*12, "pos_u": [None]*12,
+                            "gross_ship": [None]*12, "return_ship": [None]*12,
+                            "gross_case": [None]*12, "return_case": [None]*12,
+                            "gross_cu": [None]*12, "return_cu": [None]*12
+                        }
+                    d_dict = data_by_year[y_str]
+                    pv = r.get('POS_VALUE') if pd.notnull(r.get('POS_VALUE')) else r.get('POS_DOLLARS')
+                    pu = r.get('POS_UNITS')
+                    gs = r.get('GROSS_SHIPMENT_AM')
+                    rs = r.get('RETURN_SHIP_AM')
+                    gqc = r.get('GROSS_QTY_CASE')
+                    rqc = r.get('RETURN_QTY_CASE')
+                    gcu = r.get('GROSS_QTY_CU')
+                    rcu = r.get('RETURN_QTY_CU')
 
-                        d_dict["pos_val"][m_idx] = (d_dict["pos_val"][m_idx] or 0.0) + float(pv) if pd.notnull(pv) else d_dict["pos_val"][m_idx]
-                        d_dict["pos_u"][m_idx] = (d_dict["pos_u"][m_idx] or 0.0) + float(pu) if pd.notnull(pu) else d_dict["pos_u"][m_idx]
-                        d_dict["gross_ship"][m_idx] = (d_dict["gross_ship"][m_idx] or 0.0) + float(gs) if pd.notnull(gs) else d_dict["gross_ship"][m_idx]
-                        d_dict["return_ship"][m_idx] = (d_dict["return_ship"][m_idx] or 0.0) + float(rs) if pd.notnull(rs) else d_dict["return_ship"][m_idx]
-                        d_dict["gross_case"][m_idx] = (d_dict["gross_case"][m_idx] or 0.0) + float(gqc) if pd.notnull(gqc) else d_dict["gross_case"][m_idx]
-                        d_dict["return_case"][m_idx] = (d_dict["return_case"][m_idx] or 0.0) + float(rqc) if pd.notnull(rqc) else d_dict["return_case"][m_idx]
-                        d_dict["gross_cu"][m_idx] = (d_dict["gross_cu"][m_idx] or 0.0) + float(gcu) if pd.notnull(gcu) else d_dict["gross_cu"][m_idx]
-                        d_dict["return_cu"][m_idx] = (d_dict["return_cu"][m_idx] or 0.0) + float(rcu) if pd.notnull(rcu) else d_dict["return_cu"][m_idx]
+                    d_dict["pos_val"][m_idx] = (d_dict["pos_val"][m_idx] or 0.0) + float(pv) if pd.notnull(pv) else d_dict["pos_val"][m_idx]
+                    d_dict["pos_u"][m_idx] = (d_dict["pos_u"][m_idx] or 0.0) + float(pu) if pd.notnull(pu) else d_dict["pos_u"][m_idx]
+                    d_dict["gross_ship"][m_idx] = (d_dict["gross_ship"][m_idx] or 0.0) + float(gs) if pd.notnull(gs) else d_dict["gross_ship"][m_idx]
+                    d_dict["return_ship"][m_idx] = (d_dict["return_ship"][m_idx] or 0.0) + float(rs) if pd.notnull(rs) else d_dict["return_ship"][m_idx]
+                    d_dict["gross_case"][m_idx] = (d_dict["gross_case"][m_idx] or 0.0) + float(gqc) if pd.notnull(gqc) else d_dict["gross_case"][m_idx]
+                    d_dict["return_case"][m_idx] = (d_dict["return_case"][m_idx] or 0.0) + float(rqc) if pd.notnull(rqc) else d_dict["return_case"][m_idx]
+                    d_dict["gross_cu"][m_idx] = (d_dict["gross_cu"][m_idx] or 0.0) + float(gcu) if pd.notnull(gcu) else d_dict["gross_cu"][m_idx]
+                    d_dict["return_cu"][m_idx] = (d_dict["return_cu"][m_idx] or 0.0) + float(rcu) if pd.notnull(rcu) else d_dict["return_cu"][m_idx]
 
                     # Calculate Factory POS using Index Value map for active_calc_model
                     for yr_k in sorted(data_by_year.keys()):
@@ -882,6 +882,7 @@ def update_dashboard(n_clicks, gbu, squad, model, c_clicks, s_clicks, active_tab
                         factory_pos_tuples = [(yr, year_metrics[yr]["factory_pos"]) for yr in display_years]
                         pos_u_tuples = [(yr, year_metrics[yr]["pos_u"]) for yr in display_years]
                         asp_tuples = [(yr, year_metrics[yr]["asp"]) for yr in display_years]
+                        b3_tuples = [(yr, year_metrics[yr]["b3"]) for yr in display_years]
                         build_tuples = [(yr, year_metrics[yr]["build"]) for yr in display_years]
                         share_tuples = [(yr, year_metrics[yr]["share"]) for yr in display_years]
 
@@ -889,16 +890,19 @@ def update_dashboard(n_clicks, gbu, squad, model, c_clicks, s_clicks, active_tab
                         yoy_factory = [calc_pct_var(latest_metrics.get("factory_pos", [None]*12)[i], prev_metrics.get("factory_pos", [None]*12)[i]) for i in range(12)]
                         yoy_u = [calc_pct_var(latest_metrics.get("pos_u", [None]*12)[i], prev_metrics.get("pos_u", [None]*12)[i]) for i in range(12)]
                         yoy_asp = [calc_pct_var(latest_metrics.get("asp", [None]*12)[i], prev_metrics.get("asp", [None]*12)[i]) for i in range(12)]
+                        yoy_b3 = [calc_pct_var(latest_metrics.get("b3", [None]*12)[i], prev_metrics.get("b3", [None]*12)[i]) for i in range(12)]
 
                         pos_dollar_tuples.append(("YoY %", yoy_pos))
                         factory_pos_tuples.append(("YoY %", yoy_factory))
                         pos_u_tuples.append(("YoY %", yoy_u))
                         asp_tuples.append(("YoY %", yoy_asp))
+                        b3_tuples.append(("YoY %", yoy_b3))
 
                         tbody_rows.extend(make_grouped_rows("POS $", "$M", pos_dollar_tuples, "pos_val", year_metrics))
                         tbody_rows.extend(make_grouped_rows("FACTORY POS $", "$M", factory_pos_tuples, "factory_pos", year_metrics))
                         tbody_rows.extend(make_grouped_rows("POS U", "UnitsM", pos_u_tuples, "pos_u", year_metrics))
                         tbody_rows.extend(make_grouped_rows("ASP", "$", asp_tuples, "asp", year_metrics))
+                        tbody_rows.extend(make_grouped_rows("B3", "$", b3_tuples, "b3", year_metrics))
                         tbody_rows.extend(make_grouped_rows("Build", "Ratio", build_tuples, "build", year_metrics))
                         tbody_rows.extend(make_grouped_rows("% of Year", "%", share_tuples, "share", year_metrics))
 
