@@ -854,26 +854,6 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
             row_border = "3px solid #858585" if (g_idx == group_size - 1) else "1px solid #858585"
             tbody_rows.append(html.Tr(td_cells, style={"borderBottom": row_border}))
 
-            summary_vals = [q1_v, q2_v, q3_v, q4_v, fy_v, ytd_v, ytg_v]
-            for s_idx, qv in enumerate(summary_vals):
-                qv_str = fmt_m_val(qv, is_pct=is_yoy, unit_type=unit_type)
-                s_color = "#000000"
-                if is_yoy and qv is not None:
-                    if qv < 0:
-                        s_color = "#D9534F"
-                    elif qv > 0:
-                        s_color = "#28A745"
-
-                td_cells.append(html.Td(qv_str, style={
-                    "backgroundColor": yr_bg, "color": s_color,
-                    "fontWeight": "800" if is_highlight else "700",
-                    "textAlign": "right", "padding": "4px 6px", "border": "1px solid #858585", "fontSize": "11px",
-                    **({"borderRight": "3px solid #858585"} if s_idx == 3 else {})
-                }))
-
-            row_border = "3px solid #858585" if (g_idx == group_size - 1) else "1px solid #858585"
-            tbody_rows.append(html.Tr(td_cells, style={"borderBottom": row_border}))
-
     table = html.Table([thead, html.Tbody(tbody_rows)], style={
         "width": "100%", "borderCollapse": "collapse", "fontFamily": "sans-serif", "fontSize": "11px"
     })
