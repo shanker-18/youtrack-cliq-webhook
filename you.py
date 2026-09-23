@@ -11,7 +11,7 @@ import dash_bootstrap_components as dbc
  
 import database
 import BB
-import shipment_dashboard
+import ship
  
 app = dash.Dash(
     __name__,
@@ -327,7 +327,7 @@ def update_dashboard(n_clicks, gbu, squad, model, c_clicks, s_clicks, active_tab
         squad_disabled = not is_gbu_valid
  
         if active_tab == "shipments":
-            opts = shipment_dashboard.get_shipment_filter_options(gbu=gbu, squad=squad, model=model)
+            opts = ship.get_shipment_filter_options(gbu=gbu, squad=squad, model=model)
         else:
             opts = database.get_filter_options(gbu=gbu, squad=squad, model=model)
  
@@ -385,33 +385,37 @@ def update_dashboard(n_clicks, gbu, squad, model, c_clicks, s_clicks, active_tab
             print("\nFilter changed -> existing dashboard preserved")
 
         should_fetch_snowflake = (triggered_id == "btn-refresh" and can_refresh)
- 
+
         current_loaded_store = loaded_dashboard_state
- 
+
         if should_fetch_snowflake:
-            df = database.fetch_joined_snowflake_data(gbu=gbu, squad=squad, model=model)
-            rec_count = len(df)
- 
-            record_str = f"Snowflake Mapped Records: {rec_count} | Read-Only"
-            if not df.empty:
-                current_loaded_store = {
-                    "records": df.to_dict("records"),
-                    "rec_count": rec_count,
-                    "gbu": gbu,
-                    "squad": squad,
-                    "model": model
-                }
+            if active_tab == "consumption":
+                df = database.fetch_joined_snowflake_data(gbu=gbu, squad=squad, model=model)
+                rec_count = len(df)
+
+                record_str = f"Snowflake Mapped Records: {rec_count} | Read-Only"
+                if not df.empty:
+                    current_loaded_store = {
+                        "records": df.to_dict("records"),
+                        "rec_count": rec_count,
+                        "gbu": gbu,
+                        "squad": squad,
+                        "model": model
+                    }
+                else:
+                    current_loaded_store = None
             else:
-                current_loaded_store = None
+                df = pd.DataFrame()
+                record_str = "Shipment GTS Mode (Excel GMC Hierarchy Mapping)"
         else:
-            if current_loaded_store and isinstance(current_loaded_store, dict) and "records" in current_loaded_store:
+            if active_tab == "consumption" and current_loaded_store and isinstance(current_loaded_store, dict) and "records" in current_loaded_store:
                 df = pd.DataFrame(current_loaded_store["records"])
                 rec_count = current_loaded_store.get("rec_count", len(df))
                 loaded_model = current_loaded_store.get("model", "Loaded Model")
                 record_str = f"Snowflake Mapped Records: {rec_count} | Read-Only (Loaded for '{loaded_model}')"
             else:
                 df = pd.DataFrame()
-                record_str = "Filter Selection (PostgreSQL Hierarchy - Click REFRESH DATA to fetch Snowflake)"
+                record_str = "Filter Selection (Click REFRESH DATA to fetch Snowflake)"
  
         # Determine model for active calculations (use stored model name when rendering cached store)
         active_calc_model = (
@@ -439,6 +443,44 @@ def update_dashboard(n_clicks, gbu, squad, model, c_clicks, s_clicks, active_tab
         if active_tab == "shipments":
             nav_cons_style = inactive_nav_style
             nav_ship_style = active_nav_style
+            stored_ship_model = current_loaded_store.get("shipment_model") if isinstance(current_loaded_store, dict) else None
+            if should_fetch_snowflake and can_refresh:
+                ship_df = ship.fetch_shipment_data_for_model(model)
+                if not ship_df.empty:
+                    month_summary = ship.aggregate_shipment_monthly(ship_df)
+                    table_elem = ship.render_shipment_matrix_table(month_summary, model_name=model)
+                    record_str = f"Shipment GMC Mapped Records: {len(ship_df)} | Read-Only (Loaded for '{model}')"
+                    current_loaded_store = {
+                        "shipment_model": model,
+                        "rec_count": len(ship_df),
+                        "gbu": gbu,
+                        "squad": squad,
+                        "model": model
+                    }
+                else:
+                    table_elem = html.Div([
+                        html.Div([
+                            html.H6(f"No Shipment Data for '{model}'", style={"color": "#D9534F", "fontWeight": "700", "marginBottom": "8px", "fontSize": "16px"}),
+                            html.P(f"No matching GMC hierarchy items or shipment records found in Snowflake for Model: '{model}'.", style={"color": "#721c24", "fontSize": "13px", "marginBottom": "0", "fontWeight": "500"})
+                        ], style={"textAlign": "center", "padding": "48px 24px", "backgroundColor": "#f8d7da", "borderRadius": "10px", "border": "1px solid #f5c6cb", "boxShadow": "0 2px 8px rgba(0,0,0,0.04)"})
+                    ])
+                    record_str = f"No Shipment Mapping / Records for '{model}'"
+                    current_loaded_store = None
+            elif stored_ship_model and stored_ship_model == model:
+                ship_df = ship.fetch_shipment_data_for_model(stored_ship_model)
+                if not ship_df.empty:
+                    month_summary = ship.aggregate_shipment_monthly(ship_df)
+                    table_elem = ship.render_shipment_matrix_table(month_summary, model_name=stored_ship_model)
+                    record_str = f"Shipment GMC Mapped Records: {len(ship_df)} | Read-Only (Loaded for '{stored_ship_model}')"
+                else:
+                    table_elem = html.Div("No Shipment Data Available", style={"padding": "20px", "textAlign": "center", "color": "#721c24"})
+            else:
+                table_elem = html.Div([
+                    html.Div([
+                        html.H6("Shipment GTS Dashboard", style={"color": "#019881", "fontWeight": "700", "marginBottom": "8px", "fontSize": "16px"}),
+                        html.P("Select GBU, Need State, and Model, then click REFRESH DATA.", style={"color": "#495057", "fontSize": "13px", "marginBottom": "0", "fontWeight": "500"})
+                    ], style={"textAlign": "center", "padding": "48px 24px", "backgroundColor": "#ffffff", "borderRadius": "10px", "border": "1px dashed #019881", "boxShadow": "0 2px 8px rgba(0,0,0,0.04)"})
+                ])
         else:
             nav_cons_style = active_nav_style
             nav_ship_style = inactive_nav_style
