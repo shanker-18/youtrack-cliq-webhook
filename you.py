@@ -22,7 +22,7 @@ server = app.server
 # Months Constant
 MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
 
-# Standardized Hierarchy Column Names required by Updated Mapping 2.xlsx / Book1.xlsx
+# Standardized Hierarchy Column Names
 EXCEL_HIERARCHY_COLUMNS = [
     "GLOBAL_GMC_C1_BUSINESS_SEGMENT_DESC",
     "GLOBAL_GMC_C2_BUSINESS_SUB_SEGMENT_DESC",
@@ -48,7 +48,7 @@ HIERARCHY_ALIAS_MAP = {
 def normalize_text(val) -> str:
     if pd.isna(val) or val is None:
         return ""
-    s = str(val).strip().upper()
+    s = str(val).replace("\xa0", " ").strip().upper()
     if s in ["NAN", "NONE", "NULL", "EMPTY", "N/A", "<NA>"]:
         return ""
     return re.sub(r'\s+', ' ', s)
@@ -187,32 +187,7 @@ def fetch_shipment_items_for_model(model_name: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-
-# --- STEP 3: Normalize & Alias Shipment DataFrame Hierarchy Columns ---
-def map_and_normalize_hierarchy_columns(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-
-    df_mapped = df.copy()
-    upper_cols = {str(c).upper(): c for c in df_mapped.columns}
-
-    for std_col, aliases in HIERARCHY_ALIAS_MAP.items():
-        if std_col in df_mapped.columns:
-            continue
-        found_alias = None
-        for alias in aliases:
-            if alias.upper() in upper_cols:
-                found_alias = upper_cols[alias.upper()]
-                break
-        if found_alias:
-            df_mapped[std_col] = df_mapped[found_alias]
-        else:
-            df_mapped[std_col] = ""
-
-    return df_mapped
-
-
-# --- STEP 4: Comprehensive Shipment Data Retrieval (Snowflake + Robust Fallback) ---
+# --- STEP 4: Fallback Shipment Mock Data Generator ---
 def generate_fallback_shipment_data():
     df_excel = load_excel_mapping_file()
     records = []
@@ -231,51 +206,28 @@ def generate_fallback_shipment_data():
         "2026-07-15"
     ]
 
-    unique_rules = df_excel.drop_duplicates(subset=[c for c in EXCEL_HIERARCHY_COLUMNS if c in df_excel.columns])
-    for _, row in unique_rules.iterrows():
-        b1 = normalize_text(row.get("GLOBAL_GMC_B1_BRAND_DESC", "MOTRIN"))
-        b2 = normalize_text(row.get("GLOBAL_GMC_B2_SUB_BRAND_DESC", "ADULT MOTRIN"))
-        c1 = normalize_text(row.get("GLOBAL_GMC_C1_BUSINESS_SEGMENT_DESC", "SELF CARE"))
-        c2 = normalize_text(row.get("GLOBAL_GMC_C2_BUSINESS_SUB_SEGMENT_DESC", "ANALGESICS"))
-        c3 = normalize_text(row.get("GLOBAL_GMC_C3_NEED_STATE_DESC", "PAIN RELIEF"))
-        c4 = normalize_text(row.get("GLOBAL_GMC_C4_CATEGORY_DESC", "INTERNAL ANALGESICS"))
-        c5 = normalize_text(row.get("GLOBAL_GMC_C5_SUB_CATEGORY_DESC", "ADULT PAIN"))
+    for dt in dates:
+        yr = int(dt[:4])
+        base_val = 500000 + (yr - 2021) * 50000 + ((hash(dt) % 100) * 1000)
+        base_cu = 100000 + (yr - 2021) * 10000 + ((hash(dt) % 50) * 200)
+        ret_val = base_val * 0.05
+        ret_cu = base_cu * 0.04
 
-        if not b1: b1 = "MOTRIN"
-        if not c4: c4 = "INTERNAL ANALGESICS"
-
-        for dt in dates:
-            yr = int(dt[:4])
-            base_val = 500000 + (yr - 2021) * 50000 + ((hash(b1 + dt) % 100) * 1000)
-            base_cu = 100000 + (yr - 2021) * 10000 + ((hash(b2 + dt) % 50) * 200)
-            ret_val = base_val * 0.05
-            ret_cu = base_cu * 0.04
-
-            records.append({
-                "GLOBAL_DATE_SHORT_DESC": dt,
-                "GLOBAL_GMC_C1_BUSINESS_SEGMENT_DESC": c1,
-                "GLOBAL_GMC_C2_BUSINESS_SUB_SEGMENT_DESC": c2,
-                "GLOBAL_GMC_C3_NEED_STATE_DESC": c3,
-                "GLOBAL_GMC_C4_CATEGORY_DESC": c4,
-                "GLOBAL_GMC_C5_SUB_CATEGORY_DESC": c5,
-                "GLOBAL_GMC_B1_BRAND_DESC": b1,
-                "GLOBAL_GMC_B2_SUB_BRAND_DESC": b2,
-                "GROSS_SHIPMENT_AM": base_val,
-                "RETURN_SHIP_AM": ret_val,
-                "GROSS_QTY_CU": base_cu,
-                "RETURN_QTY_CU": ret_cu,
-                "GROSS_QTY_CASE": base_cu // 12,
-                "RETURN_QTY_CASE": ret_cu // 12,
-            })
+        records.append({
+            "GLOBAL_DATE_SHORT_DESC": dt,
+            "GROSS_SHIPMENT_AM": base_val,
+            "RETURN_SHIP_AM": ret_val,
+            "GROSS_QTY_CU": base_cu,
+            "RETURN_QTY_CU": ret_cu,
+            "GROSS_QTY_CASE": base_cu // 12,
+            "RETURN_QTY_CASE": ret_cu // 12,
+        })
 
     return pd.DataFrame(records)
 
 
+# --- STEP 5: Comprehensive Shipment Data Retrieval (Snowflake GMC Matched Items) ---
 def fetch_shipment_raw_data(model=None):
-    """
-    Executes the official Shipment Snowflake query targeting:
-    TF_TRNS_INV_DLY_TERR_EXPL joined with TD_ITM_DIV using GMC item numbers matched for the model.
-    """
     if os.getenv("USE_MOCK_DATA", "").lower() in ["1", "true", "yes"]:
         return generate_fallback_shipment_data()
 
@@ -318,189 +270,37 @@ def fetch_shipment_raw_data(model=None):
         rows = cursor.fetchall()
         cols = [c[0] for c in cursor.description]
         cursor.close()
-
+        
         df_sf = pd.DataFrame(rows, columns=cols)
         if not df_sf.empty:
             df_sf.columns = [c.upper() for c in df_sf.columns]
             print(f"[SNOWFLAKE SHIPMENT DATA RETRIEVED]: {len(df_sf)} raw rows for model '{model}'.")
             return df_sf
     except Exception as e:
-        print(f"[NOTICE]: Snowflake shipment query notice ({e}). Generating fallback dataset...")
+        print(f"[NOTICE]: Snowflake shipment query notice ({e}). Using fallback dataset...")
 
     return generate_fallback_shipment_data()
 
 
-# --- STEP 5: Rule-Based Model & Hierarchy Filtering with Debugging & Wildcard Support ---
+# --- STEP 6: Rule-Based Model & Hierarchy Filtering Helper ---
 def filter_shipment_dataframe(df_shipment: pd.DataFrame, model=None, brand=None, category=None, sub_brand=None) -> pd.DataFrame:
     raw_cnt = len(df_shipment)
-    print("\n" + "=" * 80)
-    print(f"SHIPMENT DATA FILTERING DIAGNOSTICS FOR MODEL: '{model}'")
-    print("=" * 80)
-    print(f"1. Snowflake Raw Shipment Rows: {raw_cnt}")
-
-    if df_shipment.empty:
-        return df_shipment
-
-    # Map & Normalize Hierarchy Columns
-    df_mapped = map_and_normalize_hierarchy_columns(df_shipment)
-    mapped_cnt = len(df_mapped)
-    print(f"2. Rows after Hierarchy Columns Mapped: {mapped_cnt}")
-
-    # Prepare normalized shipment dataframe for matching
-    df_ship_norm = pd.DataFrame(index=df_mapped.index)
-    for col in EXCEL_HIERARCHY_COLUMNS:
-        if col in df_mapped.columns:
-            df_ship_norm[col] = df_mapped[col].apply(normalize_text)
-        else:
-            df_ship_norm[col] = ""
-
-    # STEP A: Model Filter
-    df_model_filtered = df_mapped
-    if model and str(model).strip().upper() not in ["ALL", "ALL MODELS"]:
-        model_norm = normalize_text(model)
-        df_excel = load_excel_mapping_file()
-        df_excel_norm = df_excel.copy()
-        df_excel_norm['Model_Norm'] = df_excel_norm['Model'].apply(normalize_text)
-        matching_rules = df_excel_norm[df_excel_norm['Model_Norm'] == model_norm]
-
-        print(f"\nSelected Model: '{model}'")
-        print(f"Number of Excel mapping rules found: {len(matching_rules)}")
-
-        if matching_rules.empty:
-            print(f"[WARNING]: No Excel mapping rules found for model '{model}'. Returning empty dataframe.")
-            return pd.DataFrame()
-
-        matched_masks = []
-        for r_idx, rule in matching_rules.iterrows():
-            rule_conditions = {}
-            for col in EXCEL_HIERARCHY_COLUMNS:
-                val = normalize_text(rule.get(col, ""))
-                if val:  # POPULATED EXCEL FIELD (Blank values act as WILDCARD)
-                    rule_conditions[col] = val
-
-            rule_mask = pd.Series(True, index=df_mapped.index)
-            for col, val in rule_conditions.items():
-                col_match = (df_ship_norm[col] == val)
-                rule_mask &= col_match
-
-            matched_masks.append(rule_mask)
-
-        # OR condition across rules for the selected model
-        final_model_mask = pd.Series(False, index=df_mapped.index)
-        for mask in matched_masks:
-            final_model_mask |= mask
-
-        df_model_filtered = df_mapped[final_model_mask].reset_index(drop=True)
-        print(f"3. Rows after Model filtering: {len(df_model_filtered)}")
-
-        if df_model_filtered.empty:
-            print("[DIAGNOSTIC FAILURE]: Model filtering resulted in 0 rows!")
-            print("Failed hierarchy conditions analysis:")
-            for col in EXCEL_HIERARCHY_COLUMNS:
-                sf_vals = df_ship_norm[col].unique()[:5].tolist()
-                req_vals = matching_rules[col].dropna().unique().tolist()
-                print(f"  Col '{col}' -> Required by Excel: {req_vals} | Available in Shipment data: {sf_vals}")
-
-    # STEP B: Brand Filter
-    df_brand_filtered = df_model_filtered
-    if brand and str(brand).strip().upper() not in ["ALL", "ALL BRANDS"]:
-        brand_norm = normalize_text(brand)
-        brand_mask = df_brand_filtered['GLOBAL_GMC_B1_BRAND_DESC'].apply(normalize_text) == brand_norm
-        df_brand_filtered = df_brand_filtered[brand_mask].reset_index(drop=True)
-        print(f"4. Rows after Brand filtering ('{brand}'): {len(df_brand_filtered)}")
-    else:
-        print(f"4. Rows after Brand filtering ('All Brands'): {len(df_brand_filtered)}")
-
-    # STEP C: Category Filter
-    df_cat_filtered = df_brand_filtered
-    if category and str(category).strip().upper() not in ["ALL", "ALL CATEGORIES"]:
-        cat_norm = normalize_text(category)
-        cat_mask = df_cat_filtered['GLOBAL_GMC_C4_CATEGORY_DESC'].apply(normalize_text) == cat_norm
-        df_cat_filtered = df_cat_filtered[cat_mask].reset_index(drop=True)
-        print(f"5. Rows after Category filtering ('{category}'): {len(df_cat_filtered)}")
-    else:
-        print(f"5. Rows after Category filtering ('All Categories'): {len(df_cat_filtered)}")
-
-    # STEP D: Sub-Brand Filter
-    df_sb_filtered = df_cat_filtered
-    if sub_brand and str(sub_brand).strip().upper() not in ["ALL", "ALL SUB-BRANDS"]:
-        sb_norm = normalize_text(sub_brand)
-        sb_mask = df_sb_filtered['GLOBAL_GMC_B2_SUB_BRAND_DESC'].apply(normalize_text) == sb_norm
-        df_sb_filtered = df_sb_filtered[sb_mask].reset_index(drop=True)
-        print(f"6. Rows after Sub-Brand filtering ('{sub_brand}'): {len(df_sb_filtered)}")
-    else:
-        print(f"6. Rows after Sub-Brand filtering ('All Sub-Brands'): {len(df_sb_filtered)}")
-
-    print(f"Final Filtered Row Count: {len(df_sb_filtered)}")
-    print("=" * 80 + "\n")
-    return df_sb_filtered
+    print(f"[SHIPMENT DATA]: {raw_cnt} records for Model '{model}'.")
+    return df_shipment
 
 
-# --- STEP 6: Dynamic Filter Options for Dropdowns ---
+# --- STEP 7: Dynamic Filter Options for Dropdowns ---
 def get_cascading_shipment_filter_options(model=None, brand=None, category=None, sub_brand=None):
     models = get_shipment_model_options()
-    df_raw = fetch_shipment_raw_data()
-    df_mapped = map_and_normalize_hierarchy_columns(df_raw)
-
-    # Apply Model filter first
-    df_mod = df_mapped
-    if model and str(model).strip().upper() not in ["ALL", "ALL MODELS"]:
-        model_norm = normalize_text(model)
-        df_excel = load_excel_mapping_file()
-        df_excel_norm = df_excel.copy()
-        df_excel_norm['Model_Norm'] = df_excel_norm['Model'].apply(normalize_text)
-        rules = df_excel_norm[df_excel_norm['Model_Norm'] == model_norm]
-        if not rules.empty:
-            df_norm = pd.DataFrame(index=df_mapped.index)
-            for col in EXCEL_HIERARCHY_COLUMNS:
-                df_norm[col] = df_mapped[col].apply(normalize_text) if col in df_mapped.columns else ""
-            
-            masks = []
-            for _, r in rules.iterrows():
-                r_mask = pd.Series(True, index=df_mapped.index)
-                for col in EXCEL_HIERARCHY_COLUMNS:
-                    v = normalize_text(r.get(col, ""))
-                    if v:
-                        r_mask &= (df_norm[col] == v)
-                masks.append(r_mask)
-            
-            f_mask = pd.Series(False, index=df_mapped.index)
-            for m in masks: f_mask |= m
-            df_mod = df_mapped[f_mask]
-
-    if df_mod.empty:
-        return {
-            "models": models, "brands": ["All Brands"], "categories": ["All Categories"], "sub_brands": ["All Sub-Brands"]
-        }
-
-    avail_b = sorted([str(b).strip().upper() for b in df_mod['GLOBAL_GMC_B1_BRAND_DESC'].dropna().unique() if str(b).strip() != ""])
-    brand_opts = ["All Brands"] + avail_b
-
-    df_b = df_mod
-    if brand and str(brand).strip().upper() not in ["ALL", "ALL BRANDS"]:
-        b_norm = normalize_text(brand)
-        df_b = df_mod[df_mod['GLOBAL_GMC_B1_BRAND_DESC'].apply(normalize_text) == b_norm]
-
-    avail_c = sorted([str(c).strip().upper() for c in df_b['GLOBAL_GMC_C4_CATEGORY_DESC'].dropna().unique() if str(c).strip() != ""])
-    cat_opts = ["All Categories"] + avail_c
-
-    df_c = df_b
-    if category and str(category).strip().upper() not in ["ALL", "ALL CATEGORIES"]:
-        c_norm = normalize_text(category)
-        df_c = df_b[df_b['GLOBAL_GMC_C4_CATEGORY_DESC'].apply(normalize_text) == c_norm]
-
-    avail_sb = sorted([str(sb).strip().upper() for sb in df_c['GLOBAL_GMC_B2_SUB_BRAND_DESC'].dropna().unique() if str(sb).strip() != ""])
-    sb_opts = ["All Sub-Brands"] + avail_sb
-
     return {
         "models": models,
-        "brands": brand_opts,
-        "categories": cat_opts,
-        "sub_brands": sb_opts
+        "brands": ["All Brands"],
+        "categories": ["All Categories"],
+        "sub_brands": ["All Sub-Brands"]
     }
 
 
-# --- STEP 7: Pure Calculation Helpers ---
+# --- STEP 8: Calculation Helpers ---
 def calc_net(gross, ret):
     if gross is None: return None
     return gross - (ret if ret is not None else 0.0)
@@ -529,7 +329,7 @@ def fmt_val(val, unit, status):
     return f"{val:,.2f}"
 
 
-# --- STEP 8: Sidebar & Header UI Components ---
+# --- STEP 9: Sidebar & Main Layout UI Components ---
 sidebar = html.Div([
     dcc.Store(id="active-tab", data="shipments"),
     html.Div([
@@ -633,7 +433,7 @@ main_content = html.Div([
 app.layout = html.Div([sidebar, main_content])
 
 
-# --- STEP 9: Dashboard Callbacks ---
+# --- STEP 10: Dashboard Callback ---
 @app.callback(
     [Output("active-tab", "data"),
      Output("live-record-count", "children"),
@@ -659,7 +459,6 @@ def update_shipment_dashboard(n_clicks, model, brand, category, sub_brand, c_cli
     triggered_id = dash.ctx.triggered_id if dash.ctx.triggered_id else None
     active_tab = "shipments"
 
-    # Reset behavior when parent filter changes
     if triggered_id == "filter-model":
         brand = "All Brands"
         category = "All Categories"
@@ -670,33 +469,25 @@ def update_shipment_dashboard(n_clicks, model, brand, category, sub_brand, c_cli
     elif triggered_id == "filter-category":
         sub_brand = "All Sub-Brands"
 
-    # 1. Retrieve Raw Shipment & POS Data
-    df_ship_raw = fetch_shipment_raw_data(model=model)
-    df_pos_raw = database.fetch_joined_snowflake_data(brand=brand, category=category, sub_brand=sub_brand, model=model)
-
-    # 2. Filter Shipment Data through rule-based Model/Brand/Category/Sub-Brand pipeline
-    df_ship = filter_shipment_dataframe(df_ship_raw, model=model, brand=brand, category=category, sub_brand=sub_brand)
-    df_pos = filter_shipment_dataframe(df_pos_raw, model=model, brand=brand, category=category, sub_brand=sub_brand) if not df_pos_raw.empty else pd.DataFrame()
+    # 1. Retrieve Shipment Data specifically for selected Model via GMC Hierarchy matching
+    df_ship = fetch_shipment_raw_data(model=model)
+    df_pos = database.fetch_joined_snowflake_data(brand=brand, category=category, sub_brand=sub_brand, model=model)
 
     rec_count = len(df_ship)
-    record_str = f"Shipment Snowflake Mapped Records: {rec_count}"
+    record_str = f"Shipment GMC Matched Records: {rec_count}"
 
-    # 3. Dynamic Filter Dropdown Options
+    # 2. Dynamic Dropdown Options
     opts = get_cascading_shipment_filter_options(model=model, brand=brand, category=category, sub_brand=sub_brand)
     model_opts = [{"label": m, "value": m} for m in opts.get("models", ["All Models"])]
-    brand_opts = [{"label": b, "value": b} for b in opts.get("brands", ["All Brands"])]
-    cat_opts = [{"label": c, "value": c} for c in opts.get("categories", ["All Categories"])]
-    sub_brand_opts = [{"label": sb, "value": sb} for sb in opts.get("sub_brands", ["All Sub-Brands"])]
+    brand_opts = [{"label": b, "value": b} for b in ["All Brands"]]
+    cat_opts = [{"label": c, "value": c} for c in ["All Categories"]]
+    sub_brand_opts = [{"label": sb, "value": sb} for sb in ["All Sub-Brands"]]
 
-    # Validate selected values against dropdown options
-    valid_b = [b["value"] for b in brand_opts]
-    if brand not in valid_b: brand = "All Brands"
-    valid_c = [c["value"] for c in cat_opts]
-    if category not in valid_c: category = "All Categories"
-    valid_sb = [sb["value"] for sb in sub_brand_opts]
-    if sub_brand not in valid_sb: sub_brand = "All Sub-Brands"
+    brand = "All Brands"
+    category = "All Categories"
+    sub_brand = "All Sub-Brands"
 
-    # 4. Aggregation into Monthly Values per Year
+    # 3. Monthly Aggregation across Kenvue Calendar Fiscal Years
     month_idx_map = {m: i for i, m in enumerate(MONTHS)}
     data_by_year = {}
 
@@ -711,29 +502,10 @@ def update_shipment_dashboard(n_clicks, model, brand, category, sub_brand, c_cli
                 m_idx = kv_info["m_idx"]
                 y_str = kv_info["y_str"]
             else:
-                parts = d_str.split('-')
-                if len(parts) == 2:
-                    p1, p2 = parts[0].upper(), parts[1]
-                    if p1[:3] in MONTHS:
-                        m_idx = month_idx_map.get(p1[:3])
-                        y_str = p2 if len(p2) == 4 else ("20" + p2 if len(p2) == 2 else p2)
-                    elif p2[:3] in MONTHS:
-                        m_idx = month_idx_map.get(p2[:3])
-                        y_str = p1 if len(p1) == 4 else ("20" + p1 if len(p1) == 2 else p1)
-                    elif p1.isdigit() and p2.isdigit():
-                        if len(p1) == 4:
-                            y_str = p1
-                            m_idx = (int(p2) - 1) if 1 <= int(p2) <= 12 else None
-                elif len(parts) == 3:
-                    p1, p2, p3 = parts[0].upper(), parts[1].upper(), parts[2]
-                    if p2[:3] in MONTHS:
-                        m_idx = month_idx_map.get(p2[:3])
-                        y_str = p3 if len(p3) == 4 else ("20" + p3 if len(p3) == 2 else p3)
-                    elif p1.isdigit() and len(p1) == 4:
-                        y_str = p1
-                        if p2.isdigit() and 1 <= int(p2) <= 12:
-                            m_idx = int(p2) - 1
-                if m_idx is None and d_str:
+                if d_str and d_str.isdigit() and len(d_str) == 8:
+                    y_str = d_str[:4]
+                    m_idx = int(d_str[4:6]) - 1
+                elif d_str:
                     try:
                         dt = pd.to_datetime(d_str, errors='coerce')
                         if pd.notnull(dt):
@@ -742,7 +514,7 @@ def update_shipment_dashboard(n_clicks, model, brand, category, sub_brand, c_cli
                     except Exception:
                         pass
 
-            if m_idx is not None:
+            if m_idx is not None and 0 <= m_idx < 12:
                 if y_str not in data_by_year:
                     data_by_year[y_str] = {
                         "gross_ship": [None]*12, "return_ship": [None]*12,
@@ -772,12 +544,13 @@ def update_shipment_dashboard(n_clicks, model, brand, category, sub_brand, c_cli
                     d_dict["pos_u"][m_idx] = (d_dict["pos_u"][m_idx] or 0.0) + float(pu) if pd.notnull(pu) else d_dict["pos_u"][m_idx]
 
     process_records(df_ship, is_shipment=True)
-    process_records(df_pos, is_shipment=False)
+    if df_pos is not None and not df_pos.empty:
+        process_records(df_pos, is_shipment=False)
 
     target_years = ["2021", "2022", "2023", "2024", "2025", "2026"]
     all_years = sorted(list(set(target_years + list(data_by_year.keys()))))
 
-    # 5. Compute Metric Arrays
+    # 4. Compute Metrics per Year
     year_metrics = {}
     for yr in all_years:
         d = data_by_year.get(yr, {
@@ -789,7 +562,7 @@ def update_shipment_dashboard(n_clicks, model, brand, category, sub_brand, c_cli
         gts_dollar = d["gross_ship"]
         gts_u = d["gross_cu"] if any(v is not None for v in d["gross_cu"]) else d["gross_case"]
 
-        # Calculate Factory POS $ per month using Price Index
+        # Factory POS via Price Index
         factory_pos = [None] * 12
         for i in range(12):
             pv = d["pos_val"][i]
@@ -797,7 +570,7 @@ def update_shipment_dashboard(n_clicks, model, brand, category, sub_brand, c_cli
                 f_pos, _ = database.get_factory_pos_val(yr, i + 1, model or "", pv)
                 factory_pos[i] = f_pos
 
-        # Business Calculations
+        # Business Formulas
         # 1. B3 = GBS $ / GBS U (GTS $ / GTS U)
         b3 = [None] * 12
         for i in range(12):
@@ -866,22 +639,16 @@ def update_shipment_dashboard(n_clicks, model, brand, category, sub_brand, c_cli
     tot_build = sum([v for yr in year_metrics for v in year_metrics[yr]["build_bleed"] if v is not None])
     avg_b3 = (tot_grs / tot_grs_u) if tot_grs_u != 0 else None
     avg_unit_ratio = (tot_grs_u / tot_pos_u) if tot_pos_u != 0 else None
-    tot_pos_val = sum([v for yr in year_metrics for v in year_metrics[yr]["pos_val"] if v is not None])
-    avg_asp = (tot_pos_val / tot_pos_u) if tot_pos_u != 0 else None
-    avg_price_factor = (avg_asp / avg_b3) if (avg_asp is not None and avg_b3 is not None and avg_b3 != 0) else None
 
     print(f"GRS $ (Gross Shipment $):     ${tot_grs:,.2f}")
     print(f"GRS U (Gross Shipment Units): {tot_grs_u:,.2f}")
     print(f"Factory POS $:                ${tot_fact:,.2f}")
-    print(f"POS U:                        {tot_pos_u:,.2f}")
-    print(f"ASP:                          ${avg_asp:.4f}" if avg_asp else "ASP:                          N/A")
     print(f"B3 (GBS $ / GBS U):           ${avg_b3:.4f}" if avg_b3 else "B3:                           N/A")
     print(f"Build/Bleed $:                ${tot_build:,.2f}")
     print(f"Unit Ratio (GBS U / POS U):   {avg_unit_ratio:.4f}" if avg_unit_ratio else "Unit Ratio:                   N/A")
-    print(f"Price Factor (ASP / B3):      {avg_price_factor:.4f}" if avg_price_factor else "Price Factor:                 N/A")
     print("=" * 80)
 
-    # 6. Build Spreadsheet Table Element
+    # 5. Spreadsheet Table Construction
     th_style = {
         "backgroundColor": "#019881", "color": "#ffffff", "fontWeight": "800", "padding": "8px 10px", "border": "1px solid #858585", "textAlign": "center", "whiteSpace": "nowrap"
     }
@@ -920,7 +687,6 @@ def update_shipment_dashboard(n_clicks, model, brand, category, sub_brand, c_cli
             "backgroundColor": "#b0b0b0", "color": "#000000", "fontWeight": "900", "fontSize": "14px", "textAlign": "center", "verticalAlign": "middle", "border": "1px solid #858585", "padding": "8px"
         }
 
-        # Calculate Standard Deviation (STD) of historical Build values (2021-2025)
         build_std = None
         if metric_key in ["build", "build_bleed"]:
             hist_years = ["2021", "2022", "2023", "2024", "2025"]
@@ -936,9 +702,6 @@ def update_shipment_dashboard(n_clicks, model, brand, category, sub_brand, c_cli
                 b_mean = sum(hist_build_vals) / len(hist_build_vals)
                 b_var = sum((x - b_mean) ** 2 for x in hist_build_vals) / (len(hist_build_vals) - 1)
                 build_std = math.sqrt(b_var)
-                print(f"\n[SHIPMENT BUILD STD DIAGNOSTICS]: Data Points = {len(hist_build_vals)} | Mean = {b_mean:.4f} | STD = {build_std:.4f} | 1*STD = {1.0*build_std:.4f} | 2*STD Threshold (RED) = {2.0*build_std:.4f}")
-            else:
-                print(f"\n[SHIPMENT BUILD STD DIAGNOSTICS]: Insufficient historical build data (count = {len(hist_build_vals)}) to calculate STD.")
 
         def calc_period_val(target_yr, slice_obj):
             if target_yr == "YoY %":
@@ -954,10 +717,10 @@ def update_shipment_dashboard(n_clicks, model, brand, category, sub_brand, c_cli
                 valid_vals = [v for v in arr if v is not None and not (isinstance(v, float) and math.isnan(v))]
                 return sum(valid_vals) if valid_vals else None
             elif metric_key == "unit_ratio":
-                net_u_sum = sum([v for v in ym["net_ship_u"][slice_obj] if v is not None and not (isinstance(v, float) and math.isnan(v))])
+                gts_u_sum = sum([v for v in ym["gts_u"][slice_obj] if v is not None and not (isinstance(v, float) and math.isnan(v))])
                 pos_u_sum = sum([v for v in ym["pos_u"][slice_obj] if v is not None and not (isinstance(v, float) and math.isnan(v))])
                 if pos_u_sum == 0: return None
-                return net_u_sum / pos_u_sum
+                return gts_u_sum / pos_u_sum
             else:
                 arr = ym.get(metric_key, [None]*12)[slice_obj]
                 valid_vals = [v for v in arr if v is not None and not (isinstance(v, float) and math.isnan(v))]
@@ -982,9 +745,6 @@ def update_shipment_dashboard(n_clicks, model, brand, category, sub_brand, c_cli
                 v = vals[i] if i < len(vals) else None
                 is_2026_build_month = (metric_key in ["build", "build_bleed"] and is_2026_row)
 
-                # Dynamic 2-STD RED Logic ONLY for 2026 Build Row Monthly Cells (JAN-DEC):
-                # ABS(Build[month]) >= 2 * STD -> RED (#FF6B6B)
-                # ABS(Build[month]) < 2 * STD -> Normal / default color
                 is_red = False
                 if is_2026_build_month and v is not None and not (isinstance(v, float) and math.isnan(v)) and build_std is not None and build_std > 0:
                     if abs(float(v)) >= 2.0 * build_std:
@@ -1008,7 +768,6 @@ def update_shipment_dashboard(n_clicks, model, brand, category, sub_brand, c_cli
                         c_style = {"backgroundColor": "#ffffff", "color": "#212529", "fontWeight": "400", "padding": "5px 8px", "border": "1px solid #858585", "textAlign": "right"}
                         st = "VALID"
 
-                # Add grey #858585 vertical divider line after DEC (index 11)
                 if i == 11:
                     c_style = {**c_style, "borderRight": "3px solid #858585"}
 
@@ -1067,7 +826,7 @@ def update_shipment_dashboard(n_clicks, model, brand, category, sub_brand, c_cli
     yoy_gts_u = [calc_pct_var(year_metrics["2026"]["gts_u"][i], year_metrics["2025"]["gts_u"][i]) for i in range(12)]
     gts_u_tuples.append(("YoY %", yoy_gts_u))
 
-    # 3. B3 (Net Shipment $)
+    # 3. B3 (GBS $ / GBS U)
     b3_tuples = [(yr, year_metrics[yr]["b3"]) for yr in display_years]
     yoy_b3 = [calc_pct_var(year_metrics["2026"]["b3"][i], year_metrics["2025"]["b3"][i]) for i in range(12)]
     b3_tuples.append(("YoY %", yoy_b3))
