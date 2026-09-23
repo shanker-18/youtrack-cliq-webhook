@@ -377,6 +377,55 @@ def update_dashboard(n_clicks, gbu, squad, model, c_clicks, s_clicks, active_tab
             "cursor": "pointer" if can_refresh else "not-allowed",
             "opacity": "1.0" if can_refresh else "0.6"
         }
+ 
+        if triggered_id == "btn-refresh":
+            print("\nRefresh clicked -> dashboard data refreshed")
+            database.reset_kv_counters()
+        elif triggered_id in ["filter-gbu", "filter-squad", "filter-model"]:
+            print("\nFilter changed -> existing dashboard preserved")
+
+        should_fetch_snowflake = (triggered_id == "btn-refresh" and can_refresh)
+
+        current_loaded_store = loaded_dashboard_state
+
+        if should_fetch_snowflake:
+            if active_tab == "consumption":
+                df = database.fetch_joined_snowflake_data(gbu=gbu, squad=squad, model=model)
+                rec_count = len(df)
+
+                record_str = f"Snowflake Mapped Records: {rec_count} | Read-Only"
+                if not df.empty:
+                    current_loaded_store = {
+                        "records": df.to_dict("records"),
+                        "rec_count": rec_count,
+                        "gbu": gbu,
+                        "squad": squad,
+                        "model": model
+                    }
+                else:
+                    current_loaded_store = None
+            else:
+                df = pd.DataFrame()
+                record_str = "Shipment GTS Mode (Excel GMC Hierarchy Mapping)"
+        else:
+            if active_tab == "consumption" and current_loaded_store and isinstance(current_loaded_store, dict) and "records" in current_loaded_store:
+                df = pd.DataFrame(current_loaded_store["records"])
+                rec_count = current_loaded_store.get("rec_count", len(df))
+                loaded_model = current_loaded_store.get("model", "Loaded Model")
+                record_str = f"Snowflake Mapped Records: {rec_count} | Read-Only (Loaded for '{loaded_model}')"
+            else:
+                df = pd.DataFrame()
+                record_str = "Filter Selection (Click REFRESH DATA to fetch Snowflake)"
+
+        # Determine model for active calculations (use stored model name when rendering cached store)
+        active_calc_model = (
+            current_loaded_store.get("model")
+            if (current_loaded_store and isinstance(current_loaded_store, dict) and current_loaded_store.get("model"))
+            else model
+        )
+
+        # Load Building Block Data (force reload if refresh button clicked)
+        bb_df = BB.load_building_block_data(force_reload=should_fetch_snowflake)
 
         active_nav_style = {
             "backgroundColor": "#019881", "color": "#ffffff", "width": "134px", "padding": "12px 8px",
@@ -394,47 +443,20 @@ def update_dashboard(n_clicks, gbu, squad, model, c_clicks, s_clicks, active_tab
         if active_tab == "shipments":
             nav_cons_style = inactive_nav_style
             nav_ship_style = active_nav_style
-        else:
-            nav_cons_style = active_nav_style
-            nav_ship_style = inactive_nav_style
-
-        if triggered_id in ["filter-gbu", "filter-squad", "filter-model"]:
-            print(f"\nFilter changed ('{triggered_id}') -> returning lightweight dropdown updates")
-            return (
-                active_tab,
-                dash.no_update,
-                dash.no_update,
-                dash.no_update,
-                gbu_opts,
-                squad_opts,
-                model_opts,
-                gbu,
-                squad,
-                model,
-                squad_disabled,
-                model_disabled,
-                btn_disabled,
-                btn_style,
-                nav_cons_style,
-                nav_ship_style
-            )
-
-        should_fetch_snowflake = (triggered_id == "btn-refresh" and can_refresh)
-        current_loaded_store = loaded_dashboard_state if isinstance(loaded_dashboard_state, dict) else {}
-
-        if active_tab == "shipments":
-            stored_ship_model = current_loaded_store.get("shipment_model")
-            if should_fetch_snowflake:
+            stored_ship_model = current_loaded_store.get("shipment_model") if isinstance(current_loaded_store, dict) else None
+            if should_fetch_snowflake and can_refresh:
                 ship_df = ship.fetch_shipment_data_for_model(model)
                 if not ship_df.empty:
                     month_summary = ship.aggregate_shipment_monthly(ship_df)
                     table_elem = ship.render_shipment_matrix_table(month_summary, model_name=model)
                     record_str = f"Shipment GMC Mapped Records: {len(ship_df)} | Read-Only (Loaded for '{model}')"
-                    current_loaded_store["shipment_model"] = model
-                    current_loaded_store["shipment_rec_count"] = len(ship_df)
-                    current_loaded_store["gbu"] = gbu
-                    current_loaded_store["squad"] = squad
-                    current_loaded_store["model"] = model
+                    current_loaded_store = {
+                        "shipment_model": model,
+                        "rec_count": len(ship_df),
+                        "gbu": gbu,
+                        "squad": squad,
+                        "model": model
+                    }
                 else:
                     table_elem = html.Div([
                         html.Div([
@@ -443,6 +465,7 @@ def update_dashboard(n_clicks, gbu, squad, model, c_clicks, s_clicks, active_tab
                         ], style={"textAlign": "center", "padding": "48px 24px", "backgroundColor": "#f8d7da", "borderRadius": "10px", "border": "1px solid #f5c6cb", "boxShadow": "0 2px 8px rgba(0,0,0,0.04)"})
                     ])
                     record_str = f"No Shipment Mapping / Records for '{model}'"
+                    current_loaded_store = None
             elif stored_ship_model and stored_ship_model == model:
                 ship_df = ship.fetch_shipment_data_for_model(stored_ship_model)
                 if not ship_df.empty:
@@ -451,7 +474,6 @@ def update_dashboard(n_clicks, gbu, squad, model, c_clicks, s_clicks, active_tab
                     record_str = f"Shipment GMC Mapped Records: {len(ship_df)} | Read-Only (Loaded for '{stored_ship_model}')"
                 else:
                     table_elem = html.Div("No Shipment Data Available", style={"padding": "20px", "textAlign": "center", "color": "#721c24"})
-                    record_str = f"No Shipment Mapping / Records for '{stored_ship_model}'"
             else:
                 table_elem = html.Div([
                     html.Div([
@@ -459,53 +481,9 @@ def update_dashboard(n_clicks, gbu, squad, model, c_clicks, s_clicks, active_tab
                         html.P("Select GBU, Need State, and Model, then click REFRESH DATA.", style={"color": "#495057", "fontSize": "13px", "marginBottom": "0", "fontWeight": "500"})
                     ], style={"textAlign": "center", "padding": "48px 24px", "backgroundColor": "#ffffff", "borderRadius": "10px", "border": "1px dashed #019881", "boxShadow": "0 2px 8px rgba(0,0,0,0.04)"})
                 ])
-                record_str = "Shipment GTS Mode (Excel GMC Hierarchy Mapping)"
-
-            return (
-                active_tab,
-                current_loaded_store,
-                record_str,
-                table_elem,
-                gbu_opts,
-                squad_opts,
-                model_opts,
-                gbu,
-                squad,
-                model,
-                squad_disabled,
-                model_disabled,
-                btn_disabled,
-                btn_style,
-                nav_cons_style,
-                nav_ship_style
-            )
-
-        # active_tab == "consumption"
-        if should_fetch_snowflake:
-            df = database.fetch_joined_snowflake_data(gbu=gbu, squad=squad, model=model)
-            rec_count = len(df)
-            record_str = f"Snowflake Mapped Records: {rec_count} | Read-Only"
-            if not df.empty:
-                current_loaded_store["records"] = df.to_dict("records")
-                current_loaded_store["rec_count"] = rec_count
-                current_loaded_store["gbu"] = gbu
-                current_loaded_store["squad"] = squad
-                current_loaded_store["model"] = model
-            else:
-                current_loaded_store.pop("records", None)
-            bb_df = BB.load_building_block_data(force_reload=True)
-            active_calc_model = model
-        elif "records" in current_loaded_store and current_loaded_store.get("model") == model:
-            df = pd.DataFrame(current_loaded_store["records"])
-            rec_count = current_loaded_store.get("rec_count", len(df))
-            loaded_model = current_loaded_store.get("model", "Loaded Model")
-            record_str = f"Snowflake Mapped Records: {rec_count} | Read-Only (Loaded for '{loaded_model}')"
-            bb_df = BB.load_building_block_data(force_reload=False)
-            active_calc_model = loaded_model
         else:
-            df = pd.DataFrame()
-            record_str = "Filter Selection (Click REFRESH DATA to fetch Snowflake)"
-            active_calc_model = model
+            nav_cons_style = active_nav_style
+            nav_ship_style = inactive_nav_style
 
         if active_tab == "consumption":
             if not df.empty:
@@ -525,34 +503,34 @@ def update_dashboard(n_clicks, gbu, squad, model, c_clicks, s_clicks, active_tab
                         m_idx = kv_info["m_idx"]
                         y_str = kv_info["y_str"]
 
-                    if str(y_str).isdigit() and int(y_str) < 2022:
-                        continue
+                        if str(y_str).isdigit() and int(y_str) < 2022:
+                            continue
 
-                    if y_str not in data_by_year:
-                        data_by_year[y_str] = {
-                            "pos_val": [None]*12, "factory_pos": [None]*12, "pos_u": [None]*12,
-                            "gross_ship": [None]*12, "return_ship": [None]*12,
-                            "gross_case": [None]*12, "return_case": [None]*12,
-                            "gross_cu": [None]*12, "return_cu": [None]*12
-                        }
-                    d_dict = data_by_year[y_str]
-                    pv = r.get('POS_VALUE') if pd.notnull(r.get('POS_VALUE')) else r.get('POS_DOLLARS')
-                    pu = r.get('POS_UNITS')
-                    gs = r.get('GROSS_SHIPMENT_AM')
-                    rs = r.get('RETURN_SHIP_AM')
-                    gqc = r.get('GROSS_QTY_CASE')
-                    rqc = r.get('RETURN_QTY_CASE')
-                    gcu = r.get('GROSS_QTY_CU')
-                    rcu = r.get('RETURN_QTY_CU')
+                        if y_str not in data_by_year:
+                            data_by_year[y_str] = {
+                                "pos_val": [None]*12, "factory_pos": [None]*12, "pos_u": [None]*12,
+                                "gross_ship": [None]*12, "return_ship": [None]*12,
+                                "gross_case": [None]*12, "return_case": [None]*12,
+                                "gross_cu": [None]*12, "return_cu": [None]*12
+                            }
+                        d_dict = data_by_year[y_str]
+                        pv = r.get('POS_VALUE') if pd.notnull(r.get('POS_VALUE')) else r.get('POS_DOLLARS')
+                        pu = r.get('POS_UNITS')
+                        gs = r.get('GROSS_SHIPMENT_AM')
+                        rs = r.get('RETURN_SHIP_AM')
+                        gqc = r.get('GROSS_QTY_CASE')
+                        rqc = r.get('RETURN_QTY_CASE')
+                        gcu = r.get('GROSS_QTY_CU')
+                        rcu = r.get('RETURN_QTY_CU')
 
-                    d_dict["pos_val"][m_idx] = (d_dict["pos_val"][m_idx] or 0.0) + float(pv) if pd.notnull(pv) else d_dict["pos_val"][m_idx]
-                    d_dict["pos_u"][m_idx] = (d_dict["pos_u"][m_idx] or 0.0) + float(pu) if pd.notnull(pu) else d_dict["pos_u"][m_idx]
-                    d_dict["gross_ship"][m_idx] = (d_dict["gross_ship"][m_idx] or 0.0) + float(gs) if pd.notnull(gs) else d_dict["gross_ship"][m_idx]
-                    d_dict["return_ship"][m_idx] = (d_dict["return_ship"][m_idx] or 0.0) + float(rs) if pd.notnull(rs) else d_dict["return_ship"][m_idx]
-                    d_dict["gross_case"][m_idx] = (d_dict["gross_case"][m_idx] or 0.0) + float(gqc) if pd.notnull(gqc) else d_dict["gross_case"][m_idx]
-                    d_dict["return_case"][m_idx] = (d_dict["return_case"][m_idx] or 0.0) + float(rqc) if pd.notnull(rqc) else d_dict["return_case"][m_idx]
-                    d_dict["gross_cu"][m_idx] = (d_dict["gross_cu"][m_idx] or 0.0) + float(gcu) if pd.notnull(gcu) else d_dict["gross_cu"][m_idx]
-                    d_dict["return_cu"][m_idx] = (d_dict["return_cu"][m_idx] or 0.0) + float(rcu) if pd.notnull(rcu) else d_dict["return_cu"][m_idx]
+                        d_dict["pos_val"][m_idx] = (d_dict["pos_val"][m_idx] or 0.0) + float(pv) if pd.notnull(pv) else d_dict["pos_val"][m_idx]
+                        d_dict["pos_u"][m_idx] = (d_dict["pos_u"][m_idx] or 0.0) + float(pu) if pd.notnull(pu) else d_dict["pos_u"][m_idx]
+                        d_dict["gross_ship"][m_idx] = (d_dict["gross_ship"][m_idx] or 0.0) + float(gs) if pd.notnull(gs) else d_dict["gross_ship"][m_idx]
+                        d_dict["return_ship"][m_idx] = (d_dict["return_ship"][m_idx] or 0.0) + float(rs) if pd.notnull(rs) else d_dict["return_ship"][m_idx]
+                        d_dict["gross_case"][m_idx] = (d_dict["gross_case"][m_idx] or 0.0) + float(gqc) if pd.notnull(gqc) else d_dict["gross_case"][m_idx]
+                        d_dict["return_case"][m_idx] = (d_dict["return_case"][m_idx] or 0.0) + float(rqc) if pd.notnull(rqc) else d_dict["return_case"][m_idx]
+                        d_dict["gross_cu"][m_idx] = (d_dict["gross_cu"][m_idx] or 0.0) + float(gcu) if pd.notnull(gcu) else d_dict["gross_cu"][m_idx]
+                        d_dict["return_cu"][m_idx] = (d_dict["return_cu"][m_idx] or 0.0) + float(rcu) if pd.notnull(rcu) else d_dict["return_cu"][m_idx]
 
                     # Calculate Factory POS using Index Value map for active_calc_model
                     for yr_k in sorted(data_by_year.keys()):
@@ -892,7 +870,6 @@ def update_dashboard(n_clicks, gbu, squad, model, c_clicks, s_clicks, active_tab
                         factory_pos_tuples = [(yr, year_metrics[yr]["factory_pos"]) for yr in display_years]
                         pos_u_tuples = [(yr, year_metrics[yr]["pos_u"]) for yr in display_years]
                         asp_tuples = [(yr, year_metrics[yr]["asp"]) for yr in display_years]
-                        b3_tuples = [(yr, year_metrics[yr]["b3"]) for yr in display_years]
                         build_tuples = [(yr, year_metrics[yr]["build"]) for yr in display_years]
                         share_tuples = [(yr, year_metrics[yr]["share"]) for yr in display_years]
 
@@ -900,19 +877,16 @@ def update_dashboard(n_clicks, gbu, squad, model, c_clicks, s_clicks, active_tab
                         yoy_factory = [calc_pct_var(latest_metrics.get("factory_pos", [None]*12)[i], prev_metrics.get("factory_pos", [None]*12)[i]) for i in range(12)]
                         yoy_u = [calc_pct_var(latest_metrics.get("pos_u", [None]*12)[i], prev_metrics.get("pos_u", [None]*12)[i]) for i in range(12)]
                         yoy_asp = [calc_pct_var(latest_metrics.get("asp", [None]*12)[i], prev_metrics.get("asp", [None]*12)[i]) for i in range(12)]
-                        yoy_b3 = [calc_pct_var(latest_metrics.get("b3", [None]*12)[i], prev_metrics.get("b3", [None]*12)[i]) for i in range(12)]
 
                         pos_dollar_tuples.append(("YoY %", yoy_pos))
                         factory_pos_tuples.append(("YoY %", yoy_factory))
                         pos_u_tuples.append(("YoY %", yoy_u))
                         asp_tuples.append(("YoY %", yoy_asp))
-                        b3_tuples.append(("YoY %", yoy_b3))
 
                         tbody_rows.extend(make_grouped_rows("POS $", "$M", pos_dollar_tuples, "pos_val", year_metrics))
                         tbody_rows.extend(make_grouped_rows("FACTORY POS $", "$M", factory_pos_tuples, "factory_pos", year_metrics))
                         tbody_rows.extend(make_grouped_rows("POS U", "UnitsM", pos_u_tuples, "pos_u", year_metrics))
                         tbody_rows.extend(make_grouped_rows("ASP", "$", asp_tuples, "asp", year_metrics))
-                        tbody_rows.extend(make_grouped_rows("B3", "$", b3_tuples, "b3", year_metrics))
                         tbody_rows.extend(make_grouped_rows("Build", "Ratio", build_tuples, "build", year_metrics))
                         tbody_rows.extend(make_grouped_rows("% of Year", "%", share_tuples, "share", year_metrics))
 
