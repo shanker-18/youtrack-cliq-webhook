@@ -1,948 +1,469 @@
+"""
+BB.py - Building Blocks Calculation & Diagnostics Module for Consumption Validation Dashboard.
+
+Dynamically calculates current Kenvue month POS value using:
+  Previous-Year Same Kenvue Month POS $ (normalized to $M)
++ Current-Year 11 Official Building Block Values (PostgreSQL)
+-------------------------------------------------
+= Current-Year Calculated POS $ ($M)
+
+Then calculates:
+  Factory POS $ = Calculated POS $ * Existing Index Value
+
+Reuses existing implementations from database.py.
+Filters specifically for the 11 official POS adjustment building blocks:
+  Base Trend, Season, Competition, Distribution, Innovation, Discontinuations,
+  Renovation, Media, Trade, Price, Club.
+"""
+
 import os
+import sys
 import math
-import statistics
-import base64
-import traceback
-import flask
+from typing import Optional, Dict, List, Tuple
 import pandas as pd
-import dash
-from dash import dcc, html, Input, Output, State
-import dash_bootstrap_components as dbc
- 
+
 import database
-import BB
-import ship
- 
-app = dash.Dash(
-    __name__,
-    external_stylesheets=[dbc.themes.BOOTSTRAP],
-    suppress_callback_exceptions=True,
-    title="Consumption Validation Dashboard"
-)
-server = app.server
- 
-# Explicit File Paths for Assets (Can be overridden via environment variables or modified directly here)
-LOGO_PATH = os.getenv("LOGO_PATH", r"C:\Users\maniav1\OneDrive - Kenvue Brands LLC\Desktop\Dashboard\assests\logo.png")
-CONSUMPTION_ICON_PATH = os.getenv("CONSUMPTION_ICON_PATH", r"C:\Users\maniav1\OneDrive - Kenvue Brands LLC\Desktop\Dashboard\assests\consumption.png")
-SHIPMENT_ICON_PATH = os.getenv("SHIPMENT_ICON_PATH", r"C:\Users\maniav1\OneDrive - Kenvue Brands LLC\Desktop\Dashboard\assests\shipment.png")
- 
- 
-def get_asset_src(path_or_filename: str) -> str:
+
+# Authoritative Reference Query for Building Blocks
+BB_QUERY = """
+SELECT
+    hm.model_name AS model,
+    DATE_TRUNC('month', cpv.period_month)::date AS period_month,
+    cbb.name AS building_block,
+    SUM(cpv.value_in_thousands) AS value_in_thousands
+FROM public.consumption_planning_rows cpr
+INNER JOIN public.consumption_building_blocks cbb
+    ON cpr.building_block_id = cbb.block_id
+INNER JOIN public.consumption_planning_values cpv
+    ON cpr.row_id = cpv.row_id
+INNER JOIN public.hierarchy_models hm
+    ON cpr.model_id = hm.model_id
+WHERE
+    cpr.is_deleted = FALSE
+    AND cbb.is_active = TRUE
+    AND hm.is_active = TRUE
+GROUP BY
+    hm.model_name,
+    DATE_TRUNC('month', cpv.period_month),
+    cbb.name
+ORDER BY
+    hm.model_name,
+    period_month,
+    cbb.name;
+"""
+
+# The 11 Official POS Adjustment Building Blocks
+ALLOWED_BUILDING_BLOCKS = [
+    "Base Trend",
+    "Season",
+    "Competition",
+    "Distribution",
+    "Innovation",
+    "Discontinuations",
+    "Renovation",
+    "Media",
+    "Trade",
+    "Price",
+    "Club",
+]
+
+ALLOWED_BB_NORM = {database.normalize_text(b) for b in ALLOWED_BUILDING_BLOCKS}
+
+BUILDING_BLOCK_DISPLAY_MODELS = [
+    "Children's Motrin",
+    "Children's Tylenol",
+]
+
+BUILDING_BLOCK_DISPLAY_MODELS_NORM = {database.normalize_text(m) for m in BUILDING_BLOCK_DISPLAY_MODELS}
+
+
+_cached_bb_df = None
+
+
+def load_building_block_data(force_reload: bool = False) -> pd.DataFrame:
     """
-    Encodes an image file as a Base64 data URI given its full file path or filename.
-    Resolves explicit full file path directly, or falls back to local project 'assests/' folder.
+    Executes authoritative reference BB_QUERY against PostgreSQL to load active Building Block planning records.
+    Returns DataFrame with columns: ['model', 'period_month', 'building_block', 'value_in_thousands'].
+    Caches result in _cached_bb_df for fast subsequent lookups.
     """
-    filepath = path_or_filename
-    if not os.path.exists(filepath):
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        fname = os.path.basename(path_or_filename)
-        cand = os.path.join(base_dir, "assests", fname)
-        if os.path.exists(cand):
-            filepath = cand
- 
-    if os.path.exists(filepath):
-        try:
-            with open(filepath, "rb") as f:
-                b64 = base64.b64encode(f.read()).decode("utf-8")
-                ext = os.path.splitext(filepath)[1].lower().replace(".", "")
-                mime = f"image/{ext}" if ext in ["png", "jpeg", "jpg", "gif", "svg"] else "image/png"
-                return f"data:{mime};base64,{b64}"
-        except Exception:
-            pass
- 
-    return f"/assests/{os.path.basename(path_or_filename)}"
- 
- 
-@server.route('/assests/<path:filename>')
-def serve_assests(filename):
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    local_assests = os.path.join(base_dir, "assests")
-    if os.path.exists(local_assests):
-        return flask.send_from_directory(local_assests, filename)
-    default_dir = os.path.dirname(LOGO_PATH)
-    if os.path.exists(default_dir):
-        return flask.send_from_directory(default_dir, filename)
-    return "", 404
- 
- 
-MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
- 
- 
-def calc_net(gross, ret):
-    if gross is None:
-        return None
-    return gross - (ret if ret is not None else 0.0)
- 
- 
-def calc_asp(pos_val, pos_units):
-    if pos_val is None or pos_units is None or pos_units == 0:
-        return None
-    return pos_val / pos_units
- 
- 
-def calc_variance(actual, comparison):
-    if actual is None or comparison is None:
-        return None
-    return actual - comparison
- 
- 
-def calc_pct_var(actual, comparison):
-    if actual is None or comparison is None or comparison == 0:
-        return None
-    return ((actual - comparison) / abs(comparison)) * 100.0
- 
- 
-def calc_share(month_val, total_val):
-    if month_val is None or total_val is None or total_val == 0:
-        return None
-    return (month_val / total_val) * 100.0
- 
- 
-def fmt_val(val, unit, status):
-    if status == "EMPTY" or val is None or math.isnan(val):
-        return ""
-    if unit == "$M":
-        val_m = val / 1_000_000.0
-        if val_m < 0:
-            return f"-${abs(val_m):,.1f}"
-        return f"${val_m:,.1f}"
-    elif unit == "UnitsM":
-        val_m = val / 1_000_000.0
-        return f"{val_m:,.1f}"
-    elif unit == "$":
-        if val < 0:
-            return f"-${abs(val):,.1f}"
-        return f"${val:,.1f}"
-    elif unit == "Units":
-        return f"{val:,.1f}"
-    elif unit == "Ratio":
-        return f"{val:,.2f}"
-    elif unit == "%":
-        return f"{val:.1f}%"
-    elif unit == "Status":
-        return status
-    return f"{val:,.2f}"
- 
- 
-filter_opts = database.get_filter_options()
- 
-sidebar = html.Div([
-    dcc.Store(id="active-tab", data="consumption"),
-    dcc.Store(id="loaded-dashboard-data", data=None),
-    html.Div([
-        html.Img(
-            src=get_asset_src(LOGO_PATH),
-            style={"maxHeight": "55px", "maxWidth": "125px", "objectFit": "contain"}
-        )
-    ], style={"marginTop": "24px", "marginBottom": "40px", "textAlign": "center", "width": "100%"}),
- 
-    html.Div([
-        dbc.Button([
-            html.Img(
-                src=get_asset_src(CONSUMPTION_ICON_PATH),
-                style={"width": "44px", "height": "44px", "marginBottom": "8px", "pointerEvents": "none"}
-            ),
-            html.Span("Consumption", style={
-                "color": "#ffffff", "fontSize": "16px", "fontWeight": "700", "textAlign": "center", "lineHeight": "1.2", "pointerEvents": "none"
-            })
-        ], id="nav-consumption", color="link", n_clicks=0, style={
-            "backgroundColor": "#00B097",
-            "width": "134px",
-            "padding": "12px 8px",
-            "minHeight": "105px",
-            "borderRadius": "12px",
-            "display": "flex",
-            "flexDirection": "column",
-            "alignItems": "center",
-            "justifyContent": "center",
-            "cursor": "pointer",
-            "boxShadow": "0 2px 6px rgba(0,0,0,0.2)",
-            "border": "none",
-            "textDecoration": "none"
-        }),
- 
-        dbc.Button([
-            html.Img(
-                src=get_asset_src(SHIPMENT_ICON_PATH),
-                style={"width": "44px", "height": "44px", "marginBottom": "8px", "pointerEvents": "none"}
-            ),
-            html.Span("Shipment", style={
-                "color": "#ffffff", "fontSize": "16px", "fontWeight": "700", "textAlign": "center", "lineHeight": "1.2", "pointerEvents": "none"
-            })
-        ], id="nav-shipments", color="link", n_clicks=0, style={
-            "width": "134px",
-            "padding": "12px 8px",
-            "minHeight": "105px",
-            "borderRadius": "12px",
-            "display": "flex",
-            "flexDirection": "column",
-            "alignItems": "center",
-            "justifyContent": "center",
-            "cursor": "pointer",
-            "opacity": "0.85",
-            "backgroundColor": "transparent",
-            "border": "none",
-            "textDecoration": "none"
-        })
-    ], style={"display": "flex", "flexDirection": "column", "gap": "24px", "alignItems": "center", "width": "100%"})
-], style={
-    "position": "fixed",
-    "top": "0",
-    "left": "0",
-    "bottom": "0",
-    "width": "156px",
-    "backgroundColor": "#00B097",
-    "zIndex": "1000",
-    "display": "flex",
-    "flexDirection": "column",
-    "alignItems": "center",
-    "boxShadow": "2px 0 10px rgba(0,0,0,0.15)"
-})
- 
-main_content = html.Div([
-    html.Div([
-        html.Span(id="live-record-count", style={"display": "none"}),
- 
-        dbc.Row([
-            dbc.Col([
-                html.Label("GBU:", style={"fontWeight": "600", "fontSize": "11px", "marginBottom": "2px"}),
-                dcc.Dropdown(
-                    id="filter-gbu",
-                    options=[{"label": g, "value": g} for g in filter_opts.get("gbus", ["Select GBU"])],
-                    value="Select GBU", clearable=False, style={"fontSize": "12px"}
-                )
-            ], width=3),
-            dbc.Col([
-                html.Label("Need State:", style={"fontWeight": "600", "fontSize": "11px", "marginBottom": "2px"}),
-                dcc.Dropdown(
-                    id="filter-squad",
-                    options=[{"label": "Select Need State", "value": "Select Need State"}],
-                    value="Select Need State", disabled=True, clearable=False, style={"fontSize": "12px"}
-                )
-            ], width=4),
-            dbc.Col([
-                html.Label("Model:", style={"fontWeight": "600", "fontSize": "11px", "marginBottom": "2px"}),
-                dcc.Dropdown(
-                    id="filter-model",
-                    options=[{"label": "Select Model", "value": "Select Model"}],
-                    value="Select Model", disabled=True, clearable=False, style={"fontSize": "12px"}
-                )
-            ], width=3),
-            dbc.Col([
-                html.Label("\u00a0", style={"display": "block", "marginBottom": "2px"}),
-                dbc.Button("REFRESH DATA", id="btn-refresh", color="success", n_clicks=0, disabled=True, style={
-                    "backgroundColor": "#6c757d", "color": "#ffffff", "fontWeight": "700", "fontSize": "12px", "padding": "6px 12px", "width": "100%", "border": "none", "cursor": "not-allowed", "opacity": "0.6"
-                })
-            ], width=2),
-        ])
-    ], style={
-        "backgroundColor": "#ffffff", "border": "1px solid #e9ecef", "borderRadius": "10px", "padding": "14px 20px", "marginBottom": "16px", "boxShadow": "0 4px 12px rgba(0,0,0,0.05)"
-    }),
- 
-    html.Div([
-        html.Div(id="spreadsheet-container", style={"overflowX": "auto", "border": "1px solid #858585", "borderRadius": "6px"})
-    ], style={"backgroundColor": "#ffffff", "borderRadius": "10px", "boxShadow": "0 4px 12px rgba(0,0,0,0.05)", "border": "1px solid #e9ecef", "padding": "16px", "marginBottom": "24px"})
-], style={
-    "marginLeft": "156px",
-    "padding": "16px 24px",
-    "maxWidth": "calc(100% - 156px)",
-    "backgroundColor": "#f8f9fa",
-    "fontFamily": "sans-serif",
-    "minHeight": "100vh"
-})
- 
-app.layout = html.Div([
-    sidebar,
-    main_content
-])
- 
- 
-def parse_date_to_month_year(d_str: str):
-    """
-    Parses a date string into (m_idx [0-11], y_str).
-    Uses data-driven Kenvue Calendar Excel mapping from database.py.
-    """
-    cal_info = database.map_date_to_kv_calendar(d_str)
-    if cal_info:
-        return cal_info["m_idx"], cal_info["y_str"]
-    print(f"[WARNING]: Kenvue Calendar mapping not found for date '{d_str}'. Skipping unmapped record.")
-    return None, None
- 
- 
-@app.callback(
-    [Output("active-tab", "data"),
-     Output("loaded-dashboard-data", "data"),
-     Output("live-record-count", "children"),
-     Output("spreadsheet-container", "children"),
-     Output("filter-gbu", "options"),
-     Output("filter-squad", "options"),
-     Output("filter-model", "options"),
-     Output("filter-gbu", "value"),
-     Output("filter-squad", "value"),
-     Output("filter-model", "value"),
-     Output("filter-squad", "disabled"),
-     Output("filter-model", "disabled"),
-     Output("btn-refresh", "disabled"),
-     Output("btn-refresh", "style"),
-     Output("nav-consumption", "style"),
-     Output("nav-shipments", "style")],
-    [Input("btn-refresh", "n_clicks"),
-     Input("filter-gbu", "value"),
-     Input("filter-squad", "value"),
-     Input("filter-model", "value"),
-     Input("nav-consumption", "n_clicks"),
-     Input("nav-shipments", "n_clicks")],
-    [State("active-tab", "data"),
-     State("loaded-dashboard-data", "data")]
-)
-def update_dashboard(n_clicks, gbu, squad, model, c_clicks, s_clicks, active_tab_state, loaded_dashboard_state):
-    print("=" * 70)
-    print("REFRESH CALLBACK START")
-    print("=" * 70)
- 
-    triggered_id = dash.ctx.triggered_id if dash.ctx.triggered_id else None
-    print(f"Triggered ID                          : '{triggered_id}'")
-    print(f"Refresh button callback Input detected: {'YES' if triggered_id == 'btn-refresh' else 'NO'}")
-    print(f"Selected GBU                          : '{gbu}'")
-    print(f"Selected Need State                   : '{squad}'")
-    print(f"Selected Model                        : '{model}'")
-    print("-" * 70)
- 
+    global _cached_bb_df
+    if _cached_bb_df is not None and not force_reload:
+        return _cached_bb_df
+
+    df = pd.DataFrame(columns=['model', 'period_month', 'building_block', 'value_in_thousands'])
     try:
-        if triggered_id == "nav-shipments":
-            active_tab = "shipments"
-        elif triggered_id == "nav-consumption":
-            active_tab = "consumption"
-        else:
-            active_tab = active_tab_state if active_tab_state else "consumption"
- 
-        if triggered_id == "filter-gbu":
-            squad = "Select Need State"
-            model = "Select Model"
-        elif triggered_id == "filter-squad":
-            model = "Select Model"
- 
-        gbu_norm = database.normalize_text(gbu)
-        is_gbu_valid = bool(gbu and gbu_norm not in database.IGNORED_PLACEHOLDERS)
-        squad_disabled = not is_gbu_valid
- 
-        if active_tab == "shipments":
-            opts = ship.get_shipment_filter_options(gbu=gbu, squad=squad, model=model)
-        else:
-            opts = database.get_filter_options(gbu=gbu, squad=squad, model=model)
- 
-        gbu_opts = [{"label": g, "value": g} for g in opts.get("gbus", ["Select GBU"])]
-        valid_gbus_norm = [database.normalize_text(g["value"]) for g in gbu_opts]
-        if database.normalize_text(gbu) not in valid_gbus_norm:
-            gbu = "Select GBU"
-            is_gbu_valid = False
-            squad_disabled = True
- 
-        if is_gbu_valid:
-            squad_opts = [{"label": s, "value": s} for s in opts.get("squads", ["Select Need State"])]
-            if squad and database.normalize_text(squad) not in database.IGNORED_PLACEHOLDERS:
-                if not any(database.normalize_text(s["value"]) == database.normalize_text(squad) for s in squad_opts):
-                    squad_opts.append({"label": squad, "value": squad})
-        else:
-            squad_opts = [{"label": "Select Need State", "value": "Select Need State"}]
-            squad = "Select Need State"
- 
-        squad_norm = database.normalize_text(squad)
-        is_squad_valid = bool(squad and squad_norm not in database.IGNORED_PLACEHOLDERS)
-        model_disabled = not (is_gbu_valid and is_squad_valid)
- 
-        if is_gbu_valid and is_squad_valid:
-            model_opts = [{"label": m, "value": m} for m in opts.get("models", ["Select Model"])]
-            if model and database.normalize_text(model) not in database.IGNORED_PLACEHOLDERS:
-                if not any(database.normalize_text(m["value"]) == database.normalize_text(model) for m in model_opts):
-                    model_opts.append({"label": model, "value": model})
-        else:
-            model_opts = [{"label": "Select Model", "value": "Select Model"}]
-            model = "Select Model"
- 
-        model_norm = database.normalize_text(model)
-        is_model_valid = bool(model and model_norm not in database.IGNORED_PLACEHOLDERS)
- 
-        can_refresh = (is_gbu_valid and is_squad_valid and is_model_valid)
-        btn_disabled = not can_refresh
- 
-        btn_style = {
-            "backgroundColor": "#019881" if can_refresh else "#6c757d",
-            "color": "#ffffff",
-            "fontWeight": "700",
-            "fontSize": "12px",
-            "padding": "6px 12px",
-            "width": "100%",
-            "border": "none",
-            "cursor": "pointer" if can_refresh else "not-allowed",
-            "opacity": "1.0" if can_refresh else "0.6"
-        }
+        conn = database.get_postgres_connection()
+        cur = conn.cursor()
+        cur.execute(BB_QUERY)
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
 
-        active_nav_style = {
-            "backgroundColor": "#019881", "color": "#ffffff", "width": "134px", "padding": "12px 8px",
-            "minHeight": "105px", "borderRadius": "12px", "display": "flex", "flexDirection": "column",
-            "alignItems": "center", "justifyContent": "center", "cursor": "pointer",
-            "boxShadow": "0 2px 6px rgba(0,0,0,0.2)", "border": "none", "textDecoration": "none"
-        }
-        inactive_nav_style = {
-            "backgroundColor": "transparent", "color": "#ffffff", "width": "134px", "padding": "12px 8px",
-            "minHeight": "105px", "borderRadius": "12px", "display": "flex", "flexDirection": "column",
-            "alignItems": "center", "justifyContent": "center", "cursor": "pointer",
-            "opacity": "0.85", "border": "none", "textDecoration": "none"
-        }
+        if rows:
+            df = pd.DataFrame(rows, columns=['model', 'period_month', 'building_block', 'value_in_thousands'])
+            df['value_in_thousands'] = pd.to_numeric(df['value_in_thousands'], errors='coerce').fillna(0.0)
+            df['building_block'] = df['building_block'].astype(str).str.strip()
+            df['model'] = df['model'].astype(str).str.strip()
+    except Exception as e:
+        print(f"[POSTGRES BUILDING BLOCK LOAD NOTICE]: {e}")
 
-        if active_tab == "shipments":
-            nav_cons_style = inactive_nav_style
-            nav_ship_style = active_nav_style
+    _cached_bb_df = df
+    return df
+
+
+def get_current_kv_period(df: pd.DataFrame = None, target_year: Optional[str] = None) -> dict:
+    """
+    Determines current Kenvue year, current/target Kenvue month, and completeness
+    using existing Kenvue Calendar logic in database.py.
+    """
+    comp = database.get_kv_month_completeness_status(df, target_year=target_year)
+    t_year = comp.get("latest_year", "")
+
+    latest_comp_nbr = comp.get("latest_complete_m_nbr", 0)
+    month_details = comp.get("month_details", {})
+
+    target_m_nbr = min(latest_comp_nbr + 1, 12) if (latest_comp_nbr > 0 and latest_comp_nbr < 12) else (12 if latest_comp_nbr == 12 else 1)
+    m_info = month_details.get(target_m_nbr, {})
+    is_comp = m_info.get("is_complete", False)
+    m_name = database.MONTHS[target_m_nbr - 1] if 1 <= target_m_nbr <= 12 else "N/A"
+
+    return {
+        "target_year": t_year,
+        "target_month_nbr": target_m_nbr,
+        "target_month_name": m_name,
+        "is_complete": is_comp,
+        "month_details": month_details,
+        "completeness_status": comp
+    }
+
+
+def get_previous_year_pos(
+    df: pd.DataFrame,
+    current_year: str,
+    current_month_nbr: int,
+    model_name: Optional[str] = None
+) -> Tuple[Optional[float], Optional[float], List[Tuple]]:
+    """
+    Gets POS $ for the SAME Kenvue month in the PREVIOUS KENVUE YEAR.
+    Example: Current = Sep 2026 -> Previous Year = Sep 2025.
+    Normalizes raw Snowflake POS dollars into dashboard $M units (divides by 1,000,000).
+    Returns tuple: (raw_pos_dollars, normalized_pos_in_millions, weekly_rows).
+    """
+    if df is None or df.empty or not current_year or not str(current_year).isdigit():
+        return None, None, []
+
+    prev_year = str(int(current_year) - 1)
+    target_kv_m = f"{prev_year}-{current_month_nbr:02d}"
+
+    raw_pos = 0.0
+    found = False
+    weekly_rows = []
+
+    for _, r in df.iterrows():
+        d_str = str(r.get('GLOBAL_DATE_SHORT_DESC', '')).strip()
+        kv_info = database.map_date_to_kv_calendar(d_str) if d_str else None
+        
+        kv_m_str = ""
+        wk_id = r.get('KV_WK_ID')
+        
+        if kv_info:
+            kv_m_str = f"{kv_info['y_str']}-{kv_info['m_nbr']:02d}"
+            if not wk_id:
+                wk_id = kv_info.get('wk_id')
         else:
-            nav_cons_style = active_nav_style
-            nav_ship_style = inactive_nav_style
+            kv_m_str = str(r.get('KV_MONTH', '')).strip()
 
-        if triggered_id in ["filter-gbu", "filter-squad", "filter-model"]:
-            print(f"\nFilter changed ('{triggered_id}') -> returning lightweight dropdown updates")
-            return (
-                active_tab,
-                dash.no_update,
-                dash.no_update,
-                dash.no_update,
-                gbu_opts,
-                squad_opts,
-                model_opts,
-                gbu,
-                squad,
-                model,
-                squad_disabled,
-                model_disabled,
-                btn_disabled,
-                btn_style,
-                nav_cons_style,
-                nav_ship_style
-            )
+        if kv_m_str == target_kv_m:
+            pv = r.get('POS_VALUE') if pd.notnull(r.get('POS_VALUE')) else r.get('POS_DOLLARS')
+            if pd.notnull(pv):
+                val = float(pv)
+                raw_pos += val
+                found = True
+                weekly_rows.append((str(wk_id or 'N/A'), d_str, val))
 
-        should_fetch_snowflake = (triggered_id == "btn-refresh" and can_refresh)
- 
-        current_loaded_store = loaded_dashboard_state if isinstance(loaded_dashboard_state, dict) else {}
+    if not found:
+        return None, None, []
 
-        if active_tab == "shipments":
-            stored_ship_model = current_loaded_store.get("shipment_model")
-            if should_fetch_snowflake:
-                ship_df = ship.fetch_shipment_data_for_model(model)
-                if not ship_df.empty:
-                    month_summary = ship.aggregate_shipment_monthly(ship_df)
-                    table_elem = ship.render_shipment_matrix_table(month_summary, model_name=model)
-                    record_str = f"Shipment GMC Mapped Records: {len(ship_df)} | Read-Only (Loaded for '{model}')"
-                    current_loaded_store["shipment_model"] = model
-                    current_loaded_store["shipment_rec_count"] = len(ship_df)
-                    current_loaded_store["gbu"] = gbu
-                    current_loaded_store["squad"] = squad
-                    current_loaded_store["model"] = model
-                else:
-                    table_elem = html.Div([
-                        html.Div([
-                            html.H6(f"No Shipment Data for '{model}'", style={"color": "#D9534F", "fontWeight": "700", "marginBottom": "8px", "fontSize": "16px"}),
-                            html.P(f"No matching GMC hierarchy items or shipment records found in Snowflake for Model: '{model}'.", style={"color": "#721c24", "fontSize": "13px", "marginBottom": "0", "fontWeight": "500"})
-                        ], style={"textAlign": "center", "padding": "48px 24px", "backgroundColor": "#f8d7da", "borderRadius": "10px", "border": "1px solid #f5c6cb", "boxShadow": "0 2px 8px rgba(0,0,0,0.04)"})
-                    ])
-                    record_str = f"No Shipment Mapping / Records for '{model}'"
-            elif stored_ship_model and stored_ship_model == model:
-                ship_df = ship.fetch_shipment_data_for_model(stored_ship_model)
-                if not ship_df.empty:
-                    month_summary = ship.aggregate_shipment_monthly(ship_df)
-                    table_elem = ship.render_shipment_matrix_table(month_summary, model_name=stored_ship_model)
-                    record_str = f"Shipment GMC Mapped Records: {len(ship_df)} | Read-Only (Loaded for '{stored_ship_model}')"
-                else:
-                    table_elem = html.Div("No Shipment Data Available", style={"padding": "20px", "textAlign": "center", "color": "#721c24"})
-                    record_str = f"No Shipment Mapping / Records for '{stored_ship_model}'"
+    pos_in_m = raw_pos / 1_000_000.0
+    return raw_pos, pos_in_m, weekly_rows
+
+
+def get_building_block_values(
+    model_name: str,
+    year: str,
+    month_nbr: int,
+    bb_df: Optional[pd.DataFrame] = None
+) -> Tuple[Dict[str, Optional[float]], Optional[float], List[Tuple], bool]:
+    """
+    Filters Building Block planning values for model and period matching the 11 official POS adjustment blocks:
+      Base Trend, Season, Competition, Distribution, Innovation, Discontinuations,
+      Renovation, Media, Trade, Price, Club.
+    Returns tuple: (blocks_dict, total_bb_value, raw_rows_list, has_bb_data).
+    If model is not in BUILDING_BLOCK_DISPLAY_MODELS or no matching records exist, returns total_bb_value = None and has_bb_data = False.
+    """
+    if not model_name or database.normalize_text(model_name) in database.IGNORED_PLACEHOLDERS:
+        return {b: None for b in ALLOWED_BUILDING_BLOCKS}, None, [], False
+
+    norm_target_model = database.normalize_text(model_name)
+    if norm_target_model not in BUILDING_BLOCK_DISPLAY_MODELS_NORM:
+        return {b: None for b in ALLOWED_BUILDING_BLOCKS}, None, [], False
+
+    if bb_df is None or bb_df.empty:
+        bb_df = load_building_block_data()
+
+    if bb_df.empty:
+        return {b: None for b in ALLOWED_BUILDING_BLOCKS}, None, [], False
+
+    yr_int = int(year) if year and str(year).isdigit() else 2026
+
+    blocks = {}
+    total = 0.0
+    raw_list = []
+
+    for _, r in bb_df.iterrows():
+        row_model = str(r['model'])
+        if database.normalize_text(row_model) != norm_target_model:
+            continue
+
+        b_name_raw = str(r['building_block']).strip()
+        b_norm = database.normalize_text(b_name_raw)
+
+        # Filter strictly for the 11 official POS adjustment Building Blocks
+        if b_norm not in ALLOWED_BB_NORM:
+            continue
+
+        p_val = r['period_month']
+        match_period = False
+
+        if pd.notnull(p_val):
+            dt = pd.to_datetime(p_val, errors='coerce')
+            if pd.notnull(dt):
+                if dt.year == yr_int and dt.month == month_nbr:
+                    match_period = True
             else:
-                table_elem = html.Div([
-                    html.Div([
-                        html.H6("Shipment GTS Dashboard", style={"color": "#019881", "fontWeight": "700", "marginBottom": "8px", "fontSize": "16px"}),
-                        html.P("Select GBU, Need State, and Model, then click REFRESH DATA.", style={"color": "#495057", "fontSize": "13px", "marginBottom": "0", "fontWeight": "500"})
-                    ], style={"textAlign": "center", "padding": "48px 24px", "backgroundColor": "#ffffff", "borderRadius": "10px", "border": "1px dashed #019881", "boxShadow": "0 2px 8px rgba(0,0,0,0.04)"})
-                ])
-                record_str = "Shipment GTS Mode (Excel GMC Hierarchy Mapping)"
+                p_str = str(p_val).strip()
+                if p_str.startswith(f"{yr_int}-{month_nbr:02d}"):
+                    match_period = True
 
-            return (
-                active_tab,
-                current_loaded_store,
-                record_str,
-                table_elem,
-                gbu_opts,
-                squad_opts,
-                model_opts,
-                gbu,
-                squad,
-                model,
-                squad_disabled,
-                model_disabled,
-                btn_disabled,
-                btn_style,
-                nav_cons_style,
-                nav_ship_style
-            )
- 
-        if should_fetch_snowflake:
-            df = database.fetch_joined_snowflake_data(gbu=gbu, squad=squad, model=model)
-            rec_count = len(df)
- 
-            record_str = f"Snowflake Mapped Records: {rec_count} | Read-Only"
-            if not df.empty:
-                current_loaded_store = {
-                    "records": df.to_dict("records"),
-                    "rec_count": rec_count,
-                    "gbu": gbu,
-                    "squad": squad,
-                    "model": model
-                }
-            else:
-                current_loaded_store = None
+        if match_period:
+            canonical_name = next((b for b in ALLOWED_BUILDING_BLOCKS if database.normalize_text(b) == b_norm), b_name_raw)
+            val = float(r['value_in_thousands']) if pd.notnull(r['value_in_thousands']) else 0.0
+            blocks[canonical_name] = blocks.get(canonical_name, 0.0) + val
+            total += val
+            raw_list.append((canonical_name, val, yr_int, month_nbr))
+
+    has_bb_data = len(raw_list) > 0
+    if not has_bb_data:
+        return {b: None for b in ALLOWED_BUILDING_BLOCKS}, None, [], False
+
+    final_blocks = {}
+    for b in ALLOWED_BUILDING_BLOCKS:
+        final_blocks[b] = blocks.get(b, 0.0)
+
+    return final_blocks, total, raw_list, True
+
+
+
+def calculate_current_month_asp(
+    df: pd.DataFrame,
+    current_year: str,
+    target_month_nbr: int
+) -> Optional[float]:
+    """
+    Calculates ASP for Current Month (Building Block target month):
+      ASP(Current Month) = ASP(Previous Year Same Month) * (1 + YoY% of ASP OF YTD)
+    """
+    if df is None or df.empty or not current_year or not str(current_year).isdigit():
+        return None
+
+    prev_year = str(int(current_year) - 1)
+    target_m_idx = target_month_nbr - 1
+
+    pos_val_curr = [0.0] * 12
+    pos_u_curr = [0.0] * 12
+    pos_val_prev = [0.0] * 12
+    pos_u_prev = [0.0] * 12
+
+    has_val_curr = [False] * 12
+    has_u_curr = [False] * 12
+    has_val_prev = [False] * 12
+    has_u_prev = [False] * 12
+
+    for _, r in df.iterrows():
+        d_str = str(r.get('GLOBAL_DATE_SHORT_DESC', '')).strip()
+        kv_info = database.map_date_to_kv_calendar(d_str) if d_str else None
+        if not kv_info:
+            continue
+        y_str = kv_info['y_str']
+        m_idx = kv_info['m_idx']
+
+        pv = r.get('POS_VALUE') if pd.notnull(r.get('POS_VALUE')) else r.get('POS_DOLLARS')
+        pu = r.get('POS_UNITS')
+
+        if y_str == current_year and 0 <= m_idx < 12:
+            if pd.notnull(pv):
+                pos_val_curr[m_idx] += float(pv)
+                has_val_curr[m_idx] = True
+            if pd.notnull(pu):
+                pos_u_curr[m_idx] += float(pu)
+                has_u_curr[m_idx] = True
+        elif y_str == prev_year and 0 <= m_idx < 12:
+            if pd.notnull(pv):
+                pos_val_prev[m_idx] += float(pv)
+                has_val_prev[m_idx] = True
+            if pd.notnull(pu):
+                pos_u_prev[m_idx] += float(pu)
+                has_u_prev[m_idx] = True
+
+    if not (has_val_prev[target_m_idx] and has_u_prev[target_m_idx] and pos_u_prev[target_m_idx] > 0):
+        return None
+
+    prev_same_month_asp = pos_val_prev[target_m_idx] / pos_u_prev[target_m_idx]
+
+    ytd_end = target_m_idx if target_m_idx > 0 else 12
+
+    curr_ytd_val = sum(pos_val_curr[:ytd_end])
+    curr_ytd_u = sum(pos_u_curr[:ytd_end])
+
+    prev_ytd_val = sum(pos_val_prev[:ytd_end])
+    prev_ytd_u = sum(pos_u_prev[:ytd_end])
+
+    ytd_asp_curr = (curr_ytd_val / curr_ytd_u) if curr_ytd_u > 0 else None
+    ytd_asp_prev = (prev_ytd_val / prev_ytd_u) if prev_ytd_u > 0 else None
+
+    yoy_asp_ytd_pct = 0.0
+    if ytd_asp_curr is not None and ytd_asp_prev is not None and ytd_asp_prev > 0:
+        yoy_asp_ytd_pct = (ytd_asp_curr - ytd_asp_prev) / abs(ytd_asp_prev)
+
+    calc_asp = prev_same_month_asp * (1.0 + yoy_asp_ytd_pct)
+    return calc_asp
+
+
+def calculate_current_month_pos(
+    df: pd.DataFrame,
+    model_name: str,
+    target_year: Optional[str] = None,
+    target_month_nbr: Optional[int] = None
+) -> dict:
+    """
+    Main calculation entry point for Building Blocks & Current Month POS:
+      Current-Month Calculated POS ($M) = Previous-Year Same Month POS ($M) + Building Block Total ($K)
+      Calculated Factory POS ($M) = Calculated Current POS ($M) * Existing Index Value
+    Gated strictly by Kenvue Month completeness (complete == TRUE) and BUILDING_BLOCK_DISPLAY_MODELS.
+    """
+    period_info = get_current_kv_period(df, target_year=target_year)
+    yr = target_year or period_info["target_year"]
+    m_nbr = target_month_nbr or period_info["target_month_nbr"]
+    m_name = database.MONTHS[m_nbr - 1] if 1 <= m_nbr <= 12 else "N/A"
+    prev_yr_str = str(int(yr) - 1) if yr and str(yr).isdigit() else "N/A"
+
+    m_complete = period_info.get("is_complete", False)
+    m_details = period_info.get("month_details", {}).get(m_nbr, {})
+    req_weeks = m_details.get("req_weeks_count", 0)
+    avail_weeks = m_details.get("avail_weeks_count", 0)
+    pos_raw_avail = avail_weeks > 0
+
+    norm_model = database.normalize_text(model_name)
+    is_bb_eligible = norm_model in BUILDING_BLOCK_DISPLAY_MODELS_NORM
+
+    # Print required Model Eligibility diagnostic block
+    print("\n" + "=" * 60)
+    print(f"Selected Model: {model_name}")
+    print(f"Building Block Eligible: {'YES' if is_bb_eligible else 'NO'}")
+
+    # Get Previous-Year Same Month POS
+    raw_prev_pos, prev_pos_m, prev_weekly_rows = get_previous_year_pos(df, yr, m_nbr, model_name=model_name)
+
+    # Load & filter Building Block data (11 official blocks)
+    bb_df = load_building_block_data()
+    bb_blocks, bb_total, bb_raw_list, has_bb_data = get_building_block_values(model_name, yr, m_nbr, bb_df=bb_df)
+
+    if is_bb_eligible:
+        print(f"Building Block records available: {len(bb_raw_list)}")
+    else:
+        print("Building Block display skipped for selected model.")
+
+    pos_display_allowed = is_bb_eligible and has_bb_data and (prev_pos_m is not None)
+    bb_display_allowed = is_bb_eligible and has_bb_data
+
+    # Calculation: Current-Month Calculated POS ($M) = Previous-Year POS ($M) + Building Block Total ($K)
+    calc_pos_m = None
+    if is_bb_eligible and has_bb_data and (prev_pos_m is not None):
+        calc_pos_m = prev_pos_m + (bb_total if bb_total is not None else 0.0)
+
+    # Calculation: Factory POS ($M) = Calculated POS ($M) * Price Index
+    factory_pos_m = None
+    index_val = None
+    if calc_pos_m is not None:
+        norm_m = database.normalize_month_3letter(m_nbr)
+        idx_map = database.get_price_index_lookup_map()
+        key = (norm_m, norm_model)
+        if key in idx_map:
+            index_val = idx_map[key]
+            factory_pos_m = calc_pos_m * index_val
         else:
-            if current_loaded_store and isinstance(current_loaded_store, dict) and "records" in current_loaded_store:
-                df = pd.DataFrame(current_loaded_store["records"])
-                rec_count = current_loaded_store.get("rec_count", len(df))
-                loaded_model = current_loaded_store.get("model", "Loaded Model")
-                record_str = f"Snowflake Mapped Records: {rec_count} | Read-Only (Loaded for '{loaded_model}')"
-            else:
-                df = pd.DataFrame()
-                record_str = "Filter Selection (PostgreSQL Hierarchy - Click REFRESH DATA to fetch Snowflake)"
- 
-        # Load Building Block Data
-        bb_df = BB.load_building_block_data()
- 
+            factory_pos_m = calc_pos_m
 
- 
-        if not df.empty:
-            data_by_year = {}
-            for _, r in df.iterrows():
-                kv_m_str = str(r.get('KV_MONTH', '')).strip()
-                if kv_m_str and '-' in kv_m_str:
-                    parts = kv_m_str.split('-')
-                    y_str = parts[0]
-                    m_nbr = int(parts[1])
-                    m_idx = m_nbr - 1
-                else:
-                    d_str = str(r.get('GLOBAL_DATE_SHORT_DESC', '')).strip()
-                    kv_info = database.map_date_to_kv_calendar(d_str)
-                    if not kv_info:
-                        continue
-                    m_idx = kv_info["m_idx"]
-                    y_str = kv_info["y_str"]
- 
-                if str(y_str).isdigit() and int(y_str) < 2022:
-                    continue
- 
-                if y_str not in data_by_year:
-                    data_by_year[y_str] = {
-                        "pos_val": [None]*12, "factory_pos": [None]*12, "pos_u": [None]*12,
-                        "gross_ship": [None]*12, "return_ship": [None]*12,
-                        "gross_case": [None]*12, "return_case": [None]*12,
-                        "gross_cu": [None]*12, "return_cu": [None]*12
-                    }
-                d_dict = data_by_year[y_str]
-                pv = r.get('POS_VALUE') if pd.notnull(r.get('POS_VALUE')) else r.get('POS_DOLLARS')
-                pu = r.get('POS_UNITS')
-                gs = r.get('GROSS_SHIPMENT_AM')
-                rs = r.get('RETURN_SHIP_AM')
-                gqc = r.get('GROSS_QTY_CASE')
-                rqc = r.get('RETURN_QTY_CASE')
-                gcu = r.get('GROSS_QTY_CU')
-                rcu = r.get('RETURN_QTY_CU')
- 
-                d_dict["pos_val"][m_idx] = (d_dict["pos_val"][m_idx] or 0.0) + float(pv) if pd.notnull(pv) else d_dict["pos_val"][m_idx]
-                d_dict["pos_u"][m_idx] = (d_dict["pos_u"][m_idx] or 0.0) + float(pu) if pd.notnull(pu) else d_dict["pos_u"][m_idx]
-                d_dict["gross_ship"][m_idx] = (d_dict["gross_ship"][m_idx] or 0.0) + float(gs) if pd.notnull(gs) else d_dict["gross_ship"][m_idx]
-                d_dict["return_ship"][m_idx] = (d_dict["return_ship"][m_idx] or 0.0) + float(rs) if pd.notnull(rs) else d_dict["return_ship"][m_idx]
-                d_dict["gross_case"][m_idx] = (d_dict["gross_case"][m_idx] or 0.0) + float(gqc) if pd.notnull(gqc) else d_dict["gross_case"][m_idx]
-                d_dict["return_case"][m_idx] = (d_dict["return_case"][m_idx] or 0.0) + float(rqc) if pd.notnull(rqc) else d_dict["return_case"][m_idx]
-                d_dict["gross_cu"][m_idx] = (d_dict["gross_cu"][m_idx] or 0.0) + float(gcu) if pd.notnull(gcu) else d_dict["gross_cu"][m_idx]
-                d_dict["return_cu"][m_idx] = (d_dict["return_cu"][m_idx] or 0.0) + float(rcu) if pd.notnull(rcu) else d_dict["return_cu"][m_idx]
- 
-            # Calculate Factory POS using Index Value map
-            for yr_k in sorted(data_by_year.keys()):
-                for m_i in range(12):
-                    pv_val = data_by_year[yr_k]["pos_val"][m_i]
-                    if pv_val is not None:
-                        f_pos, idx_val = database.get_factory_pos_val(yr_k, m_i + 1, model, pv_val)
-                        data_by_year[yr_k]["factory_pos"][m_i] = f_pos
- 
-            all_years = sorted([str(yr) for yr in data_by_year.keys() if str(yr).isdigit()])
-            if all_years:
-                latest_year = all_years[-1]
-                prev_year = str(int(latest_year) - 1)
-                latest_year_int = int(latest_year)
-                hist_years = [str(latest_year_int - 5 + i) for i in range(5)]
-                comp_status = database.get_kv_month_completeness_status(df, target_year=latest_year)
-                latest_comp_m_nbr = comp_status["latest_complete_m_nbr"]
-                ytd_slice = comp_status["ytd_slice"]
-                ytg_slice = comp_status["ytg_slice"]
- 
-                # Apply week completeness filter to incomplete months across all years
-                for yr_k in sorted(data_by_year.keys()):
-                    yr_comp = database.get_kv_month_completeness_status(df, target_year=yr_k)
-                    yr_m_details = yr_comp.get("month_details", {})
-                    for m_n in range(1, 13):
-                        if not yr_m_details.get(m_n, {}).get("is_complete", False):
-                            m_i = m_n - 1
-                            data_by_year[yr_k]["pos_val"][m_i] = None
-                            data_by_year[yr_k]["pos_u"][m_i] = None
-                            data_by_year[yr_k]["factory_pos"][m_i] = None
- 
-                # Invoke BB.py calculation & update current month POS $ and Factory POS $
-                if is_model_valid:
-                    bb_result = BB.calculate_current_month_pos(df, model, target_year=latest_year)
-                    if bb_result:
-                        t_m_i = bb_result["target_month_nbr"] - 1
-                        if bb_result.get("calculated_pos_m") is not None:
-                            # Assign Calculated Current Month POS $ (in actual dollars)
-                            data_by_year[latest_year]["pos_val"][t_m_i] = bb_result["calculated_pos_m"] * 1_000_000.0
-                        else:
-                            data_by_year[latest_year]["pos_val"][t_m_i] = None
- 
-                        if bb_result.get("factory_pos_m") is not None:
-                            data_by_year[latest_year]["factory_pos"][t_m_i] = bb_result["factory_pos_m"] * 1_000_000.0
-                        else:
-                            data_by_year[latest_year]["factory_pos"][t_m_i] = None
-            else:
-                latest_year = ""
-                prev_year = ""
-                hist_years = []
-                comp_status = database.get_kv_month_completeness_status(df, target_year=None)
-                latest_comp_m_nbr = 0
-                ytd_slice = slice(0, 0)
-                ytg_slice = slice(0, 12)
- 
-            year_metrics = {}
-            for yr in all_years:
-                d = data_by_year.get(yr, {
-                    "pos_val": [None]*12, "factory_pos": [None]*12, "pos_u": [None]*12,
-                    "gross_ship": [None]*12, "return_ship": [None]*12,
-                    "gross_case": [None]*12, "return_case": [None]*12,
-                    "gross_cu": [None]*12, "return_cu": [None]*12
-                })
-                net_ship = [calc_net(d["gross_ship"][i], d["return_ship"][i]) for i in range(12)]
-                net_case = [calc_net(d["gross_case"][i], d["return_case"][i]) for i in range(12)]
-                net_cu = [calc_net(d["gross_cu"][i], d["return_cu"][i]) for i in range(12)]
-                asp = [calc_asp(d["pos_val"][i], d["pos_u"][i]) for i in range(12)]
- 
-                prev_year_str = str(int(yr) - 1) if yr.isdigit() else None
-                prev_year_dec_pos = None
-                if prev_year_str and prev_year_str in data_by_year:
-                    prev_year_dec_pos = data_by_year[prev_year_str]["pos_val"][11]
- 
-                build = [None] * 12
-                for i in range(12):
-                    cur_pos = d["pos_val"][i]
-                    prev_pos = (d["pos_val"][i-1] if i > 0 else prev_year_dec_pos)
-                    if cur_pos is not None and prev_pos is not None and prev_pos != 0:
-                        build[i] = cur_pos / prev_pos
- 
-                tot_pos = sum([v for v in d["pos_val"] if v is not None])
-                share = [calc_share(d["pos_val"][i], tot_pos) for i in range(12)]
-                variance = [calc_variance(d["pos_val"][i], net_ship[i]) for i in range(12)]
-                var_pct = [calc_pct_var(d["pos_val"][i], net_ship[i]) for i in range(12)]
- 
-                year_metrics[yr] = {
-                    "pos_val": d["pos_val"], "factory_pos": d.get("factory_pos", [None]*12), "pos_u": d["pos_u"],
-                    "gross_ship": d["gross_ship"], "return_ship": d["return_ship"], "net_ship": net_ship,
-                    "gross_case": d["gross_case"], "return_case": d["return_case"], "net_case": net_case,
-                    "gross_cu": d["gross_cu"], "return_cu": d["return_cu"], "net_cu": net_cu,
-                    "asp": asp, "build": build, "share": share,
-                    "variance": variance, "var_pct": var_pct
-                }
+    # Print exact required CURRENT MONTH DISPLAY GATE diagnostic block
+    print("\nCURRENT MONTH DISPLAY GATE")
+    print("=" * 60)
+    print(f"Current Kenvue Month : {yr}-{m_nbr:02d}")
+    print(f"Required Weeks       : {req_weeks}")
+    print(f"Available Weeks      : {avail_weeks}")
+    print(f"Month Complete       : {'TRUE' if m_complete else 'FALSE'}")
+    print("")
+    print(f"POS Raw Available    : {'YES' if pos_raw_avail else 'NO'}")
+    print(f"POS Display Allowed  : {'YES' if pos_display_allowed else 'NO'}")
+    print("")
+    print(f"Building Block Data  : {'YES' if has_bb_data else 'NO'}")
+    print(f"BB Display Allowed   : {'YES' if bb_display_allowed else 'NO'}")
+    print("")
+    print(f"Final POS $          : {f'${calc_pos_m:.1f} M' if calc_pos_m is not None else 'BLANK'}")
+    print(f"Final Factory POS $  : {f'${factory_pos_m:.1f} M' if factory_pos_m is not None else 'BLANK'}")
+    calc_asp_val = None
+    if is_bb_eligible and has_bb_data:
+        calc_asp_val = calculate_current_month_asp(df, yr, m_nbr)
 
-            if is_model_valid and bb_result and latest_year in year_metrics:
-                t_m_i = bb_result.get("target_month_nbr", 1) - 1
-                if bb_result.get("calculated_asp") is not None:
-                    year_metrics[latest_year]["asp"][t_m_i] = bb_result["calculated_asp"]
- 
-            # Table Header Construction
-            th_style = {"backgroundColor": "#019881", "color": "#ffffff", "fontWeight": "800", "padding": "8px 10px", "border": "1px solid #858585", "textAlign": "center", "whiteSpace": "nowrap"}
-            th_q1 = html.Th("Q1", colSpan=3, style={**th_style, "backgroundColor": "#018571"})
-            th_q2 = html.Th("Q2", colSpan=3, style={**th_style, "backgroundColor": "#018571"})
-            th_q3 = html.Th("Q3", colSpan=3, style={**th_style, "backgroundColor": "#018571"})
-            th_q4 = html.Th("Q4", colSpan=3, style={**th_style, "backgroundColor": "#018571", "borderRight": "3px solid #858585"})
-            th_tot = html.Th("TOTALS", colSpan=7, style={**th_style, "backgroundColor": "#017362"})
- 
-            hdr_row1 = html.Tr([
-                html.Th("METRIC NAME", style={**th_style, "backgroundColor": "#019881", "textAlign": "left"}),
-                html.Th("YEAR", style={**th_style, "backgroundColor": "#019881"}),
-                th_q1, th_q2, th_q3, th_q4, th_tot
-            ])
- 
-            hdr_row2 = html.Tr([
-                html.Th("Metric Description", style={**th_style, "textAlign": "left", "minWidth": "160px", "backgroundColor": "#019881"}),
-                html.Th("Ver/Yr", style={**th_style, "minWidth": "50px", "backgroundColor": "#019881"}),
-                *[html.Th(m, style={**th_style, "minWidth": "55px", "backgroundColor": "#019881", **({"borderRight": "3px solid #858585"} if m == "DEC" else {})}) for m in MONTHS],
-                html.Th("Q1", style={**th_style, "minWidth": "60px", "backgroundColor": "#018571", "color": "#ffffff"}),
-                html.Th("Q2", style={**th_style, "minWidth": "60px", "backgroundColor": "#018571", "color": "#ffffff"}),
-                html.Th("Q3", style={**th_style, "minWidth": "60px", "backgroundColor": "#018571", "color": "#ffffff"}),
-                html.Th("Q4", style={**th_style, "minWidth": "60px", "backgroundColor": "#018571", "color": "#ffffff", "borderRight": "3px solid #858585"}),
-                html.Th("FY", style={**th_style, "minWidth": "65px", "backgroundColor": "#017362", "color": "#ffffff"}),
-                html.Th("YTD", style={**th_style, "minWidth": "65px", "backgroundColor": "#017362", "color": "#ffffff"}),
-                html.Th("YTG", style={**th_style, "minWidth": "65px", "backgroundColor": "#017362", "color": "#ffffff"})
-            ])
- 
-            thead = html.Thead([hdr_row1, hdr_row2])
-            tbody_rows = []
- 
-            def make_grouped_rows(metric_name, unit, yr_val_tuples, metric_key, year_metrics):
-                group_rows = []
-                group_size = len(yr_val_tuples)
-                label_td_style = {
-                    "backgroundColor": "#DDDDDD", "color": "#000000", "fontWeight": "900", "fontSize": "14px",
-                    "textAlign": "center", "verticalAlign": "middle", "border": "1px solid #858585", "padding": "8px"
-                }
- 
-                def calc_period_val(target_yr, slice_obj):
-                    if target_yr == "YoY %":
-                        val_latest = calc_period_val(latest_year, slice_obj) if latest_year else None
-                        val_prev = calc_period_val(prev_year, slice_obj) if prev_year else None
-                        return calc_pct_var(val_latest, val_prev)
- 
-                    ym = year_metrics.get(target_yr)
-                    if not ym:
-                        return None
- 
-                    if metric_key in ["pos_val", "factory_pos", "pos_u", "gross_ship", "gross_case", "net_ship", "share"]:
-                        arr = ym.get(metric_key, [None]*12)[slice_obj]
-                        valid_vals = [v for v in arr if v is not None and not (isinstance(v, float) and math.isnan(v))]
-                        return sum(valid_vals) if valid_vals else None
-                    elif metric_key == "build":
-                        arr = ym.get("build", [None]*12)[slice_obj]
-                        valid_vals = [v for v in arr if v is not None and not (isinstance(v, float) and math.isnan(v))]
-                        return (sum(valid_vals) / len(valid_vals)) if valid_vals else None
-                    elif metric_key == "asp":
-                        pos_v_sum = sum([v for v in ym["pos_val"][slice_obj] if v is not None and not (isinstance(v, float) and math.isnan(v))])
-                        pos_u_sum = sum([v for v in ym["pos_u"][slice_obj] if v is not None and not (isinstance(v, float) and math.isnan(v))])
-                        if pos_u_sum == 0:
-                            return None
-                        return pos_v_sum / pos_u_sum
-                    else:
-                        arr = ym.get(metric_key, [None]*12)[slice_obj]
-                        valid_vals = [v for v in arr if v is not None and not (isinstance(v, float) and math.isnan(v))]
-                        return sum(valid_vals) if valid_vals else None
- 
-                for idx, (yr, m_vals) in enumerate(yr_val_tuples):
-                    td_cells = []
-                    if idx == 0:
-                        td_cells.append(html.Td(metric_name, rowSpan=group_size, style=label_td_style))
- 
-                    is_grey_highlight = (yr in [latest_year, "YoY %"])
-                    yr_bg_color = "#DDDDDD" if is_grey_highlight else "#ffffff"
- 
-                    td_cells.append(html.Td(yr, style={
-                        "backgroundColor": yr_bg_color, "color": "#000000",
-                        "fontWeight": "800" if is_grey_highlight else "bold",
-                        "textAlign": "center", "border": "1px solid #858585"
-                    }))
- 
-                    cell_unit = "%" if yr == "YoY %" else unit
- 
-                    for m_idx in range(12):
-                        v = m_vals[m_idx] if m_idx < len(m_vals) else None
-                        cell_str = fmt_val(v, cell_unit, "VALID")
- 
-                        cell_bg = yr_bg_color
-                        text_color = "#000000"
-                        font_wt = "800" if is_grey_highlight else "500"
- 
-                        if yr == "YoY %" and v is not None and not (isinstance(v, float) and math.isnan(v)):
-                            if v < 0:
-                                text_color = "#D9534F"
-                            elif v > 0:
-                                text_color = "#28A745"
- 
-                        if metric_key == "build" and yr == latest_year:
-                            if v is not None and not (isinstance(v, float) and math.isnan(v)):
-                                val_float_2d = round(float(v), 2)
-                                hist_builds = []
-                                for h_yr in hist_years:
-                                    b_val = year_metrics.get(h_yr, {}).get("build", [None]*12)[m_idx]
-                                    if b_val is not None and not (isinstance(b_val, float) and math.isnan(b_val)):
-                                        hist_builds.append(round(float(b_val), 2))
- 
-                                if len(hist_builds) >= 2:
-                                    try:
-                                        h_mean_2d = round(statistics.mean(hist_builds), 2)
-                                        h_std = statistics.stdev(hist_builds) if len(hist_builds) > 1 else statistics.pstdev(hist_builds)
-                                        two_std_2d = round(2.0 * h_std, 2)
-                                        abs_diff_2d = round(abs(val_float_2d - h_mean_2d), 2)
- 
-                                        is_red = (abs_diff_2d > two_std_2d)
-                                        if is_red:
-                                            cell_bg = "#F8696B"
-                                            text_color = "#ffffff"
-                                            font_wt = "800"
-                                    except Exception:
-                                        pass
- 
-                        border_style = "1px solid #858585"
-                        td_cells.append(html.Td(cell_str, style={
-                            "backgroundColor": cell_bg, "color": text_color, "fontWeight": font_wt,
-                            "textAlign": "right", "border": border_style, "padding": "6px 8px",
-                            **({"borderRight": "3px solid #858585"} if m_idx == 11 else {})
-                        }))
- 
-                    q1_val = calc_period_val(yr, slice(0, 3))
-                    q2_val = calc_period_val(yr, slice(3, 6))
-                    q3_val = calc_period_val(yr, slice(6, 9))
-                    q4_val = calc_period_val(yr, slice(9, 12))
-                    fy_val = calc_period_val(yr, slice(0, 12))
-                    ytd_val = calc_period_val(yr, ytd_slice)
-                    ytg_val = calc_period_val(yr, ytg_slice)
- 
-                    summary_cells = [
-                        (q1_val, "#ffffff"), (q2_val, "#ffffff"), (q3_val, "#ffffff"), (q4_val, "#ffffff"),
-                        (fy_val, "#ffffff"), (ytd_val, "#ffffff"), (ytg_val, "#ffffff")
-                    ]
- 
-                    for s_idx, (s_val, s_bg) in enumerate(summary_cells):
-                        s_str = fmt_val(s_val, cell_unit, "VALID")
-                        final_s_bg = yr_bg_color if is_grey_highlight else s_bg
-                        s_text_color = "#000000"
-                        if yr == "YoY %" and s_val is not None and not (isinstance(s_val, float) and math.isnan(s_val)):
-                            if s_val < 0:
-                                s_text_color = "#D9534F"
-                            elif s_val > 0:
-                                s_text_color = "#28A745"
- 
-                        td_cells.append(html.Td(s_str, style={
-                            "backgroundColor": final_s_bg, "color": s_text_color,
-                            "fontWeight": "800" if is_grey_highlight else "bold",
-                            "textAlign": "right", "border": "1px solid #858585", "padding": "6px 8px",
-                            **({"borderRight": "3px solid #858585"} if s_idx == 3 else {})
-                        }))
- 
-                    row_border_bottom = "3px solid #858585" if (idx == group_size - 1) else "1px solid #858585"
-                    group_rows.append(html.Tr(td_cells, style={"borderBottom": row_border_bottom}))
- 
-                return group_rows
- 
-            display_years = all_years
-            latest_metrics = year_metrics.get(latest_year, {})
-            prev_metrics = year_metrics.get(prev_year, {})
- 
-            if active_tab == "shipments":
-                gts_dollar_tuples = [(yr, year_metrics[yr]["gross_ship"]) for yr in display_years]
-                gst_u_tuples = [(yr, year_metrics[yr]["gross_case"]) for yr in display_years]
-                b3_tuples = [(yr, year_metrics[yr]["net_ship"]) for yr in display_years]
-                build_bleed_tuples = [(yr, year_metrics[yr]["build"]) for yr in display_years]
-                unit_ratio_tuples = [(yr, year_metrics[yr]["share"]) for yr in display_years]
- 
-                yoy_gts = [calc_pct_var(latest_metrics.get("gross_ship", [None]*12)[i], prev_metrics.get("gross_ship", [None]*12)[i]) for i in range(12)]
-                yoy_gstu = [calc_pct_var(latest_metrics.get("gross_case", [None]*12)[i], prev_metrics.get("gross_case", [None]*12)[i]) for i in range(12)]
-                yoy_b3 = [calc_pct_var(latest_metrics.get("net_ship", [None]*12)[i], prev_metrics.get("net_ship", [None]*12)[i]) for i in range(12)]
- 
-                gts_dollar_tuples.append(("YoY %", yoy_gts))
-                gst_u_tuples.append(("YoY %", yoy_gstu))
-                b3_tuples.append(("YoY %", yoy_b3))
- 
-                tbody_rows.extend(make_grouped_rows("GTS $", "$", gts_dollar_tuples, "gross_ship", year_metrics))
-                tbody_rows.extend(make_grouped_rows("GST U", "Units", gst_u_tuples, "gross_case", year_metrics))
-                tbody_rows.extend(make_grouped_rows("B3", "$", b3_tuples, "net_ship", year_metrics))
-                tbody_rows.extend(make_grouped_rows("Build/Bleed $", "$", build_bleed_tuples, "build", year_metrics))
-                tbody_rows.extend(make_grouped_rows("Unit Ratio", "Ratio", unit_ratio_tuples, "share", year_metrics))
-            else:
-                pos_dollar_tuples = [(yr, year_metrics[yr]["pos_val"]) for yr in display_years]
-                factory_pos_tuples = [(yr, year_metrics[yr]["factory_pos"]) for yr in display_years]
-                pos_u_tuples = [(yr, year_metrics[yr]["pos_u"]) for yr in display_years]
-                asp_tuples = [(yr, year_metrics[yr]["asp"]) for yr in display_years]
-                build_tuples = [(yr, year_metrics[yr]["build"]) for yr in display_years]
-                share_tuples = [(yr, year_metrics[yr]["share"]) for yr in display_years]
- 
-                yoy_pos = [calc_pct_var(latest_metrics.get("pos_val", [None]*12)[i], prev_metrics.get("pos_val", [None]*12)[i]) for i in range(12)]
-                yoy_factory = [calc_pct_var(latest_metrics.get("factory_pos", [None]*12)[i], prev_metrics.get("factory_pos", [None]*12)[i]) for i in range(12)]
-                yoy_u = [calc_pct_var(latest_metrics.get("pos_u", [None]*12)[i], prev_metrics.get("pos_u", [None]*12)[i]) for i in range(12)]
-                yoy_asp = [calc_pct_var(latest_metrics.get("asp", [None]*12)[i], prev_metrics.get("asp", [None]*12)[i]) for i in range(12)]
- 
-                pos_dollar_tuples.append(("YoY %", yoy_pos))
-                factory_pos_tuples.append(("YoY %", yoy_factory))
-                pos_u_tuples.append(("YoY %", yoy_u))
-                asp_tuples.append(("YoY %", yoy_asp))
- 
-                tbody_rows.extend(make_grouped_rows("POS $", "$M", pos_dollar_tuples, "pos_val", year_metrics))
-                tbody_rows.extend(make_grouped_rows("FACTORY POS $", "$M", factory_pos_tuples, "factory_pos", year_metrics))
-                tbody_rows.extend(make_grouped_rows("POS U", "UnitsM", pos_u_tuples, "pos_u", year_metrics))
-                tbody_rows.extend(make_grouped_rows("ASP", "$", asp_tuples, "asp", year_metrics))
-                tbody_rows.extend(make_grouped_rows("Build", "Ratio", build_tuples, "build", year_metrics))
-                tbody_rows.extend(make_grouped_rows("% of Year", "%", share_tuples, "share", year_metrics))
- 
-            tbody = html.Tbody(tbody_rows)
- 
-            footer_note = html.Div(
-                "* POS Dollar, Factory POS Dollar, and POS Units are in millions.",
-                style={"marginTop": "10px", "fontSize": "12px", "fontWeight": "600", "color": "#495057", "fontStyle": "italic"}
-            )
- 
-            table_elem = html.Div([
-                html.Table([thead, tbody], style={
-                    "width": "100%", "borderCollapse": "collapse", "fontFamily": "sans-serif", "fontSize": "11px"
-                }),
-                footer_note
-            ])
-        else:
-            if not can_refresh:
-                if not is_gbu_valid:
-                    prompt_text = "Please select a GBU to begin."
-                elif not is_squad_valid:
-                    prompt_text = "Please select a Need State."
-                else:
-                    prompt_text = "Please select a Model."
-            else:
-                if should_fetch_snowflake and df.empty:
-                    prompt_text = f"No POS records found in Snowflake for GBU: '{gbu}', Need State: '{squad}', Model: '{model}'."
-                else:
-                    prompt_text = "All selections complete. Click REFRESH DATA to load the dashboard."
- 
-            dash_title = "Shipment Validation Dashboard" if active_tab == "shipments" else "Consumption Validation Dashboard"
-            table_elem = html.Div([
-                html.Div([
-                    html.H6(dash_title, style={"color": "#00B097", "fontWeight": "700", "marginBottom": "8px", "fontSize": "16px"}),
-                    html.P(prompt_text, style={"color": "#495057", "fontSize": "13px", "marginBottom": "0", "fontWeight": "500"})
-                ], style={"textAlign": "center", "padding": "48px 24px", "backgroundColor": "#ffffff", "borderRadius": "10px", "border": "1px dashed #00B097", "boxShadow": "0 2px 8px rgba(0,0,0,0.04)"})
-            ])
- 
-    except Exception as callback_err:
-        print("=" * 70)
-        print("REFRESH CALLBACK ERROR")
-        print("=" * 70)
-        traceback.print_exc()
-        print("=" * 70)
- 
-        err_title = "Dashboard Calculation Error"
-        err_msg = f"An error occurred while updating the dashboard: {str(callback_err)}"
-        table_elem = html.Div([
-            html.Div([
-                html.H6(err_title, style={"color": "#D9534F", "fontWeight": "700", "marginBottom": "8px", "fontSize": "16px"}),
-                html.P(err_msg, style={"color": "#721c24", "fontSize": "13px", "marginBottom": "12px", "fontWeight": "500"}),
-                html.Pre(traceback.format_exc(), style={"textAlign": "left", "backgroundColor": "#f8d7da", "padding": "12px", "borderRadius": "6px", "fontSize": "11px", "overflowX": "auto"})
-            ], style={"textAlign": "center", "padding": "24px", "backgroundColor": "#f8d7da", "borderRadius": "10px", "border": "1px solid #f5c6cb", "boxShadow": "0 2px 8px rgba(0,0,0,0.04)"})
-        ])
- 
-    out_tuple = (
-        active_tab,
-        current_loaded_store,
-        record_str,
-        table_elem,
-        gbu_opts,
-        squad_opts,
-        model_opts,
-        gbu,
-        squad,
-        model,
-        squad_disabled,
-        model_disabled,
-        btn_disabled,
-        btn_style,
-        nav_cons_style,
-        nav_ship_style
-    )
- 
-    return out_tuple
-if __name__ == "__main__":
-    host = os.getenv("HOST", "127.0.0.1")
-    port = int(os.getenv("PORT", "8050"))
-    debug = os.getenv("DEBUG", "True").lower() in ["true", "1", "t"]
-    print(f"Starting Consumption Validation Dashboard at http://{host}:{port}...")
-    app.run(host=host, port=port, debug=debug, dev_tools_ui=False)
- 
+    print(f"Final POS U          : BLANK")
+    print(f"Final ASP            : {f'${calc_asp_val:.2f}' if calc_asp_val is not None else 'BLANK'}")
+    print(f"Final BBI            : {f'{bb_total:.2f}' if (bb_display_allowed and bb_total is not None) else 'BLANK'}")
+    print(f"Final % of Year      : BLANK")
+    print("=" * 60 + "\n")
+
+    return {
+        "target_year": yr,
+        "target_month_nbr": m_nbr,
+        "target_month_name": m_name,
+        "prev_year_str": prev_yr_str,
+        "prev_year_pos_raw": raw_prev_pos,
+        "prev_year_pos_m": prev_pos_m,
+        "building_blocks": bb_blocks,
+        "bb_total": bb_total,
+        "has_bb_data": has_bb_data,
+        "is_complete": m_complete,
+        "calculated_pos_m": calc_pos_m,
+        "index_val": index_val,
+        "factory_pos_m": factory_pos_m,
+        "calculated_asp": calc_asp_val
+    }
+
+
+def calculate_factory_pos(calculated_pos_val: float, target_year: str, target_month_nbr: int, model_name: str) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Calculates Factory POS $ = Calculated POS $ * Existing Index Value.
+    Uses existing Index Value logic in database.py.
+    Returns tuple: (factory_pos_val, index_val).
+    """
+    if calculated_pos_val is None or pd.isna(calculated_pos_val):
+        return None, None
+
+    norm_m = database.normalize_month_3letter(target_month_nbr)
+    norm_model = database.normalize_text(model_name)
+    idx_map = database.get_price_index_lookup_map()
+    key = (norm_m, norm_model)
+
+    if key in idx_map:
+        index_val = idx_map[key]
+        return (float(calculated_pos_val) * index_val), index_val
+
+    return None, None
