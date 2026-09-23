@@ -386,7 +386,7 @@ def update_dashboard(n_clicks, gbu, squad, model, c_clicks, s_clicks, active_tab
 
         should_fetch_snowflake = (triggered_id == "btn-refresh" and can_refresh)
 
-        current_loaded_store = loaded_dashboard_state
+        current_loaded_store = loaded_dashboard_state if isinstance(loaded_dashboard_state, dict) else {}
 
         if should_fetch_snowflake:
             if active_tab == "consumption":
@@ -395,27 +395,39 @@ def update_dashboard(n_clicks, gbu, squad, model, c_clicks, s_clicks, active_tab
 
                 record_str = f"Snowflake Mapped Records: {rec_count} | Read-Only"
                 if not df.empty:
-                    current_loaded_store = {
-                        "records": df.to_dict("records"),
-                        "rec_count": rec_count,
-                        "gbu": gbu,
-                        "squad": squad,
-                        "model": model
-                    }
+                    current_loaded_store["records"] = df.to_dict("records")
+                    current_loaded_store["rec_count"] = rec_count
+                    current_loaded_store["gbu"] = gbu
+                    current_loaded_store["squad"] = squad
+                    current_loaded_store["model"] = model
                 else:
-                    current_loaded_store = None
+                    current_loaded_store.pop("records", None)
             else:
                 df = pd.DataFrame()
                 record_str = "Shipment GTS Mode (Excel GMC Hierarchy Mapping)"
         else:
-            if active_tab == "consumption" and current_loaded_store and isinstance(current_loaded_store, dict) and "records" in current_loaded_store:
-                df = pd.DataFrame(current_loaded_store["records"])
-                rec_count = current_loaded_store.get("rec_count", len(df))
-                loaded_model = current_loaded_store.get("model", "Loaded Model")
-                record_str = f"Snowflake Mapped Records: {rec_count} | Read-Only (Loaded for '{loaded_model}')"
+            if active_tab == "consumption":
+                if "records" in current_loaded_store and current_loaded_store.get("model") == model:
+                    df = pd.DataFrame(current_loaded_store["records"])
+                    rec_count = current_loaded_store.get("rec_count", len(df))
+                    loaded_model = current_loaded_store.get("model", "Loaded Model")
+                    record_str = f"Snowflake Mapped Records: {rec_count} | Read-Only (Loaded for '{loaded_model}')"
+                elif can_refresh and triggered_id == "nav-consumption":
+                    df = database.fetch_joined_snowflake_data(gbu=gbu, squad=squad, model=model)
+                    rec_count = len(df)
+                    record_str = f"Snowflake Mapped Records: {rec_count} | Read-Only"
+                    if not df.empty:
+                        current_loaded_store["records"] = df.to_dict("records")
+                        current_loaded_store["rec_count"] = rec_count
+                        current_loaded_store["gbu"] = gbu
+                        current_loaded_store["squad"] = squad
+                        current_loaded_store["model"] = model
+                else:
+                    df = pd.DataFrame()
+                    record_str = "Filter Selection (Click REFRESH DATA to fetch Snowflake)"
             else:
                 df = pd.DataFrame()
-                record_str = "Filter Selection (Click REFRESH DATA to fetch Snowflake)"
+                record_str = "Shipment GTS Mode (Excel GMC Hierarchy Mapping)"
 
         # Determine model for active calculations (use stored model name when rendering cached store)
         active_calc_model = (
@@ -444,19 +456,20 @@ def update_dashboard(n_clicks, gbu, squad, model, c_clicks, s_clicks, active_tab
             nav_cons_style = inactive_nav_style
             nav_ship_style = active_nav_style
             stored_ship_model = current_loaded_store.get("shipment_model") if isinstance(current_loaded_store, dict) else None
-            if should_fetch_snowflake and can_refresh:
+
+            should_fetch_ship = (should_fetch_snowflake or (triggered_id == "nav-shipments" and stored_ship_model != model))
+
+            if should_fetch_ship and can_refresh:
                 ship_df = ship.fetch_shipment_data_for_model(model)
                 if not ship_df.empty:
                     month_summary = ship.aggregate_shipment_monthly(ship_df)
                     table_elem = ship.render_shipment_matrix_table(month_summary, model_name=model)
                     record_str = f"Shipment GMC Mapped Records: {len(ship_df)} | Read-Only (Loaded for '{model}')"
-                    current_loaded_store = {
-                        "shipment_model": model,
-                        "rec_count": len(ship_df),
-                        "gbu": gbu,
-                        "squad": squad,
-                        "model": model
-                    }
+                    current_loaded_store["shipment_model"] = model
+                    current_loaded_store["shipment_rec_count"] = len(ship_df)
+                    current_loaded_store["gbu"] = gbu
+                    current_loaded_store["squad"] = squad
+                    current_loaded_store["model"] = model
                 else:
                     table_elem = html.Div([
                         html.Div([
@@ -465,7 +478,6 @@ def update_dashboard(n_clicks, gbu, squad, model, c_clicks, s_clicks, active_tab
                         ], style={"textAlign": "center", "padding": "48px 24px", "backgroundColor": "#f8d7da", "borderRadius": "10px", "border": "1px solid #f5c6cb", "boxShadow": "0 2px 8px rgba(0,0,0,0.04)"})
                     ])
                     record_str = f"No Shipment Mapping / Records for '{model}'"
-                    current_loaded_store = None
             elif stored_ship_model and stored_ship_model == model:
                 ship_df = ship.fetch_shipment_data_for_model(stored_ship_model)
                 if not ship_df.empty:
