@@ -224,32 +224,43 @@ def load_kv_calendar():
 # =============================================================================
 def resolve_shipment_model_items(model_name: str) -> pd.DataFrame:
     """
-    Reads mapping rows for model_name dynamically from Excel, matches GMC hierarchy in Snowflake:
-      VW_DIM_GMC_PRODCUT_HIERARCHY
+    Reads mapping rows for model_name dynamically from PostgreSQL hierarchy mapping,
+    matches GMC hierarchy in Snowflake: VW_DIM_GMC_PRODCUT_HIERARCHY.
     Using GMC_BRAND_NAME, GMC_SUBBRAND_NAME, GMC_SUBCATEGORY_NAME with OR logic.
     Returns DataFrame of matched unique KV_ITEM_NOs.
     """
     model_mapping = load_shipment_model_mapping(model_name=model_name)
- 
+
     if model_mapping.empty:
-        print(f"[WARNING]: Zero mapping rows found in Excel for model '{model_name}'.")
+        print(f"[WARNING]: Zero mapping rows found in PostgreSQL mapping for model '{model_name}'.")
         return pd.DataFrame()
- 
+
     conditions = []
     for _, row in model_mapping.iterrows():
         b = str(row.get("GMC_BRAND_NAME", "")).strip().replace("'", "''")
         sb = str(row.get("GMC_SUBBRAND_NAME", "")).strip().replace("'", "''")
         sc = str(row.get("GMC_SUBCATEGORY_NAME", "")).strip().replace("'", "''")
- 
-        cond = f"""
+
+        sub_conds = []
+        if b:
+            sub_conds.append(f"UPPER(TRIM(COALESCE(GMC_BRAND_NAME, ''))) = '{b}'")
+        if sb:
+            sub_conds.append(f"UPPER(TRIM(COALESCE(GMC_SUBBRAND_NAME, ''))) = '{sb}'")
+        if sc:
+            sub_conds.append(f"UPPER(TRIM(COALESCE(GMC_SUBCATEGORY_NAME, ''))) = '{sc}'")
+
+        if sub_conds:
+            cond = f"""
         (
-            UPPER(TRIM(COALESCE(GMC_BRAND_NAME, ''))) = '{b}'
-            AND UPPER(TRIM(COALESCE(GMC_SUBBRAND_NAME, ''))) = '{sb}'
-            AND UPPER(TRIM(COALESCE(GMC_SUBCATEGORY_NAME, ''))) = '{sc}'
+            {" AND ".join(sub_conds)}
         )
         """
-        conditions.append(cond)
- 
+            conditions.append(cond)
+
+    if not conditions:
+        print(f"[WARNING]: Zero populated hierarchy conditions for model '{model_name}'.")
+        return pd.DataFrame()
+
     where_clause = "\nOR\n".join(conditions)
  
     query = f"""
