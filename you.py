@@ -806,44 +806,82 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                     usd_vals[m_i] = float(u_val)
                 if pd.notnull(q_val):
                     qty_vals[m_i] = float(q_val)
- 
-        # Building block calculation applies ONLY from current month to end of year in latest_year
-        if str(yr) == str(latest_year):
-            m_cutoff_idx = latest_comp_m_nbr
-            ship_bb_df = load_shipment_building_block_data()
 
-            for m_i in range(m_cutoff_idx, 12):
-                m_nbr = m_i + 1
-                m_name = MONTHS[m_i]
-                factory_pos = factory_pos_map.get((str(yr), m_i))
-                bb_blocks, bb_total_k, has_bb = get_shipment_building_block_values(model_name, str(yr), m_nbr, bb_df=ship_bb_df)
-
-                if factory_pos is not None:
-                    # Divide building block values by 1000 ($K -> $M)
-                    bb_total_m = (bb_total_k / 1000.0) if bb_total_k else 0.0
-                    factory_pos_m = (factory_pos / 1_000_000.0)
-                    calc_grs_m = factory_pos_m + bb_total_m
-                    calc_grs_usd = calc_grs_m * 1_000_000.0
-
-                    usd_vals[m_i] = calc_grs_usd
-
-                    # Terminal diagnostics for current month through end of year
-                    print("\n" + "=" * 70)
-                    print(f"SHIPMENT BUILDING BLOCK SUMMARY | MODEL: '{model_name}' | PERIOD: {yr}-{m_nbr:02d} ({m_name})")
-                    print("=" * 70)
-                    for b_name in SHIPMENT_ALLOWED_BUILDING_BLOCKS:
-                        val_k = bb_blocks.get(b_name, 0.0)
-                        val_m = val_k / 1000.0
-                        print(f"  - {b_name:<20} : ${val_k:>10,.2f} K (${val_m:>6,.2f} M)")
-                    print("-" * 70)
-                    print(f"  TOTAL BUILDING BLOCKS  : ${bb_total_k:>10,.2f} K (${bb_total_m:>6,.2f} M)")
-                    print(f"  FACTORY POS $          : ${factory_pos:>10,.2f} (${factory_pos_m:>6,.2f} M)")
-                    print(f"  CALCULATED GRS $       : ${calc_grs_usd:>10,.2f} (${calc_grs_m:>6,.2f} M)")
-                    print("=" * 70 + "\n")
-
-                qty_vals[m_i] = None
- 
         raw_metric_vals[yr] = {"GRS_USD": usd_vals, "GRS_QTY": qty_vals}
+
+    # Calculate FY Price Factor of previous year (e.g., 2025)
+    fy_price_factor_prev = 1.0
+    if prev_year in raw_metric_vals:
+        prev_usd_arr = [v for v in raw_metric_vals[prev_year]["GRS_USD"] if v is not None]
+        prev_qty_arr = [v for v in raw_metric_vals[prev_year]["GRS_QTY"] if v is not None]
+        prev_pos_val_arr = [pos_val_map.get((str(prev_year), i)) for i in range(12) if pos_val_map.get((str(prev_year), i)) is not None]
+        prev_pos_u_arr = [pos_u_map.get((str(prev_year), i)) for i in range(12) if pos_u_map.get((str(prev_year), i)) is not None]
+
+        tot_prev_usd = sum(prev_usd_arr) if prev_usd_arr else 0.0
+        tot_prev_qty = sum(prev_qty_arr) if prev_qty_arr else 0.0
+        tot_prev_pos_val = sum(prev_pos_val_arr) if prev_pos_val_arr else 0.0
+        tot_prev_pos_u = sum(prev_pos_u_arr) if prev_pos_u_arr else 0.0
+
+        asp_prev_fy = (tot_prev_pos_val / tot_prev_pos_u) if (tot_prev_pos_val > 0 and tot_prev_pos_u > 0) else None
+        b3_prev_fy = (tot_prev_usd / tot_prev_qty) if (tot_prev_usd > 0 and tot_prev_qty > 0) else None
+
+        if asp_prev_fy and b3_prev_fy and b3_prev_fy != 0:
+            fy_price_factor_prev = asp_prev_fy / b3_prev_fy
+
+    # Calculate GRS $ and GRS U for latest_year from current month (m_cutoff_idx) through December (index 11)
+    if latest_year in raw_metric_vals:
+        usd_vals = raw_metric_vals[latest_year]["GRS_USD"]
+        qty_vals = raw_metric_vals[latest_year]["GRS_QTY"]
+        m_cutoff_idx = latest_comp_m_nbr
+        ship_bb_df = load_shipment_building_block_data()
+
+        for m_i in range(m_cutoff_idx, 12):
+            m_nbr = m_i + 1
+            m_name = MONTHS[m_i]
+            factory_pos = factory_pos_map.get((str(latest_year), m_i))
+            bb_blocks, bb_total_k, has_bb = get_shipment_building_block_values(model_name, str(latest_year), m_nbr, bb_df=ship_bb_df)
+
+            if factory_pos is not None:
+                bb_total_m = (bb_total_k / 1000.0) if bb_total_k else 0.0
+                factory_pos_m = (factory_pos / 1_000_000.0)
+                calc_grs_m = factory_pos_m + bb_total_m
+                calc_grs_usd = calc_grs_m * 1_000_000.0
+
+                usd_vals[m_i] = calc_grs_usd
+
+                # Calculate GRS U using FY Price Factor of previous year
+                p_val_m = pos_val_map.get((str(latest_year), m_i))
+                p_u_m = pos_u_map.get((str(latest_year), m_i))
+                asp_m = (p_val_m / p_u_m) if (p_val_m and p_u_m and p_u_m != 0) else None
+
+                if asp_m is None:
+                    p_val_prev = pos_val_map.get((str(prev_year), m_i))
+                    p_u_prev = pos_u_map.get((str(prev_year), m_i))
+                    if p_val_prev and p_u_prev and p_u_prev != 0:
+                        asp_m = p_val_prev / p_u_prev
+
+                if asp_m and fy_price_factor_prev and fy_price_factor_prev != 0:
+                    b3_proj = asp_m / fy_price_factor_prev
+                    if b3_proj != 0:
+                        qty_vals[m_i] = calc_grs_usd / b3_proj
+
+                # Terminal diagnostics for current month through December
+                print("\n" + "=" * 70)
+                print(f"SHIPMENT BUILDING BLOCK SUMMARY | MODEL: '{model_name}' | PERIOD: {latest_year}-{m_nbr:02d} ({m_name})")
+                print("=" * 70)
+                for b_name in SHIPMENT_ALLOWED_BUILDING_BLOCKS:
+                    val_k = bb_blocks.get(b_name, 0.0)
+                    val_m = val_k / 1000.0
+                    print(f"  - {b_name:<20} : ${val_k:>10,.2f} K (${val_m:>6,.2f} M)")
+                print("-" * 70)
+                print(f"  TOTAL BUILDING BLOCKS  : ${bb_total_k:>10,.2f} K (${bb_total_m:>6,.2f} M)")
+                print(f"  FACTORY POS $          : ${factory_pos:>10,.2f} (${factory_pos_m:>6,.2f} M)")
+                print(f"  CALCULATED GRS $       : ${calc_grs_usd:>10,.2f} (${calc_grs_m:>6,.2f} M)")
+                print(f"  CALCULATED GRS U       : {qty_vals[m_i]:>10,.2f}" if qty_vals[m_i] else "  CALCULATED GRS U       : N/A")
+                print(f"  FY PRICE FACTOR (PREV) : {fy_price_factor_prev:.2f}")
+                print("=" * 70 + "\n")
+
+        raw_metric_vals[latest_year] = {"GRS_USD": usd_vals, "GRS_QTY": qty_vals}
  
     for metric_name, col_key, unit_type, has_yoy in metrics_config:
         year_vals = {}
