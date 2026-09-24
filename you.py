@@ -808,11 +808,45 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                     qty_vals[m_i] = float(q_val)
  
         # From current month (incomplete month) to end of year, do NOT display values (set to BLANK)
+        # Apply Shipment Building Block Formula to GRS $:
+        # Shipment GRS $ = Factory POS $ (same Kenvue fiscal month & year) + (Building Blocks / 1000)
+        ship_bb_df = load_shipment_building_block_data()
+        for m_i in range(12):
+            m_nbr = m_i + 1
+            m_name = MONTHS[m_i]
+            factory_pos = factory_pos_map.get((str(yr), m_i))
+            bb_blocks, bb_total_k, has_bb = get_shipment_building_block_values(model_name, str(yr), m_nbr, bb_df=ship_bb_df)
+
+            if factory_pos is not None:
+                # Divide building block total ($K) by 1000 to convert to $M
+                bb_total_m = (bb_total_k / 1000.0) if bb_total_k else 0.0
+                factory_pos_m = (factory_pos / 1_000_000.0)
+                calc_grs_m = factory_pos_m + bb_total_m
+                calc_grs_usd = calc_grs_m * 1_000_000.0
+
+                # Print terminal diagnostics for each calculated month
+                print("\n" + "=" * 70)
+                print(f"SHIPMENT BUILDING BLOCK SUMMARY | MODEL: '{model_name}' | PERIOD: {yr}-{m_nbr:02d} ({m_name})")
+                print("=" * 70)
+                for b_name in SHIPMENT_ALLOWED_BUILDING_BLOCKS:
+                    val_k = bb_blocks.get(b_name, 0.0)
+                    val_m = val_k / 1000.0
+                    print(f"  - {b_name:<20} : ${val_k:>10,.2f} K (${val_m:>6,.2f} M)")
+                print("-" * 70)
+                print(f"  TOTAL BUILDING BLOCKS  : ${bb_total_k:>10,.2f} K (${bb_total_m:>6,.2f} M)")
+                print(f"  FACTORY POS $          : ${factory_pos:>10,.2f} (${factory_pos_m:>6,.2f} M)")
+                print(f"  CALCULATED GRS $       : ${calc_grs_usd:>10,.2f} (${calc_grs_m:>6,.2f} M)")
+                print("=" * 70 + "\n")
+
+                if str(yr) == str(latest_year) and m_i >= latest_comp_m_nbr:
+                    usd_vals[m_i] = calc_grs_usd
+                elif has_bb or usd_vals[m_i] is None:
+                    usd_vals[m_i] = calc_grs_usd
+
         if str(yr) == str(latest_year):
             m_cutoff_idx = latest_comp_m_nbr
             for m_i in range(12):
                 if m_i >= m_cutoff_idx:
-                    usd_vals[m_i] = None
                     qty_vals[m_i] = None
  
         raw_metric_vals[yr] = {"GRS_USD": usd_vals, "GRS_QTY": qty_vals}
