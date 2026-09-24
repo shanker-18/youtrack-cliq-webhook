@@ -994,6 +994,11 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                         text_color = "#D9534F"
                     elif v > 0:
                         text_color = "#28A745"
+                elif col_key == "BUILD_BLEED" and v is not None:
+                    if v < 0:
+                        text_color = "#D9534F"
+                    elif v > 0:
+                        text_color = "#28A745"
  
                 td_cells.append(html.Td(v_str, style={
                     "backgroundColor": yr_bg, "color": text_color,
@@ -1110,6 +1115,11 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                 qv_str = fmt_m_val(qv, is_pct=is_yoy, unit_type=unit_type)
                 s_color = "#000000"
                 if is_yoy and qv is not None:
+                    if qv < 0:
+                        s_color = "#D9534F"
+                    elif qv > 0:
+                        s_color = "#28A745"
+                elif col_key == "BUILD_BLEED" and qv is not None:
                     if qv < 0:
                         s_color = "#D9534F"
                     elif qv > 0:
