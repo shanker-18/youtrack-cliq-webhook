@@ -637,14 +637,27 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
     raw_metric_vals = {}
     for yr in years:
         yr_df = month_summary_df[month_summary_df["KV_YEAR"] == yr].sort_values("KV_MO_ID")
-        usd_vals = [0.0] * 12
-        qty_vals = [0.0] * 12
+        usd_vals = [None] * 12
+        qty_vals = [None] * 12
         for _, r in yr_df.iterrows():
             m_name = str(r["KV_MONTH_NAME"]).upper()[:3]
             if m_name in MONTHS:
                 m_i = MONTHS.index(m_name)
-                usd_vals[m_i] = float(r.get("GRS_USD", 0.0))
-                qty_vals[m_i] = float(r.get("GRS_QTY", 0.0))
+                u_val = r.get("GRS_USD")
+                q_val = r.get("GRS_QTY")
+                if pd.notnull(u_val):
+                    usd_vals[m_i] = float(u_val)
+                if pd.notnull(q_val):
+                    qty_vals[m_i] = float(q_val)
+
+        # From current month (incomplete month) to end of year, do NOT display values (set to BLANK)
+        if str(yr) == str(latest_year):
+            m_cutoff_idx = latest_comp_m_nbr
+            for m_i in range(12):
+                if m_i >= m_cutoff_idx:
+                    usd_vals[m_i] = None
+                    qty_vals[m_i] = None
+
         raw_metric_vals[yr] = {"GRS_USD": usd_vals, "GRS_QTY": qty_vals}
 
     for metric_name, col_key, unit_type, has_yoy in metrics_config:
