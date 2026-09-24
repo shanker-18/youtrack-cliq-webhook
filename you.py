@@ -68,7 +68,7 @@ def normalize_text(value):
  
  
 # =============================================================================
-# 1. DYNAMIC MODEL MAPPING POSTGRESQL LOADER (SAME AS CONSUMPTION)
+# 1. DYNAMIC MODEL MAPPING EXCEL LOADER (FOR ALL MODELS)
 # =============================================================================
 def load_shipment_model_mapping(model_name=None):
     """
@@ -81,44 +81,28 @@ def load_shipment_model_mapping(model_name=None):
 
     if _cached_excel_mapping is None or _cached_excel_mapping.empty:
         df = database.load_model_mapping_df()
-        if df.empty:
-            df = database.load_model_mapping_df(allow_fallback=True)
-
         if not df.empty:
             df = df.copy()
-            def get_col(col_list):
-                for c in col_list:
-                    if c in df.columns:
-                        return df[c].apply(normalize_text)
-                return pd.Series([""] * len(df), index=df.index)
-
-            df["C1_BUSINESS_SEGMENT"] = get_col(["GLOBAL_GMC_C1_BUSINESS_SEGMENT_DESC", "gbu_code", "C1_BUSINESS_SEGMENT"])
-            df["C3_NEED_STATE"] = get_col(["GLOBAL_GMC_C3_NEED_STATE_DESC", "squad_name", "C3_NEED_STATE"])
-            df["MODEL"] = get_col(["Model", "model_name", "MODEL"])
-            df["GMC_BRAND_NAME"] = get_col(["GLOBAL_GMC_B1_BRAND_DESC", "brand_name", "GMC_BRAND_NAME"])
-            df["GMC_SUBBRAND_NAME"] = get_col(["GLOBAL_GMC_B2_SUB_BRAND_DESC", "sub_brand_name", "GMC_SUBBRAND_NAME"])
-            df["GMC_SUBCATEGORY_NAME"] = get_col(["GLOBAL_GMC_C5_SUB_CATEGORY_DESC", "subcategory", "GMC_SUBCATEGORY_NAME"])
-            df["GMC_CATEGORY_NAME"] = get_col(["GLOBAL_GMC_C4_CATEGORY_DESC", "category", "GMC_CATEGORY_NAME"])
+            df["C1_BUSINESS_SEGMENT"] = df["GLOBAL_GMC_C1_BUSINESS_SEGMENT_DESC"].apply(normalize_text)
+            df["C3_NEED_STATE"] = df["GLOBAL_GMC_C3_NEED_STATE_DESC"].apply(normalize_text)
+            df["MODEL"] = df["Model"].apply(normalize_text)
+            df["GMC_BRAND_NAME"] = df["GLOBAL_GMC_B1_BRAND_DESC"].apply(normalize_text)
+            df["GMC_SUBBRAND_NAME"] = df["GLOBAL_GMC_B2_SUB_BRAND_DESC"].apply(normalize_text)
+            df["GMC_SUBCATEGORY_NAME"] = df["GLOBAL_GMC_C5_SUB_CATEGORY_DESC"].apply(normalize_text)
             _cached_excel_mapping = df
         else:
             _cached_excel_mapping = pd.DataFrame()
 
     if _cached_excel_mapping is not None and not _cached_excel_mapping.empty:
         if model_name:
-            model_clean = re.sub(r'[^A-Z0-9]', '', normalize_text(model_name))
-            model_df = _cached_excel_mapping[
-                _cached_excel_mapping["MODEL"].apply(lambda m: re.sub(r'[^A-Z0-9]', '', normalize_text(m))) == model_clean
-            ].copy()
-            if model_df.empty:
-                model_df = _cached_excel_mapping[
-                    _cached_excel_mapping["MODEL"].apply(lambda m: model_clean in re.sub(r'[^A-Z0-9]', '', normalize_text(m)) or re.sub(r'[^A-Z0-9]', '', normalize_text(m)) in model_clean)
-                ].copy()
+            model_norm = normalize_text(model_name)
+            model_df = _cached_excel_mapping[_cached_excel_mapping["MODEL"] == model_norm].copy()
             return model_df
         return _cached_excel_mapping
 
     return pd.DataFrame()
-
-
+ 
+ 
 def get_shipment_filter_options(gbu=None, squad=None, model=None):
     """
     Returns dropdown filter options (GBU, Need State, Model) derived dynamically
@@ -240,42 +224,35 @@ def load_kv_calendar():
 # =============================================================================
 def resolve_shipment_model_items(model_name: str) -> pd.DataFrame:
     """
-    Reads mapping rows for model_name dynamically from PostgreSQL hierarchy mapping,
-    matches GMC hierarchy in Snowflake: VW_DIM_GMC_PRODCUT_HIERARCHY.
+    Reads mapping rows for model_name dynamically from Excel, matches GMC hierarchy in Snowflake:
+      VW_DIM_GMC_PRODCUT_HIERARCHY
+    Using GMC_BRAND_NAME, GMC_SUBBRAND_NAME, GMC_SUBCATEGORY_NAME with OR logic.
     Returns DataFrame of matched unique KV_ITEM_NOs.
     """
     model_mapping = load_shipment_model_mapping(model_name=model_name)
-
-    rule_clauses = []
-    if not model_mapping.empty:
-        for _, row in model_mapping.iterrows():
-            b = str(row.get("GMC_BRAND_NAME", "")).strip().replace("'", "''")
-            sb = str(row.get("GMC_SUBBRAND_NAME", "")).strip().replace("'", "''")
-            sc = str(row.get("GMC_SUBCATEGORY_NAME", "")).strip().replace("'", "''")
-
-            conds = []
-            if b:
-                conds.append(f"UPPER(TRIM(COALESCE(GMC_BRAND_NAME, ''))) = '{b}'")
-            if sb:
-                # Extract primary subbrand keyword (e.g. CHILDREN from CHILDREN'S TYLENOL)
-                kw = re.sub(r'[^A-Z0-9]', '', sb.upper()).replace("TYLENOL", "").replace("MOTRIN", "").replace("ZYRTEC", "").replace("BENADRYL", "")
-                if not kw or len(kw) < 3:
-                    kw = re.sub(r'[^A-Z0-9]', '', sb.upper())
-
-                conds.append(
-                    f"(UPPER(TRIM(COALESCE(GMC_SUBBRAND_NAME, ''))) = '{sb}' "
-                    f"OR REGEXP_REPLACE(UPPER(TRIM(COALESCE(GMC_SUBBRAND_NAME, ''))), '[^A-Z0-9]', '') LIKE '%{kw}%')"
-                )
-            elif sc:
-                conds.append(f"UPPER(TRIM(COALESCE(GMC_SUBCATEGORY_NAME, ''))) = '{sc}'")
-
-            if conds:
-                rule_clauses.append("(\n            " + "\n            AND ".join(conds) + "\n        )")
-
-    where_clause = "\nOR\n".join(rule_clauses) if rule_clauses else ""
-
-    if where_clause:
-        query = f"""
+ 
+    if model_mapping.empty:
+        print(f"[WARNING]: Zero mapping rows found in Excel for model '{model_name}'.")
+        return pd.DataFrame()
+ 
+    conditions = []
+    for _, row in model_mapping.iterrows():
+        b = str(row.get("GMC_BRAND_NAME", "")).strip().replace("'", "''")
+        sb = str(row.get("GMC_SUBBRAND_NAME", "")).strip().replace("'", "''")
+        sc = str(row.get("GMC_SUBCATEGORY_NAME", "")).strip().replace("'", "''")
+ 
+        cond = f"""
+        (
+            UPPER(TRIM(COALESCE(GMC_BRAND_NAME, ''))) = '{b}'
+            AND UPPER(TRIM(COALESCE(GMC_SUBBRAND_NAME, ''))) = '{sb}'
+            AND UPPER(TRIM(COALESCE(GMC_SUBCATEGORY_NAME, ''))) = '{sc}'
+        )
+        """
+        conditions.append(cond)
+ 
+    where_clause = "\nOR\n".join(conditions)
+ 
+    query = f"""
 SELECT DISTINCT
     KV_ITEM_NO,
     GMC_SKU_CODE,
@@ -287,63 +264,21 @@ FROM PROD_CUSTOMER360_GLOBALNA.NAUSMASTER_ACCESS.VW_DIM_GMC_PRODCUT_HIERARCHY
 WHERE
     {where_clause}
 """
-        conn = database.get_snowflake_connection()
-        cursor = conn.cursor()
-        try:
-            cursor.execute(query)
-            rows = cursor.fetchall()
-            cols = [col[0] for col in cursor.description]
-        finally:
-            cursor.close()
-
-        items_df = pd.DataFrame(rows, columns=cols)
-        if not items_df.empty:
-            items_df["KV_ITEM_NO"] = items_df["KV_ITEM_NO"].astype(str).str.strip()
-            items_df = items_df[items_df["KV_ITEM_NO"] != ""].drop_duplicates(subset=["KV_ITEM_NO"])
-            return items_df
-
-    # -------------------------------------------------------------------------
-    # FALLBACK: Tokenized Model Search in Snowflake if primary rules yield 0 items
-    # -------------------------------------------------------------------------
-    if model_name:
-        words = [re.sub(r'[^A-Z0-9]', '', w.upper()) for w in normalize_text(model_name).split()]
-        words = [w for w in words if len(w) >= 2 and w not in ["SELECT", "MODEL", "ALL", "NONE", "AND", "THE", "FOR"]]
-
-        if words:
-            word_conds = [
-                f"(REGEXP_REPLACE(UPPER(TRIM(COALESCE(GMC_SUBBRAND_NAME, ''))), '[^A-Z0-9]', '') LIKE '%{w}%' OR "
-                f"REGEXP_REPLACE(UPPER(TRIM(COALESCE(GMC_BRAND_NAME, ''))), '[^A-Z0-9]', '') LIKE '%{w}%')"
-                for w in words
-            ]
-            fb_where = " AND ".join(word_conds)
-            fb_query = f"""
-SELECT DISTINCT
-    KV_ITEM_NO,
-    GMC_SKU_CODE,
-    GMC_SKU_NAME,
-    GMC_BRAND_NAME,
-    GMC_SUBBRAND_NAME,
-    GMC_SUBCATEGORY_NAME
-FROM PROD_CUSTOMER360_GLOBALNA.NAUSMASTER_ACCESS.VW_DIM_GMC_PRODCUT_HIERARCHY
-WHERE
-    {fb_where}
-"""
-            conn = database.get_snowflake_connection()
-            cursor = conn.cursor()
-            try:
-                cursor.execute(fb_query)
-                rows = cursor.fetchall()
-                cols = [col[0] for col in cursor.description]
-            finally:
-                cursor.close()
-
-            items_df = pd.DataFrame(rows, columns=cols)
-            if not items_df.empty:
-                items_df["KV_ITEM_NO"] = items_df["KV_ITEM_NO"].astype(str).str.strip()
-                items_df = items_df[items_df["KV_ITEM_NO"] != ""].drop_duplicates(subset=["KV_ITEM_NO"])
-                return items_df
-
-    return pd.DataFrame()
+    conn = database.get_snowflake_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        cols = [col[0] for col in cursor.description]
+    finally:
+        cursor.close()
+ 
+    items_df = pd.DataFrame(rows, columns=cols)
+    if not items_df.empty:
+        items_df["KV_ITEM_NO"] = items_df["KV_ITEM_NO"].astype(str).str.strip()
+        items_df = items_df[items_df["KV_ITEM_NO"] != ""].drop_duplicates(subset=["KV_ITEM_NO"])
+ 
+    return items_df
  
  
 # Backward-compatible alias for Children's Tylenol
@@ -550,8 +485,8 @@ def get_consumption_metrics_monthly_for_model(model_name: str) -> tuple:
  
 # Backward-compatible alias
 get_factory_pos_monthly_for_model = lambda model_name: get_consumption_metrics_monthly_for_model(model_name)[0]
-
-
+ 
+ 
 # =============================================================================
 # 5.6 SHIPMENT BUILDING BLOCKS LOADER & CALCULATOR (POSTGRESQL SOURCE)
 # =============================================================================
@@ -581,12 +516,12 @@ ORDER BY
     period_month,
     sbb.name;
 """
-
+ 
 SHIPMENT_ALLOWED_BUILDING_BLOCKS = ["Innovation", "Trade", "Club", "Retailer Inventory"]
-
+ 
 _cached_shipment_bb_df = None
-
-
+ 
+ 
 def map_shipment_building_block_name(raw_name: str):
     """
     Maps Shipment Building Block PostgreSQL names to standard logical names:
@@ -599,7 +534,7 @@ def map_shipment_building_block_name(raw_name: str):
     if not raw_name:
         return None
     norm = database.normalize_text(raw_name)
-
+ 
     if "INNOVATION" in norm:
         return "Innovation"
     if "TRADE" in norm:
@@ -608,10 +543,10 @@ def map_shipment_building_block_name(raw_name: str):
         return "Club"
     if "INVENTORY" in norm or "RETAILER" in norm:
         return "Retailer Inventory"
-
+ 
     return None
-
-
+ 
+ 
 def load_shipment_building_block_data(force_reload: bool = False) -> pd.DataFrame:
     """
     Loads active Shipment Building Block records from PostgreSQL database.
@@ -619,7 +554,7 @@ def load_shipment_building_block_data(force_reload: bool = False) -> pd.DataFram
     global _cached_shipment_bb_df
     if _cached_shipment_bb_df is not None and not force_reload:
         return _cached_shipment_bb_df
-
+ 
     df = pd.DataFrame(columns=['model', 'period_month', 'building_block', 'value_in_thousands'])
     try:
         conn = database.get_postgres_connection()
@@ -628,7 +563,7 @@ def load_shipment_building_block_data(force_reload: bool = False) -> pd.DataFram
         rows = cur.fetchall()
         cur.close()
         conn.close()
-
+ 
         if rows:
             df = pd.DataFrame(rows, columns=['model', 'period_month', 'building_block', 'value_in_thousands'])
             df['value_in_thousands'] = pd.to_numeric(df['value_in_thousands'], errors='coerce').fillna(0.0)
@@ -636,11 +571,11 @@ def load_shipment_building_block_data(force_reload: bool = False) -> pd.DataFram
             df['model'] = df['model'].astype(str).str.strip()
     except Exception as e:
         print(f"[SHIPMENT BUILDING BLOCK LOAD NOTICE]: {e}")
-
+ 
     _cached_shipment_bb_df = df
     return df
-
-
+ 
+ 
 def get_shipment_building_block_values(
     model_name: str,
     year: str,
@@ -653,34 +588,34 @@ def get_shipment_building_block_values(
     """
     if not model_name or database.normalize_text(model_name) in database.IGNORED_PLACEHOLDERS:
         return {b: 0.0 for b in SHIPMENT_ALLOWED_BUILDING_BLOCKS}, 0.0, False
-
+ 
     if bb_df is None or bb_df.empty:
         bb_df = load_shipment_building_block_data()
-
+ 
     if bb_df.empty:
         return {b: 0.0 for b in SHIPMENT_ALLOWED_BUILDING_BLOCKS}, 0.0, False
-
+ 
     norm_target_model = database.normalize_text(model_name)
     yr_int = int(year) if year and str(year).isdigit() else 2026
-
+ 
     blocks = {b: 0.0 for b in SHIPMENT_ALLOWED_BUILDING_BLOCKS}
     total = 0.0
     found_any = False
-
+ 
     for _, r in bb_df.iterrows():
         row_model = str(r['model'])
         if database.normalize_text(row_model) != norm_target_model:
             continue
-
+ 
         b_name_raw = str(r['building_block']).strip()
         canonical_b = map_shipment_building_block_name(b_name_raw)
-
+ 
         if not canonical_b:
             continue
-
+ 
         p_val = r['period_month']
         match_period = False
-
+ 
         if pd.notnull(p_val):
             dt = pd.to_datetime(p_val, errors='coerce')
             if pd.notnull(dt):
@@ -690,15 +625,14 @@ def get_shipment_building_block_values(
                 p_str = str(p_val).strip()
                 if p_str.startswith(f"{yr_int}-{month_nbr:02d}"):
                     match_period = True
-
+ 
         if match_period:
             val = float(r['value_in_thousands']) if pd.notnull(r['value_in_thousands']) else 0.0
             blocks[canonical_b] += val
             total += val
             found_any = True
-
-    return blocks, total, found_any
  
+    return blocks, total, found_any
  
 # =============================================================================
 # 6. SPREADSHEET MATRIX TABLE RENDERING (MATCHES CONSUMPTION DESIGN)
@@ -825,9 +759,9 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                     usd_vals[m_i] = float(u_val)
                 if pd.notnull(q_val):
                     qty_vals[m_i] = float(q_val)
-
+ 
         raw_metric_vals[yr] = {"GRS_USD": usd_vals, "GRS_QTY": qty_vals}
-
+ 
     # Calculate FY Price Factor of previous year (e.g., 2025)
     fy_price_factor_prev = 1.0
     if prev_year in raw_metric_vals:
@@ -835,30 +769,30 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
         prev_qty_arr = [v for v in raw_metric_vals[prev_year]["GRS_QTY"] if v is not None]
         prev_pos_val_arr = [pos_val_map.get((str(prev_year), i)) for i in range(12) if pos_val_map.get((str(prev_year), i)) is not None]
         prev_pos_u_arr = [pos_u_map.get((str(prev_year), i)) for i in range(12) if pos_u_map.get((str(prev_year), i)) is not None]
-
+ 
         tot_prev_usd = sum(prev_usd_arr) if prev_usd_arr else 0.0
         tot_prev_qty = sum(prev_qty_arr) if prev_qty_arr else 0.0
         tot_prev_pos_val = sum(prev_pos_val_arr) if prev_pos_val_arr else 0.0
         tot_prev_pos_u = sum(prev_pos_u_arr) if prev_pos_u_arr else 0.0
-
+ 
         asp_prev_fy = (tot_prev_pos_val / tot_prev_pos_u) if (tot_prev_pos_val > 0 and tot_prev_pos_u > 0) else None
         b3_prev_fy = (tot_prev_usd / tot_prev_qty) if (tot_prev_usd > 0 and tot_prev_qty > 0) else None
-
+ 
         if asp_prev_fy and b3_prev_fy and b3_prev_fy != 0:
             fy_price_factor_prev = asp_prev_fy / b3_prev_fy
-
+ 
     # Calculate GRS $ and GRS U for latest_year from current month (m_cutoff_idx) through December (index 11)
     if latest_year in raw_metric_vals:
         usd_vals = raw_metric_vals[latest_year]["GRS_USD"]
         qty_vals = raw_metric_vals[latest_year]["GRS_QTY"]
         m_cutoff_idx = latest_comp_m_nbr
         ship_bb_df = load_shipment_building_block_data()
-
+ 
         for m_i in range(m_cutoff_idx, 12):
             m_nbr = m_i + 1
             m_name = MONTHS[m_i]
             factory_pos = factory_pos_map.get((str(latest_year), m_i))
-
+ 
             if factory_pos is None:
                 # Fallback to previous year same month POS $ * Index if current year POS $ is not in Snowflake yet
                 prev_pos_val = pos_val_map.get((str(prev_year), m_i))
@@ -867,37 +801,37 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                     factory_pos = f_pos_calc if f_pos_calc is not None else prev_pos_val
                 else:
                     factory_pos = 0.0
-
+ 
             bb_blocks, bb_total_k, has_bb = get_shipment_building_block_values(model_name, str(latest_year), m_nbr, bb_df=ship_bb_df)
-
+ 
             bb_total_m = (bb_total_k / 1000.0) if bb_total_k else 0.0
             factory_pos_m = (factory_pos / 1_000_000.0) if factory_pos else 0.0
             calc_grs_m = factory_pos_m + bb_total_m
             calc_grs_usd = calc_grs_m * 1_000_000.0
-
+ 
             usd_vals[m_i] = calc_grs_usd
-
+ 
             # Calculate Consumption ASP for same month & year
             p_val_m = pos_val_map.get((str(latest_year), m_i))
             p_u_m = pos_u_map.get((str(latest_year), m_i))
             asp_m = (p_val_m / p_u_m) if (p_val_m and p_u_m and p_u_m != 0) else None
-
+ 
             if asp_m is None:
                 p_val_prev = pos_val_map.get((str(prev_year), m_i))
                 p_u_prev = pos_u_map.get((str(prev_year), m_i))
                 if p_val_prev and p_u_prev and p_u_prev != 0:
                     asp_m = p_val_prev / p_u_prev
-
+ 
             # Calculate Price Factor for same month & year
             pf_m = fy_price_factor_prev
-
+ 
             # Calculate B3 = ASP / Price Factor
             b3_proj = (asp_m / pf_m) if (asp_m and pf_m and pf_m != 0) else None
-
+ 
             # Calculate GRS U = GRS $ / B3 for current month through December
             if calc_grs_usd is not None and b3_proj and b3_proj != 0:
                 qty_vals[m_i] = calc_grs_usd / b3_proj
-
+ 
             # Terminal diagnostics for current month through December
             print("\n" + "=" * 70)
             print(f"SHIPMENT BUILDING BLOCK SUMMARY | MODEL: '{model_name}' | PERIOD: {latest_year}-{m_nbr:02d} ({m_name})")
@@ -913,7 +847,7 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
             print(f"  CALCULATED B3          : ${b3_proj:>10,.2f}" if b3_proj else "  CALCULATED B3          : N/A")
             print(f"  CALCULATED GRS U       : {qty_vals[m_i]:>10,.2f}" if qty_vals[m_i] else "  CALCULATED GRS U       : N/A")
             print("=" * 70 + "\n")
-
+ 
         raw_metric_vals[latest_year] = {"GRS_USD": usd_vals, "GRS_QTY": qty_vals}
  
     b3_by_yr = {}
@@ -928,27 +862,27 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                     p_val = pos_val_map.get((str(yr), m_i))
                     p_u = pos_u_map.get((str(yr), m_i))
                     asp_m = (p_val / p_u) if (p_val is not None and p_u is not None and p_u != 0) else None
-
+ 
                     if asp_m is None:
                         p_val_p = pos_val_map.get((str(prev_year), m_i))
                         p_u_p = pos_u_map.get((str(prev_year), m_i))
                         if p_val_p and p_u_p and p_u_p != 0:
                             asp_m = p_val_p / p_u_p
-
+ 
                     pf_m = None
                     if usd_v[m_i] is not None and qty_v[m_i] is not None and qty_v[m_i] != 0:
                         b3_actual = usd_v[m_i] / qty_v[m_i]
                         if asp_m is not None and b3_actual != 0:
                             pf_m = asp_m / b3_actual
-
+ 
                     if pf_m is None or pf_m == 0:
                         pf_m = fy_price_factor_prev
-
+ 
                     if asp_m is not None and pf_m is not None and pf_m != 0:
                         b3_v[m_i] = asp_m / pf_m
                     elif usd_v[m_i] is not None and qty_v[m_i] is not None and qty_v[m_i] != 0:
                         b3_v[m_i] = usd_v[m_i] / qty_v[m_i]
-
+ 
                 b3_by_yr[yr] = b3_v
                 year_vals[yr] = b3_v
             elif col_key == "BUILD_BLEED":
@@ -970,7 +904,7 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                     pu = pos_u_map.get((str(yr), m_i))
                     if (pu is None or pu == 0) and prev_year:
                         pu = pos_u_map.get((str(prev_year), m_i))
-
+ 
                     if gu is not None and pu is not None and pu != 0:
                         ur_v[m_i] = (gu / pu) * 100.0
                 year_vals[yr] = ur_v
@@ -983,17 +917,17 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                     p_val = pos_val_map.get((str(yr), m_i))
                     p_u = pos_u_map.get((str(yr), m_i))
                     asp_m = (p_val / p_u) if (p_val is not None and p_u is not None and p_u != 0) else None
-
+ 
                     if asp_m is None:
                         p_val_p = pos_val_map.get((str(prev_year), m_i))
                         p_u_p = pos_u_map.get((str(prev_year), m_i))
                         if p_val_p and p_u_p and p_u_p != 0:
                             asp_m = p_val_p / p_u_p
-
+ 
                     b3_m = b3_list[m_i] if m_i < len(b3_list) else None
                     if b3_m is None and usd_v[m_i] is not None and qty_v[m_i] is not None and qty_v[m_i] != 0:
                         b3_m = usd_v[m_i] / qty_v[m_i]
-
+ 
                     if asp_m is not None and b3_m is not None and b3_m != 0:
                         pf_v[m_i] = asp_m / b3_m
                     else:
@@ -1249,6 +1183,7 @@ def main():
     print(f"CHECK 4 - Total GRS $                      : ${total_grs:,.2f}")
     print(f"CHECK 5 - Monthly Row Count                : {len(result_df)} (Expected 56)")
     print("\nValidation PASSED")
-
+ 
 if __name__ == "__main__":
     main()
+ 
