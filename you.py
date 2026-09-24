@@ -849,7 +849,7 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
 
                 usd_vals[m_i] = calc_grs_usd
 
-                # Calculate GRS U using FY Price Factor of previous year
+                # Calculate Consumption ASP for same month & year
                 p_val_m = pos_val_map.get((str(latest_year), m_i))
                 p_u_m = pos_u_map.get((str(latest_year), m_i))
                 asp_m = (p_val_m / p_u_m) if (p_val_m and p_u_m and p_u_m != 0) else None
@@ -860,10 +860,15 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                     if p_val_prev and p_u_prev and p_u_prev != 0:
                         asp_m = p_val_prev / p_u_prev
 
-                if asp_m and fy_price_factor_prev and fy_price_factor_prev != 0:
-                    b3_proj = asp_m / fy_price_factor_prev
-                    if b3_proj != 0:
-                        qty_vals[m_i] = calc_grs_usd / b3_proj
+                # Calculate Price Factor for same month & year
+                pf_m = fy_price_factor_prev
+
+                # Calculate B3 = ASP / Price Factor
+                b3_proj = (asp_m / pf_m) if (asp_m and pf_m and pf_m != 0) else None
+
+                # Calculate GRS U = GRS $ / B3 for current month through December
+                if calc_grs_usd is not None and b3_proj and b3_proj != 0:
+                    qty_vals[m_i] = calc_grs_usd / b3_proj
 
                 # Terminal diagnostics for current month through December
                 print("\n" + "=" * 70)
@@ -877,8 +882,8 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                 print(f"  TOTAL BUILDING BLOCKS  : ${bb_total_k:>10,.2f} K (${bb_total_m:>6,.2f} M)")
                 print(f"  FACTORY POS $          : ${factory_pos:>10,.2f} (${factory_pos_m:>6,.2f} M)")
                 print(f"  CALCULATED GRS $       : ${calc_grs_usd:>10,.2f} (${calc_grs_m:>6,.2f} M)")
+                print(f"  CALCULATED B3          : ${b3_proj:>10,.2f}" if b3_proj else "  CALCULATED B3          : N/A")
                 print(f"  CALCULATED GRS U       : {qty_vals[m_i]:>10,.2f}" if qty_vals[m_i] else "  CALCULATED GRS U       : N/A")
-                print(f"  FY PRICE FACTOR (PREV) : {fy_price_factor_prev:.2f}")
                 print("=" * 70 + "\n")
 
         raw_metric_vals[latest_year] = {"GRS_USD": usd_vals, "GRS_QTY": qty_vals}
