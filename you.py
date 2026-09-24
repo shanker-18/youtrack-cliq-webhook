@@ -533,6 +533,111 @@ def get_consumption_metrics_monthly_for_model(model_name: str) -> tuple:
 get_factory_pos_monthly_for_model = lambda model_name: get_consumption_metrics_monthly_for_model(model_name)[0]
 
 
+
+# =============================================================================
+# 5.6 FETCH SHIPMENT BUILDING BLOCKS FROM POSTGRESQL & MATCH CALENDAR
+# =============================================================================
+_cached_shipment_bb_df = None
+
+SHIPMENT_BB_QUERY = """
+SELECT
+    hm.model_name AS model,
+    DATE_TRUNC('month', pv.period_month)::date AS period_month,
+    bb.name AS building_block,
+    SUM(pv.value_in_thousands) AS value_in_thousands
+FROM public.shipment_planning_rows pr
+INNER JOIN public.shipment_building_blocks bb
+    ON pr.building_block_id = bb.block_id
+INNER JOIN public.shipment_planning_values pv
+    ON pr.row_id = pv.row_id
+INNER JOIN public.hierarchy_models hm
+    ON pr.model_id = hm.model_id
+WHERE
+    pr.is_deleted = FALSE
+    AND bb.is_active = TRUE
+    AND hm.is_active = TRUE
+GROUP BY
+    hm.model_name,
+    DATE_TRUNC('month', pv.period_month),
+    bb.name
+ORDER BY
+    hm.model_name,
+    period_month,
+    bb.name;
+"""
+
+
+def load_shipment_building_block_data(force_reload: bool = False) -> pd.DataFrame:
+    """
+    Executes PostgreSQL query to load active Shipment Building Block planning records.
+    """
+    global _cached_shipment_bb_df
+    if _cached_shipment_bb_df is not None and not force_reload:
+        return _cached_shipment_bb_df
+
+    df = pd.DataFrame(columns=['model', 'period_month', 'building_block', 'value_in_thousands'])
+    try:
+        conn = database.get_postgres_connection()
+        cur = conn.cursor()
+        cur.execute(SHIPMENT_BB_QUERY)
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        if rows:
+            df = pd.DataFrame(rows, columns=['model', 'period_month', 'building_block', 'value_in_thousands'])
+            df['value_in_thousands'] = pd.to_numeric(df['value_in_thousands'], errors='coerce').fillna(0.0)
+            df['building_block'] = df['building_block'].astype(str).str.strip()
+            df['model'] = df['model'].astype(str).str.strip()
+    except Exception as e:
+        print(f"[POSTGRES SHIPMENT BUILDING BLOCK LOAD NOTICE]: {e}")
+
+    _cached_shipment_bb_df = df
+    return df
+
+
+def get_shipment_bb_monthly_for_model(model_name: str) -> dict:
+    """
+    Fetches Shipment Building Blocks for model_name, matches with Kenvue Calendar,
+    and returns a dictionary: {(str(year), month_idx): total_bb_in_actual_dollars}
+    """
+    if not model_name:
+        return {}
+
+    bb_df = load_shipment_building_block_data()
+    if bb_df.empty:
+        return {}
+
+    norm_target_model = database.normalize_text(model_name)
+    bb_map = {}
+
+    for _, r in bb_df.iterrows():
+        row_model = str(r.get('model', '')).strip()
+        if database.normalize_text(row_model) != norm_target_model:
+            continue
+
+        val_raw = float(r.get('value_in_thousands', 0.0))
+        if pd.isna(val_raw) or val_raw == 0:
+            continue
+
+        # Convert value to actual dollars (if stored in $M or $K)
+        if abs(val_raw) <= 1000.0:
+            val_dollars = val_raw * 1_000_000.0
+        else:
+            val_dollars = val_raw * 1_000.0
+
+        p_month = r.get('period_month')
+        if pd.notnull(p_month):
+            dt = pd.to_datetime(p_month, errors='coerce')
+            if pd.notnull(dt):
+                y_str = str(dt.year)
+                m_idx = dt.month - 1
+                key = (y_str, m_idx)
+                bb_map[key] = bb_map.get(key, 0.0) + val_dollars
+
+    return bb_map
+
+
 # =============================================================================
 # 6. SPREADSHEET MATRIX TABLE RENDERING (MATCHES CONSUMPTION DESIGN)
 # =============================================================================
