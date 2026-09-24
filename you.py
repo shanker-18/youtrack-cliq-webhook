@@ -740,7 +740,50 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
             return f"${m_val:,.1f}" if m_val != 0 else "$0.0"
         else:
             return f"{m_val:,.1f}" if m_val != 0 else "0.0"
- 
+
+    def get_unit_ratio_color(v_curr, ref_4_vals):
+        """
+        Calculates Unit Ratio Baseline = (SUM of the 4 previous/reference year Unit Ratios - MIN - MAX) / 2
+        Color-coding conditions:
+          - 🔴 RED: If Current Year Unit Ratio is outside ±10% of baseline (> 10%)
+          - 🟡 YELLOW: If Current Year Unit Ratio is outside ±5% of baseline (> 5% and <= 10%)
+          - Otherwise: No color (None, None)
+        Checked RED first, then YELLOW.
+        """
+        if v_curr is None or (isinstance(v_curr, float) and math.isnan(v_curr)):
+            return None, None
+
+        valid_ref = [v for v in ref_4_vals if v is not None and not (isinstance(v, float) and math.isnan(v))]
+        if len(valid_ref) < 2:
+            return None, None
+
+        if len(valid_ref) == 4:
+            min_v = min(valid_ref)
+            max_v = max(valid_ref)
+            baseline = (sum(valid_ref) - min_v - max_v) / 2.0
+        else:
+            min_v = min(valid_ref)
+            max_v = max(valid_ref)
+            if len(valid_ref) > 2:
+                baseline = (sum(valid_ref) - min_v - max_v) / float(len(valid_ref) - 2)
+            else:
+                baseline = sum(valid_ref) / float(len(valid_ref))
+
+        if baseline is None or baseline == 0:
+            return None, None
+
+        rel_diff_pct = (abs(v_curr - baseline) / abs(baseline)) * 100.0
+
+        # Check RED first: outside ±10% of baseline
+        if rel_diff_pct > 10.0:
+            return "#f8d7da", "#721c24"
+
+        # Check YELLOW second: outside ±5% of baseline but within ±10%
+        if rel_diff_pct > 5.0:
+            return "#fff3cd", "#856404"
+
+        return None, None
+
     tbody_rows = []
  
     factory_pos_map, pos_val_map, pos_u_map = get_consumption_metrics_monthly_for_model(model_name)
