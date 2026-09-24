@@ -68,87 +68,41 @@ def normalize_text(value):
  
  
 # =============================================================================
-# 1. DYNAMIC MODEL MAPPING EXCEL LOADER (FOR ALL MODELS)
+# 1. DYNAMIC MODEL MAPPING POSTGRESQL LOADER (SAME AS CONSUMPTION)
 # =============================================================================
 def load_shipment_model_mapping(model_name=None):
     """
-    Loads Excel mapping sheet 'Model to GMC Hierarchy mapping'.
-    Handles trailing space in sheet name safely and validates required columns.
+    Loads active Model Hierarchy Mapping from PostgreSQL database (na_ibp_db)
+    using the exact same table (public.hierarchy_models and public.hierarchy_mapping)
+    and columns as the Consumption dashboard.
     If model_name is provided, filters mapping for that model dynamically.
     """
     global _cached_excel_mapping
- 
-    if _cached_excel_mapping is None:
-        candidate_paths = [
-            EXPLICIT_SHIPMENT_MAPPING_PATH,
-            os.path.join(BASE_DIR, "Model Mapping File - Shipment GTS.xlsx"),
-            os.path.join(BASE_DIR, "model_mapping.xlsx"),
-            os.path.join(BASE_DIR, "Book1.xlsx"),
-        ]
- 
-        file_path = None
-        for cand in candidate_paths:
-            if cand and os.path.exists(cand):
-                file_path = cand
-                break
- 
-        if not file_path:
-            raise FileNotFoundError(
-                f"\nShipment mapping file not found. Checked paths:\n"
-                + "\n".join(f" - {p}" for p in candidate_paths)
-            )
- 
-        excel = pd.ExcelFile(file_path)
- 
-        # Handle trailing space in sheet name safely
-        normalized_sheets = {str(sheet).strip(): sheet for sheet in excel.sheet_names}
-        required_sheet_key = "Model to GMC Hierarchy mapping"
- 
-        if required_sheet_key not in normalized_sheets:
-            raise RuntimeError(
-                f"\nRequired sheet '{required_sheet_key}' not found in Excel.\n"
-                f"Available sheets: {excel.sheet_names}"
-            )
- 
-        actual_sheet = normalized_sheets[required_sheet_key]
-        df = pd.read_excel(file_path, sheet_name=actual_sheet)
-        df.columns = [str(c).replace("\xa0", " ").strip() for c in df.columns]
- 
-        # Map column variations if needed
-        col_rename = {}
-        for c in df.columns:
-            c_upper = c.upper()
-            if c_upper in ["MODEL", "MODEL NAME"]:
-                col_rename[c] = "MODEL"
-            elif c_upper in ["C1_BUSINESS_SEGMENT", "C1", "BUSINESS_SEGMENT"]:
-                col_rename[c] = "C1_BUSINESS_SEGMENT"
-            elif c_upper in ["C3_NEED_STATE", "C3", "NEED_STATE", "SQUAD"]:
-                col_rename[c] = "C3_NEED_STATE"
-        if col_rename:
-            df.rename(columns=col_rename, inplace=True)
- 
-        # Check required columns
-        missing_cols = [c for c in MAPPING_COLUMNS if c not in df.columns]
-        if missing_cols:
-            raise RuntimeError(
-                f"\nMissing required mapping columns in sheet '{actual_sheet}':\n"
-                + "\n".join(f" - {c}" for c in missing_cols)
-            )
- 
-        # Normalize values
-        for col in df.columns:
-            df[col] = df[col].apply(normalize_text)
- 
-        _cached_excel_mapping = df
- 
-    if model_name:
-        model_norm = normalize_text(model_name)
-        model_df = _cached_excel_mapping[_cached_excel_mapping["MODEL"] == model_norm].copy()
-        return model_df
- 
-    return _cached_excel_mapping
- 
- 
+
+    if _cached_excel_mapping is None or _cached_excel_mapping.empty:
+        df = database.load_model_mapping_df()
+        if not df.empty:
+            df = df.copy()
+            df["C1_BUSINESS_SEGMENT"] = df["GLOBAL_GMC_C1_BUSINESS_SEGMENT_DESC"].apply(normalize_text)
+            df["C3_NEED_STATE"] = df["GLOBAL_GMC_C3_NEED_STATE_DESC"].apply(normalize_text)
+            df["MODEL"] = df["Model"].apply(normalize_text)
+            df["GMC_BRAND_NAME"] = df["GLOBAL_GMC_B1_BRAND_DESC"].apply(normalize_text)
+            df["GMC_SUBBRAND_NAME"] = df["GLOBAL_GMC_B2_SUB_BRAND_DESC"].apply(normalize_text)
+            df["GMC_SUBCATEGORY_NAME"] = df["GLOBAL_GMC_C5_SUB_CATEGORY_DESC"].apply(normalize_text)
+            _cached_excel_mapping = df
+        else:
+            _cached_excel_mapping = pd.DataFrame()
+
+    if _cached_excel_mapping is not None and not _cached_excel_mapping.empty:
+        if model_name:
+            model_norm = normalize_text(model_name)
+            model_df = _cached_excel_mapping[_cached_excel_mapping["MODEL"] == model_norm].copy()
+            return model_df
+        return _cached_excel_mapping
+
+    return pd.DataFrame()
+
+
 def get_shipment_filter_options(gbu=None, squad=None, model=None):
     """
     Returns dropdown filter options (GBU, Need State, Model) derived dynamically
