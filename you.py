@@ -888,6 +888,7 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
 
         raw_metric_vals[latest_year] = {"GRS_USD": usd_vals, "GRS_QTY": qty_vals}
  
+    b3_by_yr = {}
     for metric_name, col_key, unit_type, has_yoy in metrics_config:
         year_vals = {}
         for yr in years:
@@ -920,6 +921,7 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                     elif usd_v[m_i] is not None and qty_v[m_i] is not None and qty_v[m_i] != 0:
                         b3_v[m_i] = usd_v[m_i] / qty_v[m_i]
 
+                b3_by_yr[yr] = b3_v
                 year_vals[yr] = b3_v
             elif col_key == "BUILD_BLEED":
                 usd_v = raw_metric_vals[yr]["GRS_USD"]
@@ -938,20 +940,36 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                 for m_i in range(12):
                     gu = qty_v[m_i]
                     pu = pos_u_map.get((str(yr), m_i))
+                    if (pu is None or pu == 0) and prev_year:
+                        pu = pos_u_map.get((str(prev_year), m_i))
+
                     if gu is not None and pu is not None and pu != 0:
                         ur_v[m_i] = (gu / pu) * 100.0
                 year_vals[yr] = ur_v
             elif col_key == "PRICE_FACTOR":
                 usd_v = raw_metric_vals[yr]["GRS_USD"]
                 qty_v = raw_metric_vals[yr]["GRS_QTY"]
+                b3_list = b3_by_yr.get(yr, [None] * 12)
                 pf_v = [None] * 12
                 for m_i in range(12):
                     p_val = pos_val_map.get((str(yr), m_i))
                     p_u = pos_u_map.get((str(yr), m_i))
                     asp_m = (p_val / p_u) if (p_val is not None and p_u is not None and p_u != 0) else None
-                    b3_m = (usd_v[m_i] / qty_v[m_i]) if (usd_v[m_i] is not None and qty_v[m_i] is not None and qty_v[m_i] != 0) else None
+
+                    if asp_m is None:
+                        p_val_p = pos_val_map.get((str(prev_year), m_i))
+                        p_u_p = pos_u_map.get((str(prev_year), m_i))
+                        if p_val_p and p_u_p and p_u_p != 0:
+                            asp_m = p_val_p / p_u_p
+
+                    b3_m = b3_list[m_i] if m_i < len(b3_list) else None
+                    if b3_m is None and usd_v[m_i] is not None and qty_v[m_i] is not None and qty_v[m_i] != 0:
+                        b3_m = usd_v[m_i] / qty_v[m_i]
+
                     if asp_m is not None and b3_m is not None and b3_m != 0:
                         pf_v[m_i] = asp_m / b3_m
+                    else:
+                        pf_v[m_i] = fy_price_factor_prev
                 year_vals[yr] = pf_v
             else:
                 year_vals[yr] = raw_metric_vals[yr][col_key]
