@@ -839,52 +839,61 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
             m_nbr = m_i + 1
             m_name = MONTHS[m_i]
             factory_pos = factory_pos_map.get((str(latest_year), m_i))
+
+            if factory_pos is None:
+                # Fallback to previous year same month POS $ * Index if current year POS $ is not in Snowflake yet
+                prev_pos_val = pos_val_map.get((str(prev_year), m_i))
+                if prev_pos_val is not None:
+                    f_pos_calc, _ = database.get_factory_pos_val(str(latest_year), m_nbr, model_name, prev_pos_val)
+                    factory_pos = f_pos_calc if f_pos_calc is not None else prev_pos_val
+                else:
+                    factory_pos = 0.0
+
             bb_blocks, bb_total_k, has_bb = get_shipment_building_block_values(model_name, str(latest_year), m_nbr, bb_df=ship_bb_df)
 
-            if factory_pos is not None:
-                bb_total_m = (bb_total_k / 1000.0) if bb_total_k else 0.0
-                factory_pos_m = (factory_pos / 1_000_000.0)
-                calc_grs_m = factory_pos_m + bb_total_m
-                calc_grs_usd = calc_grs_m * 1_000_000.0
+            bb_total_m = (bb_total_k / 1000.0) if bb_total_k else 0.0
+            factory_pos_m = (factory_pos / 1_000_000.0) if factory_pos else 0.0
+            calc_grs_m = factory_pos_m + bb_total_m
+            calc_grs_usd = calc_grs_m * 1_000_000.0
 
-                usd_vals[m_i] = calc_grs_usd
+            usd_vals[m_i] = calc_grs_usd
 
-                # Calculate Consumption ASP for same month & year
-                p_val_m = pos_val_map.get((str(latest_year), m_i))
-                p_u_m = pos_u_map.get((str(latest_year), m_i))
-                asp_m = (p_val_m / p_u_m) if (p_val_m and p_u_m and p_u_m != 0) else None
+            # Calculate Consumption ASP for same month & year
+            p_val_m = pos_val_map.get((str(latest_year), m_i))
+            p_u_m = pos_u_map.get((str(latest_year), m_i))
+            asp_m = (p_val_m / p_u_m) if (p_val_m and p_u_m and p_u_m != 0) else None
 
-                if asp_m is None:
-                    p_val_prev = pos_val_map.get((str(prev_year), m_i))
-                    p_u_prev = pos_u_map.get((str(prev_year), m_i))
-                    if p_val_prev and p_u_prev and p_u_prev != 0:
-                        asp_m = p_val_prev / p_u_prev
+            if asp_m is None:
+                p_val_prev = pos_val_map.get((str(prev_year), m_i))
+                p_u_prev = pos_u_map.get((str(prev_year), m_i))
+                if p_val_prev and p_u_prev and p_u_prev != 0:
+                    asp_m = p_val_prev / p_u_prev
 
-                # Calculate Price Factor for same month & year
-                pf_m = fy_price_factor_prev
+            # Calculate Price Factor for same month & year
+            pf_m = fy_price_factor_prev
 
-                # Calculate B3 = ASP / Price Factor
-                b3_proj = (asp_m / pf_m) if (asp_m and pf_m and pf_m != 0) else None
+            # Calculate B3 = ASP / Price Factor
+            b3_proj = (asp_m / pf_m) if (asp_m and pf_m and pf_m != 0) else None
 
-                # Calculate GRS U = GRS $ / B3 for current month through December
-                if calc_grs_usd is not None and b3_proj and b3_proj != 0:
-                    qty_vals[m_i] = calc_grs_usd / b3_proj
+            # Calculate GRS U = GRS $ / B3 for current month through December
+            if calc_grs_usd is not None and b3_proj and b3_proj != 0:
+                qty_vals[m_i] = calc_grs_usd / b3_proj
 
-                # Terminal diagnostics for current month through December
-                print("\n" + "=" * 70)
-                print(f"SHIPMENT BUILDING BLOCK SUMMARY | MODEL: '{model_name}' | PERIOD: {latest_year}-{m_nbr:02d} ({m_name})")
-                print("=" * 70)
-                for b_name in SHIPMENT_ALLOWED_BUILDING_BLOCKS:
-                    val_k = bb_blocks.get(b_name, 0.0)
-                    val_m = val_k / 1000.0
-                    print(f"  - {b_name:<20} : ${val_k:>10,.2f} K (${val_m:>6,.2f} M)")
-                print("-" * 70)
-                print(f"  TOTAL BUILDING BLOCKS  : ${bb_total_k:>10,.2f} K (${bb_total_m:>6,.2f} M)")
-                print(f"  FACTORY POS $          : ${factory_pos:>10,.2f} (${factory_pos_m:>6,.2f} M)")
-                print(f"  CALCULATED GRS $       : ${calc_grs_usd:>10,.2f} (${calc_grs_m:>6,.2f} M)")
-                print(f"  CALCULATED B3          : ${b3_proj:>10,.2f}" if b3_proj else "  CALCULATED B3          : N/A")
-                print(f"  CALCULATED GRS U       : {qty_vals[m_i]:>10,.2f}" if qty_vals[m_i] else "  CALCULATED GRS U       : N/A")
-                print("=" * 70 + "\n")
+            # Terminal diagnostics for current month through December
+            print("\n" + "=" * 70)
+            print(f"SHIPMENT BUILDING BLOCK SUMMARY | MODEL: '{model_name}' | PERIOD: {latest_year}-{m_nbr:02d} ({m_name})")
+            print("=" * 70)
+            for b_name in SHIPMENT_ALLOWED_BUILDING_BLOCKS:
+                val_k = bb_blocks.get(b_name, 0.0)
+                val_m = val_k / 1000.0
+                print(f"  - {b_name:<20} : ${val_k:>10,.2f} K (${val_m:>6,.2f} M)")
+            print("-" * 70)
+            print(f"  TOTAL BUILDING BLOCKS  : ${bb_total_k:>10,.2f} K (${bb_total_m:>6,.2f} M)")
+            print(f"  FACTORY POS $          : ${factory_pos:>10,.2f} (${factory_pos_m:>6,.2f} M)")
+            print(f"  CALCULATED GRS $       : ${calc_grs_usd:>10,.2f} (${calc_grs_m:>6,.2f} M)")
+            print(f"  CALCULATED B3          : ${b3_proj:>10,.2f}" if b3_proj else "  CALCULATED B3          : N/A")
+            print(f"  CALCULATED GRS U       : {qty_vals[m_i]:>10,.2f}" if qty_vals[m_i] else "  CALCULATED GRS U       : N/A")
+            print("=" * 70 + "\n")
 
         raw_metric_vals[latest_year] = {"GRS_USD": usd_vals, "GRS_QTY": qty_vals}
  
@@ -1012,11 +1021,6 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                         text_color = "#D9534F"
                     elif v > 0:
                         text_color = "#28A745"
-                elif col_key == "BUILD_BLEED" and v is not None:
-                    if v < 0:
-                        text_color = "#D9534F"
-                    elif v > 0:
-                        text_color = "#28A745"
  
                 td_cells.append(html.Td(v_str, style={
                     "backgroundColor": yr_bg, "color": text_color,
@@ -1133,11 +1137,6 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                 qv_str = fmt_m_val(qv, is_pct=is_yoy, unit_type=unit_type)
                 s_color = "#000000"
                 if is_yoy and qv is not None:
-                    if qv < 0:
-                        s_color = "#D9534F"
-                    elif qv > 0:
-                        s_color = "#28A745"
-                elif col_key == "BUILD_BLEED" and qv is not None:
                     if qv < 0:
                         s_color = "#D9534F"
                     elif qv > 0:
