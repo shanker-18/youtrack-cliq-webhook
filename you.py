@@ -89,14 +89,17 @@ def load_shipment_model_mapping(model_name=None):
             df["GMC_BRAND_NAME"] = df["GLOBAL_GMC_B1_BRAND_DESC"].apply(normalize_text)
             df["GMC_SUBBRAND_NAME"] = df["GLOBAL_GMC_B2_SUB_BRAND_DESC"].apply(normalize_text)
             df["GMC_SUBCATEGORY_NAME"] = df["GLOBAL_GMC_C5_SUB_CATEGORY_DESC"].apply(normalize_text)
+            df["GMC_CATEGORY_NAME"] = df["GLOBAL_GMC_C4_CATEGORY_DESC"].apply(normalize_text)
             _cached_excel_mapping = df
         else:
             _cached_excel_mapping = pd.DataFrame()
 
     if _cached_excel_mapping is not None and not _cached_excel_mapping.empty:
         if model_name:
-            model_norm = normalize_text(model_name)
-            model_df = _cached_excel_mapping[_cached_excel_mapping["MODEL"] == model_norm].copy()
+            model_clean = re.sub(r'[^A-Z0-9]', '', normalize_text(model_name))
+            model_df = _cached_excel_mapping[
+                _cached_excel_mapping["MODEL"].apply(lambda m: re.sub(r'[^A-Z0-9]', '', normalize_text(m))) == model_clean
+            ].copy()
             return model_df
         return _cached_excel_mapping
 
