@@ -603,7 +603,7 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
         if unit_type == "b3":
             return f"${val:,.1f}" if val != 0 else "$0.0"
         if unit_type == "unit_ratio":
-            return f"{val:,.1f}%" if val != 0 else "0.0%"
+            return f"{round(val):.0f}%" if val != 0 else "0%"
         if unit_type == "ratio":
             return f"{val:,.2f}" if val != 0 else "0.00"
         if unit_type == "build_bleed":
@@ -866,7 +866,19 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
         "width": "100%", "borderCollapse": "collapse", "fontFamily": "sans-serif", "fontSize": "11px"
     })
 
-    return table
+    note_elem = html.Div(
+        "Note: GRS $ and GRS U are in millions",
+        style={
+            "marginTop": "10px",
+            "fontSize": "12px",
+            "fontStyle": "italic",
+            "color": "#495057",
+            "fontWeight": "600",
+            "textAlign": "left"
+        }
+    )
+
+    return html.Div([table, note_elem])
 
 
 # =============================================================================
