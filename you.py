@@ -240,16 +240,22 @@ def resolve_shipment_model_items(model_name: str) -> pd.DataFrame:
         b = str(row.get("GMC_BRAND_NAME", "")).strip().replace("'", "''")
         sb = str(row.get("GMC_SUBBRAND_NAME", "")).strip().replace("'", "''")
         sc = str(row.get("GMC_SUBCATEGORY_NAME", "")).strip().replace("'", "''")
- 
-        cond = f"""
-        (
-            UPPER(TRIM(COALESCE(GMC_BRAND_NAME, ''))) = '{b}'
-            AND UPPER(TRIM(COALESCE(GMC_SUBBRAND_NAME, ''))) = '{sb}'
-            AND UPPER(TRIM(COALESCE(GMC_SUBCATEGORY_NAME, ''))) = '{sc}'
-        )
-        """
-        conditions.append(cond)
- 
+
+        row_conds = []
+        if b:
+            row_conds.append(f"UPPER(TRIM(COALESCE(GMC_BRAND_NAME, ''))) = '{b}'")
+        if sb:
+            row_conds.append(f"UPPER(TRIM(COALESCE(GMC_SUBBRAND_NAME, ''))) = '{sb}'")
+        if sc:
+            row_conds.append(f"UPPER(TRIM(COALESCE(GMC_SUBCATEGORY_NAME, ''))) = '{sc}'")
+
+        if row_conds:
+            conditions.append("(\n            " + "\n            AND ".join(row_conds) + "\n        )")
+
+    if not conditions:
+        print(f"[WARNING]: Zero populated hierarchy conditions for model '{model_name}'.")
+        return pd.DataFrame()
+
     where_clause = "\nOR\n".join(conditions)
  
     query = f"""
