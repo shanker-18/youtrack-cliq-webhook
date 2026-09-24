@@ -891,8 +891,30 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                 qty_v = raw_metric_vals[yr]["GRS_QTY"]
                 b3_v = [None] * 12
                 for m_i in range(12):
+                    p_val = pos_val_map.get((str(yr), m_i))
+                    p_u = pos_u_map.get((str(yr), m_i))
+                    asp_m = (p_val / p_u) if (p_val is not None and p_u is not None and p_u != 0) else None
+
+                    if asp_m is None:
+                        p_val_p = pos_val_map.get((str(prev_year), m_i))
+                        p_u_p = pos_u_map.get((str(prev_year), m_i))
+                        if p_val_p and p_u_p and p_u_p != 0:
+                            asp_m = p_val_p / p_u_p
+
+                    pf_m = None
                     if usd_v[m_i] is not None and qty_v[m_i] is not None and qty_v[m_i] != 0:
+                        b3_actual = usd_v[m_i] / qty_v[m_i]
+                        if asp_m is not None and b3_actual != 0:
+                            pf_m = asp_m / b3_actual
+
+                    if pf_m is None or pf_m == 0:
+                        pf_m = fy_price_factor_prev
+
+                    if asp_m is not None and pf_m is not None and pf_m != 0:
+                        b3_v[m_i] = asp_m / pf_m
+                    elif usd_v[m_i] is not None and qty_v[m_i] is not None and qty_v[m_i] != 0:
                         b3_v[m_i] = usd_v[m_i] / qty_v[m_i]
+
                 year_vals[yr] = b3_v
             elif col_key == "BUILD_BLEED":
                 usd_v = raw_metric_vals[yr]["GRS_USD"]
