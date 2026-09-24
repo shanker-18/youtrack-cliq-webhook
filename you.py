@@ -81,15 +81,24 @@ def load_shipment_model_mapping(model_name=None):
 
     if _cached_excel_mapping is None or _cached_excel_mapping.empty:
         df = database.load_model_mapping_df()
+        if df.empty:
+            df = database.load_model_mapping_df(allow_fallback=True)
+
         if not df.empty:
             df = df.copy()
-            df["C1_BUSINESS_SEGMENT"] = df["GLOBAL_GMC_C1_BUSINESS_SEGMENT_DESC"].apply(normalize_text)
-            df["C3_NEED_STATE"] = df["GLOBAL_GMC_C3_NEED_STATE_DESC"].apply(normalize_text)
-            df["MODEL"] = df["Model"].apply(normalize_text)
-            df["GMC_BRAND_NAME"] = df["GLOBAL_GMC_B1_BRAND_DESC"].apply(normalize_text)
-            df["GMC_SUBBRAND_NAME"] = df["GLOBAL_GMC_B2_SUB_BRAND_DESC"].apply(normalize_text)
-            df["GMC_SUBCATEGORY_NAME"] = df["GLOBAL_GMC_C5_SUB_CATEGORY_DESC"].apply(normalize_text)
-            df["GMC_CATEGORY_NAME"] = df["GLOBAL_GMC_C4_CATEGORY_DESC"].apply(normalize_text)
+            def get_col(col_list):
+                for c in col_list:
+                    if c in df.columns:
+                        return df[c].apply(normalize_text)
+                return pd.Series([""] * len(df), index=df.index)
+
+            df["C1_BUSINESS_SEGMENT"] = get_col(["GLOBAL_GMC_C1_BUSINESS_SEGMENT_DESC", "gbu_code", "C1_BUSINESS_SEGMENT"])
+            df["C3_NEED_STATE"] = get_col(["GLOBAL_GMC_C3_NEED_STATE_DESC", "squad_name", "C3_NEED_STATE"])
+            df["MODEL"] = get_col(["Model", "model_name", "MODEL"])
+            df["GMC_BRAND_NAME"] = get_col(["GLOBAL_GMC_B1_BRAND_DESC", "brand_name", "GMC_BRAND_NAME"])
+            df["GMC_SUBBRAND_NAME"] = get_col(["GLOBAL_GMC_B2_SUB_BRAND_DESC", "sub_brand_name", "GMC_SUBBRAND_NAME"])
+            df["GMC_SUBCATEGORY_NAME"] = get_col(["GLOBAL_GMC_C5_SUB_CATEGORY_DESC", "subcategory", "GMC_SUBCATEGORY_NAME"])
+            df["GMC_CATEGORY_NAME"] = get_col(["GLOBAL_GMC_C4_CATEGORY_DESC", "category", "GMC_CATEGORY_NAME"])
             _cached_excel_mapping = df
         else:
             _cached_excel_mapping = pd.DataFrame()
@@ -100,6 +109,10 @@ def load_shipment_model_mapping(model_name=None):
             model_df = _cached_excel_mapping[
                 _cached_excel_mapping["MODEL"].apply(lambda m: re.sub(r'[^A-Z0-9]', '', normalize_text(m))) == model_clean
             ].copy()
+            if model_df.empty:
+                model_df = _cached_excel_mapping[
+                    _cached_excel_mapping["MODEL"].apply(lambda m: model_clean in re.sub(r'[^A-Z0-9]', '', normalize_text(m)) or re.sub(r'[^A-Z0-9]', '', normalize_text(m)) in model_clean)
+                ].copy()
             return model_df
         return _cached_excel_mapping
 
@@ -227,41 +240,40 @@ def load_kv_calendar():
 # =============================================================================
 def resolve_shipment_model_items(model_name: str) -> pd.DataFrame:
     """
-    Reads mapping rows for model_name dynamically from Excel, matches GMC hierarchy in Snowflake:
-      VW_DIM_GMC_PRODCUT_HIERARCHY
-    Using GMC_BRAND_NAME, GMC_SUBBRAND_NAME, GMC_SUBCATEGORY_NAME with OR logic.
+    Reads mapping rows for model_name dynamically from PostgreSQL hierarchy mapping,
+    matches GMC hierarchy in Snowflake: VW_DIM_GMC_PRODCUT_HIERARCHY.
     Returns DataFrame of matched unique KV_ITEM_NOs.
     """
     model_mapping = load_shipment_model_mapping(model_name=model_name)
- 
-    if model_mapping.empty:
-        print(f"[WARNING]: Zero mapping rows found in Excel for model '{model_name}'.")
-        return pd.DataFrame()
- 
-    conditions = []
-    for _, row in model_mapping.iterrows():
-        b = str(row.get("GMC_BRAND_NAME", "")).strip().replace("'", "''")
-        sb = str(row.get("GMC_SUBBRAND_NAME", "")).strip().replace("'", "''")
-        sc = str(row.get("GMC_SUBCATEGORY_NAME", "")).strip().replace("'", "''")
 
-        row_conds = []
-        if b:
-            row_conds.append(f"UPPER(TRIM(COALESCE(GMC_BRAND_NAME, ''))) = '{b}'")
-        if sb:
-            row_conds.append(f"UPPER(TRIM(COALESCE(GMC_SUBBRAND_NAME, ''))) = '{sb}'")
-        if sc:
-            row_conds.append(f"UPPER(TRIM(COALESCE(GMC_SUBCATEGORY_NAME, ''))) = '{sc}'")
+    rule_clauses = []
+    if not model_mapping.empty:
+        for _, row in model_mapping.iterrows():
+            b = str(row.get("GMC_BRAND_NAME", "")).strip()
+            sb = str(row.get("GMC_SUBBRAND_NAME", "")).strip()
+            sc = str(row.get("GMC_SUBCATEGORY_NAME", "")).strip()
+            cat = str(row.get("GMC_CATEGORY_NAME", "")).strip()
 
-        if row_conds:
-            conditions.append("(\n            " + "\n            AND ".join(row_conds) + "\n        )")
+            b_clean = re.sub(r'[^A-Z0-9]', '', b.upper())
+            sb_clean = re.sub(r'[^A-Z0-9]', '', sb.upper())
+            sc_clean = re.sub(r'[^A-Z0-9]', '', sc.upper())
 
-    if not conditions:
-        print(f"[WARNING]: Zero populated hierarchy conditions for model '{model_name}'.")
-        return pd.DataFrame()
+            sub_clauses = []
+            if sb_clean:
+                sub_clauses.append(f"REGEXP_REPLACE(UPPER(TRIM(COALESCE(GMC_SUBBRAND_NAME, ''))), '[^A-Z0-9]', '') = '{sb_clean}'")
+                sub_clauses.append(f"REGEXP_REPLACE(UPPER(TRIM(COALESCE(GMC_SUBBRAND_NAME, ''))), '[^A-Z0-9]', '') LIKE '%{sb_clean}%'")
+            if b_clean:
+                sub_clauses.append(f"REGEXP_REPLACE(UPPER(TRIM(COALESCE(GMC_BRAND_NAME, ''))), '[^A-Z0-9]', '') = '{b_clean}'")
+            if sc_clean:
+                sub_clauses.append(f"REGEXP_REPLACE(UPPER(TRIM(COALESCE(GMC_SUBCATEGORY_NAME, ''))), '[^A-Z0-9]', '') = '{sc_clean}'")
 
-    where_clause = "\nOR\n".join(conditions)
- 
-    query = f"""
+            if sub_clauses:
+                rule_clauses.append("(\n            " + "\n            OR ".join(sub_clauses) + "\n        )")
+
+    where_clause = "\nOR\n".join(rule_clauses) if rule_clauses else ""
+
+    if where_clause:
+        query = f"""
 SELECT DISTINCT
     KV_ITEM_NO,
     GMC_SKU_CODE,
@@ -273,21 +285,63 @@ FROM PROD_CUSTOMER360_GLOBALNA.NAUSMASTER_ACCESS.VW_DIM_GMC_PRODCUT_HIERARCHY
 WHERE
     {where_clause}
 """
-    conn = database.get_snowflake_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute(query)
-        rows = cursor.fetchall()
-        cols = [col[0] for col in cursor.description]
-    finally:
-        cursor.close()
- 
-    items_df = pd.DataFrame(rows, columns=cols)
-    if not items_df.empty:
-        items_df["KV_ITEM_NO"] = items_df["KV_ITEM_NO"].astype(str).str.strip()
-        items_df = items_df[items_df["KV_ITEM_NO"] != ""].drop_duplicates(subset=["KV_ITEM_NO"])
- 
-    return items_df
+        conn = database.get_snowflake_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(query)
+            rows = cursor.fetchall()
+            cols = [col[0] for col in cursor.description]
+        finally:
+            cursor.close()
+
+        items_df = pd.DataFrame(rows, columns=cols)
+        if not items_df.empty:
+            items_df["KV_ITEM_NO"] = items_df["KV_ITEM_NO"].astype(str).str.strip()
+            items_df = items_df[items_df["KV_ITEM_NO"] != ""].drop_duplicates(subset=["KV_ITEM_NO"])
+            return items_df
+
+    # -------------------------------------------------------------------------
+    # FALLBACK: Tokenized Model Search in Snowflake if primary rules yield 0 items
+    # -------------------------------------------------------------------------
+    if model_name:
+        words = [re.sub(r'[^A-Z0-9]', '', w.upper()) for w in normalize_text(model_name).split()]
+        words = [w for w in words if len(w) >= 2 and w not in ["SELECT", "MODEL", "ALL", "NONE", "AND", "THE", "FOR"]]
+
+        if words:
+            word_conds = [
+                f"(REGEXP_REPLACE(UPPER(TRIM(COALESCE(GMC_SUBBRAND_NAME, ''))), '[^A-Z0-9]', '') LIKE '%{w}%' OR "
+                f"REGEXP_REPLACE(UPPER(TRIM(COALESCE(GMC_BRAND_NAME, ''))), '[^A-Z0-9]', '') LIKE '%{w}%')"
+                for w in words
+            ]
+            fb_where = " AND ".join(word_conds)
+            fb_query = f"""
+SELECT DISTINCT
+    KV_ITEM_NO,
+    GMC_SKU_CODE,
+    GMC_SKU_NAME,
+    GMC_BRAND_NAME,
+    GMC_SUBBRAND_NAME,
+    GMC_SUBCATEGORY_NAME
+FROM PROD_CUSTOMER360_GLOBALNA.NAUSMASTER_ACCESS.VW_DIM_GMC_PRODCUT_HIERARCHY
+WHERE
+    {fb_where}
+"""
+            conn = database.get_snowflake_connection()
+            cursor = conn.cursor()
+            try:
+                cursor.execute(fb_query)
+                rows = cursor.fetchall()
+                cols = [col[0] for col in cursor.description]
+            finally:
+                cursor.close()
+
+            items_df = pd.DataFrame(rows, columns=cols)
+            if not items_df.empty:
+                items_df["KV_ITEM_NO"] = items_df["KV_ITEM_NO"].astype(str).str.strip()
+                items_df = items_df[items_df["KV_ITEM_NO"] != ""].drop_duplicates(subset=["KV_ITEM_NO"])
+                return items_df
+
+    return pd.DataFrame()
  
  
 # Backward-compatible alias for Children's Tylenol
