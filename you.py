@@ -595,6 +595,13 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
             return None
         return ((actual - comparison) / abs(comparison)) * 100.0
 
+    def safe_sum(arr):
+        if not arr:
+            return None
+        if any(v is None or (isinstance(v, float) and math.isnan(v)) for v in arr):
+            return None
+        return sum(arr)
+
     def fmt_m_val(val, is_pct=False, unit_type="dollar"):
         if val is None or (isinstance(val, float) and math.isnan(val)):
             return ""
@@ -753,9 +760,9 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
 
             if col_key == "B3":
                 def calc_b3_period(yr_key, slice_obj):
-                    u_sum = sum(raw_metric_vals[yr_key]["GRS_USD"][slice_obj])
-                    q_sum = sum(raw_metric_vals[yr_key]["GRS_QTY"][slice_obj])
-                    if q_sum and q_sum != 0:
+                    u_sum = safe_sum(raw_metric_vals[yr_key]["GRS_USD"][slice_obj])
+                    q_sum = safe_sum(raw_metric_vals[yr_key]["GRS_QTY"][slice_obj])
+                    if u_sum is not None and q_sum is not None and q_sum != 0:
                         return u_sum / q_sum
                     return None
 
@@ -778,9 +785,7 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                     ytg_v = calc_b3_period(yr_int, ytg_slice)
             elif col_key == "BUILD_BLEED":
                 def calc_bb_period(yr_key, slice_obj):
-                    u_sum = sum(raw_metric_vals[yr_key]["GRS_USD"][slice_obj])
-                    f_sum = sum([factory_pos_map.get((str(yr_key), i), 0.0) for i in range(12)][slice_obj])
-                    return u_sum - f_sum
+                    return safe_sum(year_vals[yr_key][slice_obj])
 
                 yr_int = int(yr_label)
                 q1_v = calc_bb_period(yr_int, slice(0, 3))
@@ -792,9 +797,9 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                 ytg_v = calc_bb_period(yr_int, ytg_slice)
             elif col_key == "UNIT_RATIO":
                 def calc_ur_period(yr_key, slice_obj):
-                    g_sum = sum(raw_metric_vals[yr_key]["GRS_QTY"][slice_obj])
-                    p_sum = sum([pos_u_map.get((str(yr_key), i), 0.0) for i in range(12)][slice_obj])
-                    if p_sum and p_sum != 0:
+                    g_sum = safe_sum(raw_metric_vals[yr_key]["GRS_QTY"][slice_obj])
+                    p_sum = safe_sum([pos_u_map.get((str(yr_key), i)) for i in range(12)][slice_obj])
+                    if g_sum is not None and p_sum is not None and p_sum != 0:
                         return (g_sum / p_sum) * 100.0
                     return None
 
@@ -808,12 +813,12 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                 ytg_v = calc_ur_period(yr_int, ytg_slice)
             elif col_key == "PRICE_FACTOR":
                 def calc_pf_period(yr_key, slice_obj):
-                    p_val_sum = sum([pos_val_map.get((str(yr_key), i), 0.0) for i in range(12)][slice_obj])
-                    p_u_sum = sum([pos_u_map.get((str(yr_key), i), 0.0) for i in range(12)][slice_obj])
-                    g_usd_sum = sum(raw_metric_vals[yr_key]["GRS_USD"][slice_obj])
-                    g_qty_sum = sum(raw_metric_vals[yr_key]["GRS_QTY"][slice_obj])
-                    asp_v = (p_val_sum / p_u_sum) if (p_val_sum and p_u_sum and p_u_sum != 0) else None
-                    b3_v = (g_usd_sum / g_qty_sum) if (g_usd_sum and g_qty_sum and g_qty_sum != 0) else None
+                    p_val_sum = safe_sum([pos_val_map.get((str(yr_key), i)) for i in range(12)][slice_obj])
+                    p_u_sum = safe_sum([pos_u_map.get((str(yr_key), i)) for i in range(12)][slice_obj])
+                    g_usd_sum = safe_sum(raw_metric_vals[yr_key]["GRS_USD"][slice_obj])
+                    g_qty_sum = safe_sum(raw_metric_vals[yr_key]["GRS_QTY"][slice_obj])
+                    asp_v = (p_val_sum / p_u_sum) if (p_val_sum is not None and p_u_sum is not None and p_u_sum != 0) else None
+                    b3_v = (g_usd_sum / g_qty_sum) if (g_usd_sum is not None and g_qty_sum is not None and g_qty_sum != 0) else None
                     if asp_v is not None and b3_v is not None and b3_v != 0:
                         return asp_v / b3_v
                     return None
@@ -837,23 +842,23 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                     ytg_v = calc_pf_period(yr_int, ytg_slice)
             else:
                 if is_yoy:
-                    l_m = year_vals.get(latest_year, [0.0]*12)
-                    p_m = year_vals.get(prev_year, [0.0]*12)
-                    q1_v = calc_pct(sum(l_m[0:3]), sum(p_m[0:3]))
-                    q2_v = calc_pct(sum(l_m[3:6]), sum(p_m[3:6]))
-                    q3_v = calc_pct(sum(l_m[6:9]), sum(p_m[6:9]))
-                    q4_v = calc_pct(sum(l_m[9:12]), sum(p_m[9:12]))
-                    fy_v = calc_pct(sum(l_m[0:12]), sum(p_m[0:12]))
-                    ytd_v = calc_pct(sum(l_m[ytd_slice]), sum(p_m[ytd_slice]))
-                    ytg_v = calc_pct(sum(l_m[ytg_slice]), sum(p_m[ytg_slice]))
+                    l_m = year_vals.get(latest_year, [None]*12)
+                    p_m = year_vals.get(prev_year, [None]*12)
+                    q1_v = calc_pct(safe_sum(l_m[0:3]), safe_sum(p_m[0:3]))
+                    q2_v = calc_pct(safe_sum(l_m[3:6]), safe_sum(p_m[3:6]))
+                    q3_v = calc_pct(safe_sum(l_m[6:9]), safe_sum(p_m[6:9]))
+                    q4_v = calc_pct(safe_sum(l_m[9:12]), safe_sum(p_m[9:12]))
+                    fy_v = calc_pct(safe_sum(l_m[0:12]), safe_sum(p_m[0:12]))
+                    ytd_v = calc_pct(safe_sum(l_m[ytd_slice]), safe_sum(p_m[ytd_slice]))
+                    ytg_v = calc_pct(safe_sum(l_m[ytg_slice]), safe_sum(p_m[ytg_slice]))
                 else:
-                    q1_v = sum(m_vals[0:3])
-                    q2_v = sum(m_vals[3:6])
-                    q3_v = sum(m_vals[6:9])
-                    q4_v = sum(m_vals[9:12])
-                    fy_v = sum(m_vals[0:12])
-                    ytd_v = sum(m_vals[ytd_slice])
-                    ytg_v = sum(m_vals[ytg_slice])
+                    q1_v = safe_sum(m_vals[0:3])
+                    q2_v = safe_sum(m_vals[3:6])
+                    q3_v = safe_sum(m_vals[6:9])
+                    q4_v = safe_sum(m_vals[9:12])
+                    fy_v = safe_sum(m_vals[0:12])
+                    ytd_v = safe_sum(m_vals[ytd_slice])
+                    ytg_v = safe_sum(m_vals[ytg_slice])
 
             summary_vals = [q1_v, q2_v, q3_v, q4_v, fy_v, ytd_v, ytg_v]
             for s_idx, qv in enumerate(summary_vals):
