@@ -33,35 +33,6 @@ def normalize_text(val) -> str:
     return re.sub(r'\s+', ' ', s)
  
  
-def load_private_key_pem(pem: str, passphrase: Optional[str] = None) -> bytes:
-    """
-    Parses a PEM private key string and converts it into DER bytes for Snowflake connector.
-    Tolerates unformatted/pasted PEM key strings by re-wrapping Base64 content cleanly.
-    """
-    if not pem or not str(pem).strip():
-        raise ValueError("Private key PEM content is empty.")
-
-    match = re.search(r"-----BEGIN PRIVATE KEY-----(.*?)-----END PRIVATE KEY-----", str(pem), re.DOTALL)
-    if match:
-        body = match.group(1)
-        b64 = "".join(body.split())
-        wrapped = "\n".join(b64[i:i + 64] for i in range(0, len(b64), 64))
-        clean_pem = f"-----BEGIN PRIVATE KEY-----\n{wrapped}\n-----END PRIVATE KEY-----\n"
-    else:
-        clean_pem = str(pem).strip()
-
-    key = serialization.load_pem_private_key(
-        clean_pem.encode('utf-8'),
-        password=passphrase.encode('utf-8') if passphrase else None,
-        backend=default_backend()
-    )
-    return key.private_bytes(
-        encoding=serialization.Encoding.DER,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption()
-    )
-
-
 def get_snowflake_config() -> dict:
     """
     Loads Snowflake configuration from environment variables (.env).
@@ -120,26 +91,42 @@ def get_snowflake_connection(**kwargs) -> snowflake.connector.SnowflakeConnectio
     private_key_pem = os.getenv("SNOWFLAKE_PRIVATE_KEY")
     private_key_path = os.getenv("SNOWFLAKE_PRIVATE_KEY_PATH")
     passphrase = os.getenv("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE")
-
-    if private_key_pem or private_key_path:
+ 
+    if (private_key_pem or private_key_path) and config.get("authenticator") != "externalbrowser":
         try:
             if private_key_path:
                 abs_path = os.path.abspath(private_key_path)
                 if not os.path.exists(abs_path):
                     base_dir = os.path.dirname(os.path.abspath(__file__))
                     abs_path = os.path.join(base_dir, private_key_path)
-                with open(abs_path, "r", encoding="utf-8") as kf:
-                    pem_content = kf.read()
+                with open(abs_path, "rb") as kf:
+                    pem_bytes = kf.read()
             else:
-                pem_content = private_key_pem
-
-            pkb = load_private_key_pem(pem_content, passphrase=passphrase)
+                pem_str = private_key_pem.replace("\\n", "\n").strip()
+                lines = [line.strip() for line in pem_str.splitlines() if line.strip()]
+                if lines[0].startswith("-----BEGIN") and lines[-1].startswith("-----END"):
+                    header, footer = lines[0], lines[-1]
+                    body = "".join(lines[1:-1]).replace(" ", "")
+                    pad_len = len(body) % 4
+                    if pad_len > 0:
+                        body += "=" * (4 - pad_len)
+                    pem_str = header + "\n" + "\n".join([body[i:i+64] for i in range(0, len(body), 64)]) + "\n" + footer
+                pem_bytes = pem_str.encode('utf-8')
+ 
+            p_key = serialization.load_pem_private_key(
+                pem_bytes,
+                password=passphrase.encode('utf-8') if passphrase else None,
+                backend=default_backend()
+            )
+            pkb = p_key.private_bytes(
+                encoding=serialization.Encoding.DER,
+                format=serialization.PrivateFormat.PKCS8,
+                encryption_algorithm=serialization.NoEncryption()
+            )
             config["private_key"] = pkb
             config.pop("password", None)
-            config.pop("authenticator", None)
-            print("[SNOWFLAKE CONNECTION]: Configured Key-Pair (PEM) authentication.")
         except Exception as e:
-            print(f"[SNOWFLAKE CONNECTION NOTICE]: Key-Pair parse error: {e}")
+            print(f"Notice parsing private key: {e}")
  
     missing = []
     if not config.get("account"):
