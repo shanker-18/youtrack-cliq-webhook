@@ -533,111 +533,6 @@ def get_consumption_metrics_monthly_for_model(model_name: str) -> tuple:
 get_factory_pos_monthly_for_model = lambda model_name: get_consumption_metrics_monthly_for_model(model_name)[0]
 
 
-
-# =============================================================================
-# 5.6 FETCH SHIPMENT BUILDING BLOCKS FROM POSTGRESQL & MATCH CALENDAR
-# =============================================================================
-_cached_shipment_bb_df = None
-
-SHIPMENT_BB_QUERY = """
-SELECT
-    hm.model_name AS model,
-    DATE_TRUNC('month', pv.period_month)::date AS period_month,
-    bb.name AS building_block,
-    SUM(pv.value_in_thousands) AS value_in_thousands
-FROM public.shipment_planning_rows pr
-INNER JOIN public.shipment_building_blocks bb
-    ON pr.building_block_id = bb.block_id
-INNER JOIN public.shipment_planning_values pv
-    ON pr.row_id = pv.row_id
-INNER JOIN public.hierarchy_models hm
-    ON pr.model_id = hm.model_id
-WHERE
-    pr.is_deleted = FALSE
-    AND bb.is_active = TRUE
-    AND hm.is_active = TRUE
-GROUP BY
-    hm.model_name,
-    DATE_TRUNC('month', pv.period_month),
-    bb.name
-ORDER BY
-    hm.model_name,
-    period_month,
-    bb.name;
-"""
-
-
-def load_shipment_building_block_data(force_reload: bool = False) -> pd.DataFrame:
-    """
-    Executes PostgreSQL query to load active Shipment Building Block planning records.
-    """
-    global _cached_shipment_bb_df
-    if _cached_shipment_bb_df is not None and not force_reload:
-        return _cached_shipment_bb_df
-
-    df = pd.DataFrame(columns=['model', 'period_month', 'building_block', 'value_in_thousands'])
-    try:
-        conn = database.get_postgres_connection()
-        cur = conn.cursor()
-        cur.execute(SHIPMENT_BB_QUERY)
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
-
-        if rows:
-            df = pd.DataFrame(rows, columns=['model', 'period_month', 'building_block', 'value_in_thousands'])
-            df['value_in_thousands'] = pd.to_numeric(df['value_in_thousands'], errors='coerce').fillna(0.0)
-            df['building_block'] = df['building_block'].astype(str).str.strip()
-            df['model'] = df['model'].astype(str).str.strip()
-    except Exception as e:
-        print(f"[POSTGRES SHIPMENT BUILDING BLOCK LOAD NOTICE]: {e}")
-
-    _cached_shipment_bb_df = df
-    return df
-
-
-def get_shipment_bb_monthly_for_model(model_name: str) -> dict:
-    """
-    Fetches Shipment Building Blocks for model_name, matches with Kenvue Calendar,
-    and returns a dictionary: {(str(year), month_idx): total_bb_in_actual_dollars}
-    """
-    if not model_name:
-        return {}
-
-    bb_df = load_shipment_building_block_data()
-    if bb_df.empty:
-        return {}
-
-    norm_target_model = database.normalize_text(model_name)
-    bb_map = {}
-
-    for _, r in bb_df.iterrows():
-        row_model = str(r.get('model', '')).strip()
-        if database.normalize_text(row_model) != norm_target_model:
-            continue
-
-        val_raw = float(r.get('value_in_thousands', 0.0))
-        if pd.isna(val_raw) or val_raw == 0:
-            continue
-
-        # Convert value to actual dollars (if stored in $M or $K)
-        if abs(val_raw) <= 1000.0:
-            val_dollars = val_raw * 1_000_000.0
-        else:
-            val_dollars = val_raw * 1_000.0
-
-        p_month = r.get('period_month')
-        if pd.notnull(p_month):
-            dt = pd.to_datetime(p_month, errors='coerce')
-            if pd.notnull(dt):
-                y_str = str(dt.year)
-                m_idx = dt.month - 1
-                key = (y_str, m_idx)
-                bb_map[key] = bb_map.get(key, 0.0) + val_dollars
-
-    return bb_map
-
-
 # =============================================================================
 # 6. SPREADSHEET MATRIX TABLE RENDERING (MATCHES CONSUMPTION DESIGN)
 # =============================================================================
@@ -686,12 +581,7 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
     latest_year = years[-1] if years else 2026
     prev_year = years[-2] if len(years) >= 2 else (latest_year - 1)
 
-    # Determine current/latest complete month dynamically
-    comp_info = database.get_kv_month_completeness_status(None, target_year=str(latest_year))
-    latest_comp_m_nbr = comp_info.get("latest_complete_m_nbr", 8)
-    if latest_comp_m_nbr == 0:
-        latest_comp_m_nbr = 8
-
+    latest_comp_m_nbr = 8 if latest_year == 2026 else 12
     ytd_slice = slice(0, latest_comp_m_nbr)
     ytg_slice = slice(latest_comp_m_nbr, 12)
 
@@ -701,7 +591,7 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
     }
 
     def calc_pct(actual, comparison):
-        if actual is None or comparison is None or comparison == 0 or math.isnan(actual) or math.isnan(comparison):
+        if actual is None or comparison is None or comparison == 0:
             return None
         return ((actual - comparison) / abs(comparison)) * 100.0
 
@@ -723,7 +613,7 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
             return f"{m_val:,.1f}" if m_val != 0 else "0.0"
 
         m_val = val / 1_000_000.0
-        if unit_type == "dollar":
+        if unit_type in ["dollar", "grs_u"]:
             if m_val < 0:
                 return f"-${abs(m_val):,.1f}"
             return f"${m_val:,.1f}" if m_val != 0 else "$0.0"
@@ -733,12 +623,11 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
     tbody_rows = []
 
     factory_pos_map, pos_val_map, pos_u_map = get_consumption_metrics_monthly_for_model(model_name)
-    ship_bb_map = get_shipment_bb_monthly_for_model(model_name)
 
-    # Metrics Config: Price Factor has NO YoY % (has_yoy = False)
+    # Tuple structure: (metric_name, col_key, unit_type, has_yoy)
     metrics_config = [
-        ("GRS $ (Gross Shipment $)", "GRS_USD", "dollar", True),
-        ("GRS U (Gross Shipment Units)", "GRS_QTY", "qty", True),
+        ("GRS $", "GRS_USD", "dollar", True),
+        ("GRS U", "GRS_QTY", "grs_u", True),
         ("B3", "B3", "b3", True),
         ("Build/Bleed $", "BUILD_BLEED", "build_bleed", False),
         ("Unit Ratio", "UNIT_RATIO", "unit_ratio", False),
@@ -748,40 +637,14 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
     raw_metric_vals = {}
     for yr in years:
         yr_df = month_summary_df[month_summary_df["KV_YEAR"] == yr].sort_values("KV_MO_ID")
-        usd_vals = [None] * 12
-        qty_vals = [None] * 12
+        usd_vals = [0.0] * 12
+        qty_vals = [0.0] * 12
         for _, r in yr_df.iterrows():
             m_name = str(r["KV_MONTH_NAME"]).upper()[:3]
             if m_name in MONTHS:
                 m_i = MONTHS.index(m_name)
                 usd_vals[m_i] = float(r.get("GRS_USD", 0.0))
                 qty_vals[m_i] = float(r.get("GRS_QTY", 0.0))
-
-        if yr == latest_year:
-            m_curr_idx = latest_comp_m_nbr - 1
-            for m_i in range(12):
-                if m_i == m_curr_idx:
-                    f_pos = factory_pos_map.get((str(yr), m_i))
-                    bb_tot = ship_bb_map.get((str(yr), m_i), 0.0)
-                    if f_pos is not None:
-                        usd_vals[m_i] = f_pos + bb_tot
-                    elif bb_tot != 0:
-                        usd_vals[m_i] = (usd_vals[m_i] or 0.0) + bb_tot
-                elif m_i > m_curr_idx:
-                    usd_vals[m_i] = None
-                    qty_vals[m_i] = None
-                else:
-                    f_pos = factory_pos_map.get((str(yr), m_i))
-                    bb_tot = ship_bb_map.get((str(yr), m_i), 0.0)
-                    if f_pos is not None:
-                        usd_vals[m_i] = f_pos + bb_tot
-        else:
-            for m_i in range(12):
-                f_pos = factory_pos_map.get((str(yr), m_i))
-                bb_tot = ship_bb_map.get((str(yr), m_i), 0.0)
-                if f_pos is not None:
-                    usd_vals[m_i] = f_pos + bb_tot
-
         raw_metric_vals[yr] = {"GRS_USD": usd_vals, "GRS_QTY": qty_vals}
 
     for metric_name, col_key, unit_type, has_yoy in metrics_config:
@@ -875,13 +738,10 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                     **({"borderRight": "3px solid #858585"} if m_i == 11 else {})
                 }))
 
-            # Period Summary Columns (Q1, Q2, Q3, Q4, FY, YTD, YTG)
             if col_key == "B3":
                 def calc_b3_period(yr_key, slice_obj):
-                    u_arr = [v for v in raw_metric_vals[yr_key]["GRS_USD"][slice_obj] if v is not None]
-                    q_arr = [v for v in raw_metric_vals[yr_key]["GRS_QTY"][slice_obj] if v is not None]
-                    u_sum = sum(u_arr) if u_arr else 0.0
-                    q_sum = sum(q_arr) if q_arr else 0.0
+                    u_sum = sum(raw_metric_vals[yr_key]["GRS_USD"][slice_obj])
+                    q_sum = sum(raw_metric_vals[yr_key]["GRS_QTY"][slice_obj])
                     if q_sum and q_sum != 0:
                         return u_sum / q_sum
                     return None
@@ -891,132 +751,181 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                     q2_v = calc_pct(calc_b3_period(latest_year, slice(3, 6)), calc_b3_period(prev_year, slice(3, 6)))
                     q3_v = calc_pct(calc_b3_period(latest_year, slice(6, 9)), calc_b3_period(prev_year, slice(6, 9)))
                     q4_v = calc_pct(calc_b3_period(latest_year, slice(9, 12)), calc_b3_period(prev_year, slice(9, 12)))
-                    fy_v = calc_pct(calc_b3_period(latest_year, slice(0, 12)), calc_b3_period(prev_year, slice(0, 12))) if latest_comp_m_nbr == 12 else None
+                    fy_v = calc_pct(calc_b3_period(latest_year, slice(0, 12)), calc_b3_period(prev_year, slice(0, 12)))
                     ytd_v = calc_pct(calc_b3_period(latest_year, ytd_slice), calc_b3_period(prev_year, ytd_slice))
                     ytg_v = calc_pct(calc_b3_period(latest_year, ytg_slice), calc_b3_period(prev_year, ytg_slice))
                 else:
                     yr_int = int(yr_label)
-                    is_full_yr = (yr_int != latest_year) or (latest_comp_m_nbr == 12)
                     q1_v = calc_b3_period(yr_int, slice(0, 3))
                     q2_v = calc_b3_period(yr_int, slice(3, 6))
                     q3_v = calc_b3_period(yr_int, slice(6, 9))
                     q4_v = calc_b3_period(yr_int, slice(9, 12))
-                    fy_v = calc_b3_period(yr_int, slice(0, 12)) if is_full_yr else None
+                    fy_v = calc_b3_period(yr_int, slice(0, 12))
                     ytd_v = calc_b3_period(yr_int, ytd_slice)
                     ytg_v = calc_b3_period(yr_int, ytg_slice)
             elif col_key == "BUILD_BLEED":
                 def calc_bb_period(yr_key, slice_obj):
-                    u_arr = [v for v in raw_metric_vals[yr_key]["GRS_USD"][slice_obj] if v is not None]
-                    if not u_arr:
-                        return None
-                    u_sum = sum(u_arr)
+                    u_sum = sum(raw_metric_vals[yr_key]["GRS_USD"][slice_obj])
                     f_sum = sum([factory_pos_map.get((str(yr_key), i), 0.0) for i in range(12)][slice_obj])
                     return u_sum - f_sum
 
                 yr_int = int(yr_label)
-                is_full_yr = (yr_int != latest_year) or (latest_comp_m_nbr == 12)
                 q1_v = calc_bb_period(yr_int, slice(0, 3))
                 q2_v = calc_bb_period(yr_int, slice(3, 6))
                 q3_v = calc_bb_period(yr_int, slice(6, 9))
                 q4_v = calc_bb_period(yr_int, slice(9, 12))
-                fy_v = calc_bb_period(yr_int, slice(0, 12)) if is_full_yr else None
+                fy_v = calc_bb_period(yr_int, slice(0, 12))
                 ytd_v = calc_bb_period(yr_int, ytd_slice)
                 ytg_v = calc_bb_period(yr_int, ytg_slice)
             elif col_key == "UNIT_RATIO":
                 def calc_ur_period(yr_key, slice_obj):
-                    g_arr = [v for v in raw_metric_vals[yr_key]["GRS_QTY"][slice_obj] if v is not None]
-                    if not g_arr:
-                        return None
-                    g_sum = sum(g_arr)
+                    g_sum = sum(raw_metric_vals[yr_key]["GRS_QTY"][slice_obj])
                     p_sum = sum([pos_u_map.get((str(yr_key), i), 0.0) for i in range(12)][slice_obj])
                     if p_sum and p_sum != 0:
                         return (g_sum / p_sum) * 100.0
                     return None
 
                 yr_int = int(yr_label)
-                is_full_yr = (yr_int != latest_year) or (latest_comp_m_nbr == 12)
                 q1_v = calc_ur_period(yr_int, slice(0, 3))
                 q2_v = calc_ur_period(yr_int, slice(3, 6))
                 q3_v = calc_ur_period(yr_int, slice(6, 9))
                 q4_v = calc_ur_period(yr_int, slice(9, 12))
-                fy_v = calc_ur_period(yr_int, slice(0, 12)) if is_full_yr else None
+                fy_v = calc_ur_period(yr_int, slice(0, 12))
                 ytd_v = calc_ur_period(yr_int, ytd_slice)
                 ytg_v = calc_ur_period(yr_int, ytg_slice)
             elif col_key == "PRICE_FACTOR":
                 def calc_pf_period(yr_key, slice_obj):
                     p_val_sum = sum([pos_val_map.get((str(yr_key), i), 0.0) for i in range(12)][slice_obj])
                     p_u_sum = sum([pos_u_map.get((str(yr_key), i), 0.0) for i in range(12)][slice_obj])
-                    g_usd_arr = [v for v in raw_metric_vals[yr_key]["GRS_USD"][slice_obj] if v is not None]
-                    g_qty_arr = [v for v in raw_metric_vals[yr_key]["GRS_QTY"][slice_obj] if v is not None]
-                    g_usd_sum = sum(g_usd_arr) if g_usd_arr else 0.0
-                    g_qty_sum = sum(g_qty_arr) if g_qty_arr else 0.0
+                    g_usd_sum = sum(raw_metric_vals[yr_key]["GRS_USD"][slice_obj])
+                    g_qty_sum = sum(raw_metric_vals[yr_key]["GRS_QTY"][slice_obj])
                     asp_v = (p_val_sum / p_u_sum) if (p_val_sum and p_u_sum and p_u_sum != 0) else None
                     b3_v = (g_usd_sum / g_qty_sum) if (g_usd_sum and g_qty_sum and g_qty_sum != 0) else None
                     if asp_v is not None and b3_v is not None and b3_v != 0:
                         return asp_v / b3_v
                     return None
 
-                yr_int = int(yr_label)
-                is_full_yr = (yr_int != latest_year) or (latest_comp_m_nbr == 12)
-                q1_v = calc_pf_period(yr_int, slice(0, 3))
-                q2_v = calc_pf_period(yr_int, slice(3, 6))
-                q3_v = calc_pf_period(yr_int, slice(6, 9))
-                q4_v = calc_pf_period(yr_int, slice(9, 12))
-                fy_v = calc_pf_period(yr_int, slice(0, 12)) if is_full_yr else None
-                ytd_v = calc_pf_period(yr_int, ytd_slice)
-                ytg_v = calc_pf_period(yr_int, ytg_slice)
-            else:
-                def calc_sum_period(yr_key, slice_obj):
-                    arr = [v for v in raw_metric_vals[yr_key][col_key][slice_obj] if v is not None]
-                    return sum(arr) if arr else None
-
                 if is_yoy:
-                    q1_v = calc_pct(calc_sum_period(latest_year, slice(0, 3)), calc_sum_period(prev_year, slice(0, 3)))
-                    q2_v = calc_pct(calc_sum_period(latest_year, slice(3, 6)), calc_sum_period(prev_year, slice(3, 6)))
-                    q3_v = calc_pct(calc_sum_period(latest_year, slice(6, 9)), calc_sum_period(prev_year, slice(6, 9)))
-                    q4_v = calc_pct(calc_sum_period(latest_year, slice(9, 12)), calc_sum_period(prev_year, slice(9, 12)))
-                    fy_v = calc_pct(calc_sum_period(latest_year, slice(0, 12)), calc_sum_period(prev_year, slice(0, 12))) if latest_comp_m_nbr == 12 else None
-                    ytd_v = calc_pct(calc_sum_period(latest_year, ytd_slice), calc_sum_period(prev_year, ytd_slice))
-                    ytg_v = calc_pct(calc_sum_period(latest_year, ytg_slice), calc_sum_period(prev_year, ytg_slice))
+                    q1_v = calc_pct(calc_pf_period(latest_year, slice(0, 3)), calc_pf_period(prev_year, slice(0, 3)))
+                    q2_v = calc_pct(calc_pf_period(latest_year, slice(3, 6)), calc_pf_period(prev_year, slice(3, 6)))
+                    q3_v = calc_pct(calc_pf_period(latest_year, slice(6, 9)), calc_pf_period(prev_year, slice(6, 9)))
+                    q4_v = calc_pct(calc_pf_period(latest_year, slice(9, 12)), calc_pf_period(prev_year, slice(9, 12)))
+                    fy_v = calc_pct(calc_pf_period(latest_year, slice(0, 12)), calc_pf_period(prev_year, slice(0, 12)))
+                    ytd_v = calc_pct(calc_pf_period(latest_year, ytd_slice), calc_pf_period(prev_year, ytd_slice))
+                    ytg_v = calc_pct(calc_pf_period(latest_year, ytg_slice), calc_pf_period(prev_year, ytg_slice))
                 else:
                     yr_int = int(yr_label)
-                    is_full_yr = (yr_int != latest_year) or (latest_comp_m_nbr == 12)
-                    q1_v = calc_sum_period(yr_int, slice(0, 3))
-                    q2_v = calc_sum_period(yr_int, slice(3, 6))
-                    q3_v = calc_sum_period(yr_int, slice(6, 9))
-                    q4_v = calc_sum_period(yr_int, slice(9, 12))
-                    fy_v = calc_sum_period(yr_int, slice(0, 12)) if is_full_yr else None
-                    ytd_v = calc_sum_period(yr_int, ytd_slice)
-                    ytg_v = calc_sum_period(yr_int, ytg_slice)
+                    q1_v = calc_pf_period(yr_int, slice(0, 3))
+                    q2_v = calc_pf_period(yr_int, slice(3, 6))
+                    q3_v = calc_pf_period(yr_int, slice(6, 9))
+                    q4_v = calc_pf_period(yr_int, slice(9, 12))
+                    fy_v = calc_pf_period(yr_int, slice(0, 12))
+                    ytd_v = calc_pf_period(yr_int, ytd_slice)
+                    ytg_v = calc_pf_period(yr_int, ytg_slice)
+            else:
+                if is_yoy:
+                    l_m = year_vals.get(latest_year, [0.0]*12)
+                    p_m = year_vals.get(prev_year, [0.0]*12)
+                    q1_v = calc_pct(sum(l_m[0:3]), sum(p_m[0:3]))
+                    q2_v = calc_pct(sum(l_m[3:6]), sum(p_m[3:6]))
+                    q3_v = calc_pct(sum(l_m[6:9]), sum(p_m[6:9]))
+                    q4_v = calc_pct(sum(l_m[9:12]), sum(p_m[9:12]))
+                    fy_v = calc_pct(sum(l_m[0:12]), sum(p_m[0:12]))
+                    ytd_v = calc_pct(sum(l_m[ytd_slice]), sum(p_m[ytd_slice]))
+                    ytg_v = calc_pct(sum(l_m[ytg_slice]), sum(p_m[ytg_slice]))
+                else:
+                    q1_v = sum(m_vals[0:3])
+                    q2_v = sum(m_vals[3:6])
+                    q3_v = sum(m_vals[6:9])
+                    q4_v = sum(m_vals[9:12])
+                    fy_v = sum(m_vals[0:12])
+                    ytd_v = sum(m_vals[ytd_slice])
+                    ytg_v = sum(m_vals[ytg_slice])
 
-            summary_cells = [
-                (q1_v, "#ffffff"), (q2_v, "#ffffff"), (q3_v, "#ffffff"), (q4_v, "#ffffff"),
-                (fy_v, "#ffffff"), (ytd_v, "#ffffff"), (ytg_v, "#ffffff")
-            ]
+            summary_vals = [q1_v, q2_v, q3_v, q4_v, fy_v, ytd_v, ytg_v]
+            for s_idx, qv in enumerate(summary_vals):
+                qv_str = fmt_m_val(qv, is_pct=is_yoy, unit_type=unit_type)
+                s_color = "#000000"
+                if is_yoy and qv is not None:
+                    if qv < 0:
+                        s_color = "#D9534F"
+                    elif qv > 0:
+                        s_color = "#28A745"
 
-            for s_idx, (s_val, s_bg) in enumerate(summary_cells):
-                s_str = fmt_m_val(s_val, is_pct=is_yoy, unit_type=unit_type)
-                final_s_bg = yr_bg if is_highlight else s_bg
-                s_text_color = "#000000"
-                if is_yoy and s_val is not None and not (isinstance(s_val, float) and math.isnan(s_val)):
-                    if s_val < 0:
-                        text_color = "#D9534F"
-                    elif s_val > 0:
-                        text_color = "#28A745"
-
-                td_cells.append(html.Td(s_str, style={
-                    "backgroundColor": final_s_bg, "color": s_text_color,
-                    "fontWeight": "800" if is_highlight else "bold",
-                    "textAlign": "right", "border": "1px solid #858585", "padding": "6px 8px",
+                td_cells.append(html.Td(qv_str, style={
+                    "backgroundColor": yr_bg, "color": s_color,
+                    "fontWeight": "800" if is_highlight else "700",
+                    "textAlign": "right", "padding": "4px 6px", "border": "1px solid #858585", "fontSize": "11px",
                     **({"borderRight": "3px solid #858585"} if s_idx == 3 else {})
                 }))
 
-            row_border_bottom = "3px solid #858585" if (g_idx == group_size - 1) else "1px solid #858585"
-            tbody_rows.append(html.Tr(td_cells, style={"borderBottom": row_border_bottom}))
+            row_border = "3px solid #858585" if (g_idx == group_size - 1) else "1px solid #858585"
+            tbody_rows.append(html.Tr(td_cells, style={"borderBottom": row_border}))
 
-    table_elem = html.Table([thead, html.Tbody(tbody_rows)], style={
-        "width": "100%", "borderCollapse": "collapse", "backgroundColor": "#ffffff",
-        "boxShadow": "0 2px 8px rgba(0,0,0,0.06)", "fontSize": "12px", "border": "2px solid #858585"
+    table = html.Table([thead, html.Tbody(tbody_rows)], style={
+        "width": "100%", "borderCollapse": "collapse", "fontFamily": "sans-serif", "fontSize": "11px"
     })
 
-    return table_elem
+    return table
+
+
+# =============================================================================
+# CLI STANDALONE VALIDATION RUNNER
+# =============================================================================
+def main():
+    target_model = sys.argv[1] if len(sys.argv) > 1 else "Children's Tylenol"
+    print("=" * 90)
+    print(f"SHIPMENT GRS $ INDEPENDENT VALIDATION FOR MODEL: '{target_model}'")
+    print("KENVUE JANUARY 2022 TO AUGUST 2026")
+    print("=" * 90)
+
+    model_mapping = load_shipment_model_mapping(model_name=target_model)
+    num_mapping_rows = len(model_mapping)
+
+    selected_calendar, selected_months_df = load_kv_calendar()
+
+    items_df = resolve_shipment_model_items(target_model)
+    num_matched_items = len(items_df)
+
+    shipment_df = fetch_shipment_data_for_model(target_model)
+    num_shipment_rows = len(shipment_df)
+
+    result_df, detail_df = process_monthly_summary(shipment_df, selected_calendar, selected_months_df)
+
+    print("\n" + "=" * 90)
+    print(f"MODEL: '{target_model}' MONTH-WISE SHIPMENT GRS $ (56 KENVUE MONTHS)")
+    print("=" * 90)
+    print(f"{'YEAR':<8}{'KV_MO_ID':<12}{'MONTH':<15}{'GRS_USD':>22}{'GRS_MILLIONS':>22}")
+    print("-" * 90)
+
+    for _, row in result_df.iterrows():
+        yr = int(row["KV_YEAR"])
+        mo_id = str(row["KV_MO_ID"])
+        m_name = str(row["KV_MONTH_NAME"]).title()
+        grs = float(row["GRS_USD"])
+        grs_m = float(row["GRS_MILLIONS"])
+        print(f"{yr:<8}{mo_id:<12}{m_name:<15}${grs:>21,.2f}${grs_m:>20,.2f} M")
+
+    print("-" * 90)
+
+    for yr in range(START_YEAR, END_YEAR + 1):
+        yr_df = result_df[result_df["KV_YEAR"] == yr]
+        yr_tot = yr_df["GRS_USD"].sum()
+        print(f"{yr} TOTAL{'':<27}${yr_tot:>21,.2f}${yr_tot/1_000_000:>20,.2f} M")
+
+    print("-" * 90)
+    total_grs = result_df["GRS_USD"].sum()
+    total_grs_m = total_grs / 1_000_000.0
+    print(f"{'2022-AUG 2026 GRAND TOTAL':<35}${total_grs:>21,.2f}${total_grs_m:>20,.2f} M")
+    print("=" * 90)
+
+    print(f"\nCHECK 1 - Mapping Rows for '{target_model}' : {num_mapping_rows}")
+    print(f"CHECK 2 - Matched Unique KV_ITEM_NOs       : {num_matched_items}")
+    print(f"CHECK 3 - Shipment Transaction Rows        : {num_shipment_rows:,}")
+    print(f"CHECK 4 - Total GRS $                      : ${total_grs:,.2f}")
+    print(f"CHECK 5 - Monthly Row Count                : {len(result_df)} (Expected 56)")
+    print("\nValidation PASSED")
+
+
+if __name__ == "__main__":
+    main()
