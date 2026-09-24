@@ -4,25 +4,25 @@ import re
 import pandas as pd
 from dash import html
 from dotenv import load_dotenv
-
+ 
 import database
-
+ 
 # =============================================================================
 # CONFIGURATION & FILE PATHS
 # =============================================================================
 load_dotenv()
-
+ 
 START_YEAR = 2022
 END_YEAR = 2026
 END_2026_MONTH = 8  # August 2026
-
+ 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
+ 
 EXPLICIT_SHIPMENT_MAPPING_PATH = r"C:\Users\maniav1\OneDrive - Kenvue Brands LLC\Desktop\Dashboard\Model Mapping File - Shipment GTS.xlsx"
 EXPLICIT_KV_CALENDAR_PATH = r"C:\Users\maniav1\OneDrive - Kenvue Brands LLC\Desktop\Dashboard\KV Calendar Data Dump.xlsx"
-
+ 
 MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
-
+ 
 MAPPING_COLUMNS = [
     "C1_BUSINESS_SEGMENT",
     "C2_BUSINESS_SUBSEGMENT",
@@ -36,7 +36,7 @@ MAPPING_COLUMNS = [
     "GMC_SUBCATEGORY_NAME",
     "MODEL",
 ]
-
+ 
 CALENDAR_COLUMNS = [
     "CAL_DATE",
     "KV_WK_ID",
@@ -44,11 +44,11 @@ CALENDAR_COLUMNS = [
     "KV_MONTH_NAME",
     "KV_YEAR",
 ]
-
+ 
 _cached_excel_mapping = None
 _cached_kv_calendar = None
-
-
+ 
+ 
 # =============================================================================
 # TEXT NORMALIZATION
 # =============================================================================
@@ -65,8 +65,8 @@ def normalize_text(value):
     if val_str in ["NAN", "NONE", "NULL", "EMPTY", "N/A", "<NA>"]:
         return ""
     return " ".join(val_str.split())
-
-
+ 
+ 
 # =============================================================================
 # 1. DYNAMIC MODEL MAPPING EXCEL LOADER (FOR ALL MODELS)
 # =============================================================================
@@ -77,7 +77,7 @@ def load_shipment_model_mapping(model_name=None):
     If model_name is provided, filters mapping for that model dynamically.
     """
     global _cached_excel_mapping
-
+ 
     if _cached_excel_mapping is None:
         candidate_paths = [
             EXPLICIT_SHIPMENT_MAPPING_PATH,
@@ -85,35 +85,35 @@ def load_shipment_model_mapping(model_name=None):
             os.path.join(BASE_DIR, "model_mapping.xlsx"),
             os.path.join(BASE_DIR, "Book1.xlsx"),
         ]
-
+ 
         file_path = None
         for cand in candidate_paths:
             if cand and os.path.exists(cand):
                 file_path = cand
                 break
-
+ 
         if not file_path:
             raise FileNotFoundError(
                 f"\nShipment mapping file not found. Checked paths:\n"
                 + "\n".join(f" - {p}" for p in candidate_paths)
             )
-
+ 
         excel = pd.ExcelFile(file_path)
-
+ 
         # Handle trailing space in sheet name safely
         normalized_sheets = {str(sheet).strip(): sheet for sheet in excel.sheet_names}
         required_sheet_key = "Model to GMC Hierarchy mapping"
-
+ 
         if required_sheet_key not in normalized_sheets:
             raise RuntimeError(
                 f"\nRequired sheet '{required_sheet_key}' not found in Excel.\n"
                 f"Available sheets: {excel.sheet_names}"
             )
-
+ 
         actual_sheet = normalized_sheets[required_sheet_key]
         df = pd.read_excel(file_path, sheet_name=actual_sheet)
         df.columns = [str(c).replace("\xa0", " ").strip() for c in df.columns]
-
+ 
         # Map column variations if needed
         col_rename = {}
         for c in df.columns:
@@ -126,7 +126,7 @@ def load_shipment_model_mapping(model_name=None):
                 col_rename[c] = "C3_NEED_STATE"
         if col_rename:
             df.rename(columns=col_rename, inplace=True)
-
+ 
         # Check required columns
         missing_cols = [c for c in MAPPING_COLUMNS if c not in df.columns]
         if missing_cols:
@@ -134,21 +134,21 @@ def load_shipment_model_mapping(model_name=None):
                 f"\nMissing required mapping columns in sheet '{actual_sheet}':\n"
                 + "\n".join(f" - {c}" for c in missing_cols)
             )
-
+ 
         # Normalize values
         for col in df.columns:
             df[col] = df[col].apply(normalize_text)
-
+ 
         _cached_excel_mapping = df
-
+ 
     if model_name:
         model_norm = normalize_text(model_name)
         model_df = _cached_excel_mapping[_cached_excel_mapping["MODEL"] == model_norm].copy()
         return model_df
-
+ 
     return _cached_excel_mapping
-
-
+ 
+ 
 def get_shipment_filter_options(gbu=None, squad=None, model=None):
     """
     Returns dropdown filter options (GBU, Need State, Model) derived dynamically
@@ -157,32 +157,32 @@ def get_shipment_filter_options(gbu=None, squad=None, model=None):
     df_map = load_shipment_model_mapping()
     if df_map.empty:
         return {"gbus": ["Select GBU"], "squads": ["Select Need State"], "models": ["Select Model"]}
-
+ 
     gbus = sorted([g for g in df_map["C1_BUSINESS_SEGMENT"].unique() if g])
     if not gbus:
         gbus = ["ESSENTIAL HEALTH", "SELF CARE", "SKIN HEALTH & BEAUTY"]
-
+ 
     gbu_norm = normalize_text(gbu)
     if gbu_norm and gbu_norm not in ["SELECT GBU", "ALL", "NONE", ""]:
         df_filtered = df_map[df_map["C1_BUSINESS_SEGMENT"] == gbu_norm]
     else:
         df_filtered = df_map
-
+ 
     squads = sorted([s for s in df_filtered["C3_NEED_STATE"].unique() if s])
-
+ 
     squad_norm = normalize_text(squad)
     if squad_norm and squad_norm not in ["SELECT NEED STATE", "ALL", "NONE", ""]:
         df_filtered = df_filtered[df_filtered["C3_NEED_STATE"] == squad_norm]
-
+ 
     models = sorted([m for m in df_filtered["MODEL"].unique() if m])
-
+ 
     return {
         "gbus": gbus if gbus else ["Select GBU"],
         "squads": squads if squads else ["Select Need State"],
         "models": models if models else ["Select Model"]
     }
-
-
+ 
+ 
 # =============================================================================
 # 2. LOAD KENVUE CALENDAR EXCEL
 # =============================================================================
@@ -190,52 +190,52 @@ def load_kv_calendar():
     global _cached_kv_calendar
     if _cached_kv_calendar is not None:
         return _cached_kv_calendar
-
+ 
     candidate_paths = [
         EXPLICIT_KV_CALENDAR_PATH,
         os.path.join(BASE_DIR, "KV Calendar Data Dump.xlsx"),
         os.path.join(BASE_DIR, "calendar.xlsx")
     ]
-
+ 
     file_path = None
     for cand in candidate_paths:
         if cand and os.path.exists(cand):
             file_path = cand
             break
-
+ 
     if not file_path:
         raise FileNotFoundError(
             f"\nKenvue Calendar file not found. Checked paths:\n"
             + "\n".join(f" - {p}" for p in candidate_paths)
         )
-
+ 
     cal_df = pd.read_excel(file_path)
     cal_df.columns = [str(c).replace("\xa0", " ").strip() for c in cal_df.columns]
-
+ 
     if "CAL_DATE" not in cal_df.columns and "DATE" in cal_df.columns:
         cal_df.rename(columns={"DATE": "CAL_DATE"}, inplace=True)
-
+ 
     if "KV_MO_ID" not in cal_df.columns and "KV_MTH_NBR" in cal_df.columns:
         cal_df["KV_MO_ID"] = cal_df["KV_YEAR"].astype(str) + cal_df["KV_MTH_NBR"].astype(str).str.zfill(2)
-
+ 
     missing_cols = [c for c in CALENDAR_COLUMNS if c not in cal_df.columns]
     if missing_cols:
         raise RuntimeError(
             f"\nMissing required calendar columns:\n" + "\n".join(f" - {c}" for c in missing_cols)
         )
-
+ 
     cal_df["CAL_DATE"] = pd.to_datetime(cal_df["CAL_DATE"], errors="coerce")
     cal_df["KV_YEAR"] = pd.to_numeric(cal_df["KV_YEAR"], errors="coerce")
     cal_df["KV_MO_ID"] = cal_df["KV_MO_ID"].astype(str).str.strip()
     cal_df["KV_MONTH_NAME"] = cal_df["KV_MONTH_NAME"].astype(str).str.strip().str.upper()
-
+ 
     cal_df = cal_df.dropna(subset=["CAL_DATE", "KV_YEAR"]).copy()
     cal_df["KV_YEAR"] = cal_df["KV_YEAR"].astype(int)
     cal_df = cal_df.sort_values("CAL_DATE")
-
+ 
     # Select 2022 to 2026
     selected_cal = cal_df[(cal_df["KV_YEAR"] >= START_YEAR) & (cal_df["KV_YEAR"] <= END_YEAR)].copy()
-
+ 
     # Get unique Kenvue months
     month_info = (
         selected_cal[["KV_YEAR", "KV_MO_ID", "KV_MONTH_NAME", "CAL_DATE"]]
@@ -243,7 +243,7 @@ def load_kv_calendar():
         .sort_values(["KV_YEAR", "CAL_DATE"])
         .reset_index(drop=True)
     )
-
+ 
     # Filter to 2022-2025 (12 months each) + 2026 (Jan-Aug 8 months) = 56 total months
     selected_months_list = []
     for yr in range(START_YEAR, END_YEAR + 1):
@@ -251,20 +251,20 @@ def load_kv_calendar():
         if yr == END_YEAR:
             yr_months = yr_months.head(END_2026_MONTH)
         selected_months_list.append(yr_months)
-
+ 
     selected_months_df = pd.concat(selected_months_list, ignore_index=True)
-
+ 
     # STRICT CALENDAR RESTRICTION: Keep only dates in selected_months_df
     selected_cal = selected_cal.merge(
         selected_months_df[["KV_YEAR", "KV_MO_ID"]],
         on=["KV_YEAR", "KV_MO_ID"],
         how="inner"
     )
-
+ 
     _cached_kv_calendar = (selected_cal, selected_months_df)
     return _cached_kv_calendar
-
-
+ 
+ 
 # =============================================================================
 # 3. DYNAMIC GMC HIERARCHY ITEM RESOLUTION (FOR ANY MODEL)
 # =============================================================================
@@ -276,17 +276,17 @@ def resolve_shipment_model_items(model_name: str) -> pd.DataFrame:
     Returns DataFrame of matched unique KV_ITEM_NOs.
     """
     model_mapping = load_shipment_model_mapping(model_name=model_name)
-
+ 
     if model_mapping.empty:
         print(f"[WARNING]: Zero mapping rows found in Excel for model '{model_name}'.")
         return pd.DataFrame()
-
+ 
     conditions = []
     for _, row in model_mapping.iterrows():
         b = str(row.get("GMC_BRAND_NAME", "")).strip().replace("'", "''")
         sb = str(row.get("GMC_SUBBRAND_NAME", "")).strip().replace("'", "''")
         sc = str(row.get("GMC_SUBCATEGORY_NAME", "")).strip().replace("'", "''")
-
+ 
         cond = f"""
         (
             UPPER(TRIM(COALESCE(GMC_BRAND_NAME, ''))) = '{b}'
@@ -295,9 +295,9 @@ def resolve_shipment_model_items(model_name: str) -> pd.DataFrame:
         )
         """
         conditions.append(cond)
-
+ 
     where_clause = "\nOR\n".join(conditions)
-
+ 
     query = f"""
 SELECT DISTINCT
     KV_ITEM_NO,
@@ -318,19 +318,19 @@ WHERE
         cols = [col[0] for col in cursor.description]
     finally:
         cursor.close()
-
+ 
     items_df = pd.DataFrame(rows, columns=cols)
     if not items_df.empty:
         items_df["KV_ITEM_NO"] = items_df["KV_ITEM_NO"].astype(str).str.strip()
         items_df = items_df[items_df["KV_ITEM_NO"] != ""].drop_duplicates(subset=["KV_ITEM_NO"])
-
+ 
     return items_df
-
-
+ 
+ 
 # Backward-compatible alias for Children's Tylenol
 get_children_tylenol_items = lambda m_map: resolve_shipment_model_items("Children's Tylenol")
-
-
+ 
+ 
 # =============================================================================
 # 4. FETCH SHIPMENT GRS $ FOR ANY SELECTED MODEL
 # =============================================================================
@@ -343,25 +343,25 @@ def fetch_shipment_data_for_model(model_name: str) -> pd.DataFrame:
     and NEVER falls back to unfiltered shipment data.
     """
     items_df = resolve_shipment_model_items(model_name)
-
+ 
     if items_df.empty:
         print(f"[CRITICAL INTEGRITY ENFORCED]: Zero items resolved for model '{model_name}'. Returning empty DataFrame.")
         return pd.DataFrame()
-
+ 
     item_numbers = items_df["KV_ITEM_NO"].dropna().astype(str).str.strip().unique().tolist()
     if not item_numbers:
         print(f"[CRITICAL INTEGRITY ENFORCED]: Empty KV_ITEM_NO list for '{model_name}'. Returning empty DataFrame.")
         return pd.DataFrame()
-
+ 
     selected_cal, _ = load_kv_calendar()
     min_date = selected_cal["CAL_DATE"].min()
     max_date = selected_cal["CAL_DATE"].max()
-
+ 
     start_id = int(min_date.strftime("%Y%m%d"))
     end_id = int(max_date.strftime("%Y%m%d"))
-
+ 
     item_sql = ", ".join(f"'{it.replace(chr(39), chr(39)+chr(39))}'" for it in item_numbers)
-
+ 
     query = f"""
 SELECT
     f.tm_per_id,
@@ -402,21 +402,21 @@ ORDER BY
         cols = [col[0] for col in cursor.description]
     finally:
         cursor.close()
-
+ 
     shipment_df = pd.DataFrame(rows, columns=cols)
     if not shipment_df.empty:
         shipment_df["TM_PER_ID"] = pd.to_numeric(shipment_df["TM_PER_ID"], errors="coerce")
         shipment_df["KV_ITEM_NO"] = shipment_df["KV_ITEM_NO"].astype(str).str.strip()
         shipment_df["GROSS_SHIP_AM"] = pd.to_numeric(shipment_df["GROSS_SHIP_AM"], errors="coerce").fillna(0.0)
         shipment_df["GROSS_SHIP_QTY"] = pd.to_numeric(shipment_df.get("GROSS_SHIP_QTY", 0.0), errors="coerce").fillna(0.0)
-
+ 
     return shipment_df
-
-
+ 
+ 
 # Backward-compatible alias
 fetch_shipments = lambda items_df, cal: fetch_shipment_data_for_model("Children's Tylenol")
-
-
+ 
+ 
 # =============================================================================
 # 5. MAP SHIPMENT DATES TO KENVUE FISCAL CALENDAR & AGGREGATE
 # =============================================================================
@@ -426,7 +426,7 @@ def aggregate_shipment_monthly(shipment_df: pd.DataFrame) -> pd.DataFrame:
     Returns month-wise GRS $ and GRS U for 2022 to 2026.
     """
     selected_cal, selected_months_df = load_kv_calendar()
-
+ 
     if shipment_df.empty:
         res = selected_months_df.copy()
         res["GRS_USD"] = 0.0
@@ -434,46 +434,46 @@ def aggregate_shipment_monthly(shipment_df: pd.DataFrame) -> pd.DataFrame:
         res["GRS_QTY"] = 0.0
         res["GRS_QTY_MILLIONS"] = 0.0
         return res
-
+ 
     df = shipment_df.copy()
     df["SHIP_DATE"] = pd.to_datetime(df["TM_PER_ID"].astype(str), format="%Y%m%d", errors="coerce")
-
+ 
     cal_lookup = selected_cal[["CAL_DATE", "KV_YEAR", "KV_MO_ID", "KV_MONTH_NAME"]].rename(
         columns={"CAL_DATE": "SHIP_DATE"}
     ).drop_duplicates("SHIP_DATE")
-
+ 
     df = df.merge(cal_lookup, on="SHIP_DATE", how="left")
-
+ 
     qty_col = "GROSS_SHIP_QTY" if "GROSS_SHIP_QTY" in df.columns else "GROSS_SHIP_AM"
     if qty_col not in df.columns:
         df["GROSS_SHIP_QTY"] = 0.0
         qty_col = "GROSS_SHIP_QTY"
-
+ 
     monthly_agg = (
         df.dropna(subset=["KV_MO_ID"])
         .groupby(["KV_YEAR", "KV_MO_ID", "KV_MONTH_NAME"], as_index=False)[["GROSS_SHIP_AM", qty_col]]
         .sum()
         .rename(columns={"GROSS_SHIP_AM": "GRS_USD", qty_col: "GRS_QTY"})
     )
-
+ 
     result = selected_months_df[["KV_YEAR", "KV_MO_ID", "KV_MONTH_NAME"]].merge(
         monthly_agg,
         on=["KV_YEAR", "KV_MO_ID", "KV_MONTH_NAME"],
         how="left"
     )
-
+ 
     result["GRS_USD"] = result["GRS_USD"].fillna(0.0)
     result["GRS_MILLIONS"] = result["GRS_USD"] / 1_000_000.0
     result["GRS_QTY"] = result["GRS_QTY"].fillna(0.0)
     result["GRS_QTY_MILLIONS"] = result["GRS_QTY"] / 1_000_000.0
     result = result.sort_values(["KV_YEAR", "KV_MO_ID"]).reset_index(drop=True)
-
+ 
     return result
-
-
+ 
+ 
 process_monthly_summary = lambda ship_df, cal, m_df: (aggregate_shipment_monthly(ship_df), ship_df)
-
-
+ 
+ 
 # =============================================================================
 # 5.5 FETCH CONSUMPTION METRICS (FACTORY POS $, POS $, & POS UNITS) FOR MODEL
 # =============================================================================
@@ -488,7 +488,7 @@ def get_consumption_metrics_monthly_for_model(model_name: str) -> tuple:
         df = database.fetch_joined_snowflake_data(model=model_name)
         if df.empty:
             return {}, {}, {}
-
+ 
         pos_val_by_yr_m = {}
         pos_u_by_yr_m = {}
         for _, r in df.iterrows():
@@ -505,10 +505,10 @@ def get_consumption_metrics_monthly_for_model(model_name: str) -> tuple:
                     continue
                 m_idx = kv_info["m_idx"]
                 y_str = kv_info["y_str"]
-
+ 
             if str(y_str).isdigit() and int(y_str) < 2022:
                 continue
-
+ 
             pv = r.get('POS_VALUE') if pd.notnull(r.get('POS_VALUE')) else r.get('POS_DOLLARS')
             pu = r.get('POS_UNITS')
             key = (str(y_str), m_idx)
@@ -516,19 +516,19 @@ def get_consumption_metrics_monthly_for_model(model_name: str) -> tuple:
                 pos_val_by_yr_m[key] = (pos_val_by_yr_m.get(key) or 0.0) + float(pv)
             if pd.notnull(pu):
                 pos_u_by_yr_m[key] = (pos_u_by_yr_m.get(key) or 0.0) + float(pu)
-
+ 
         factory_pos_map = {}
         for (y_str, m_idx), pv_val in pos_val_by_yr_m.items():
             f_pos, _ = database.get_factory_pos_val(y_str, m_idx + 1, model_name, pv_val)
             if f_pos is not None:
                 factory_pos_map[(str(y_str), m_idx)] = f_pos
-
+ 
         return factory_pos_map, pos_val_by_yr_m, pos_u_by_yr_m
     except Exception as e:
         print(f"[SHIPMENT CONSUMPTION METRICS FETCH NOTICE]: {e}")
         return {}, {}, {}
-
-
+ 
+ 
 # Backward-compatible alias
 get_factory_pos_monthly_for_model = lambda model_name: get_consumption_metrics_monthly_for_model(model_name)[0]
 
@@ -679,8 +679,8 @@ def get_shipment_building_block_values(
             found_any = True
 
     return blocks, total, found_any
-
-
+ 
+ 
 # =============================================================================
 # 6. SPREADSHEET MATRIX TABLE RENDERING (MATCHES CONSUMPTION DESIGN)
 # =============================================================================
@@ -690,10 +690,10 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
     Matches Consumption Dashboard matrix design and formula specifications exactly.
     """
     import math
-
+ 
     if month_summary_df.empty:
         return html.Div("No Shipment Data Available", style={"padding": "20px", "textAlign": "center", "color": "#721c24"})
-
+ 
     th_style = {
         "backgroundColor": "#019881", "color": "#ffffff", "fontWeight": "800", "padding": "8px 10px",
         "border": "1px solid #858585", "textAlign": "center", "whiteSpace": "nowrap",
@@ -704,13 +704,13 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
     th_q3 = html.Th("Q3", colSpan=3, style={**th_style, "backgroundColor": "#018571"})
     th_q4 = html.Th("Q4", colSpan=3, style={**th_style, "backgroundColor": "#018571", "borderRight": "3px solid #858585"})
     th_tot = html.Th("TOTALS", colSpan=7, style={**th_style, "backgroundColor": "#017362"})
-
+ 
     hdr_row1 = html.Tr([
         html.Th("SHIPMENT METRIC", style={**th_style, "backgroundColor": "#019881", "textAlign": "left"}),
         html.Th("YEAR", style={**th_style, "backgroundColor": "#019881"}),
         th_q1, th_q2, th_q3, th_q4, th_tot
     ])
-
+ 
     hdr_row2 = html.Tr([
         html.Th("Metric Description", style={**th_style, "textAlign": "left", "minWidth": "160px", "backgroundColor": "#019881"}),
         html.Th("Year", style={**th_style, "minWidth": "50px", "backgroundColor": "#019881"}),
@@ -723,35 +723,35 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
         html.Th("YTD", style={**th_style, "minWidth": "65px", "backgroundColor": "#017362"}),
         html.Th("YTG", style={**th_style, "minWidth": "65px", "backgroundColor": "#017362"})
     ])
-
+ 
     thead = html.Thead([hdr_row2])
-
+ 
     years = sorted(month_summary_df["KV_YEAR"].unique())
     latest_year = years[-1] if years else 2026
     prev_year = years[-2] if len(years) >= 2 else (latest_year - 1)
-
+ 
     latest_comp_m_nbr = 8 if latest_year == 2026 else 12
     ytd_slice = slice(0, latest_comp_m_nbr)
     ytg_slice = slice(latest_comp_m_nbr, 12)
-
+ 
     label_td_style = {
         "backgroundColor": "#DDDDDD", "color": "#000000", "fontWeight": "900", "fontSize": "14px",
         "textAlign": "center", "verticalAlign": "middle", "border": "1px solid #858585", "padding": "8px",
         "fontFamily": "'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, 'Helvetica Neue', Arial, sans-serif"
     }
-
+ 
     def calc_pct(actual, comparison):
         if actual is None or comparison is None or comparison == 0:
             return None
         return ((actual - comparison) / abs(comparison)) * 100.0
-
+ 
     def safe_sum(arr):
         if not arr:
             return None
         if any(v is None or (isinstance(v, float) and math.isnan(v)) for v in arr):
             return None
         return sum(arr)
-
+ 
     def fmt_m_val(val, is_pct=False, unit_type="dollar"):
         if val is None or (isinstance(val, float) and math.isnan(val)):
             return ""
@@ -768,7 +768,7 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
             if m_val < 0:
                 return f"-{abs(m_val):,.1f}"
             return f"{m_val:,.1f}" if m_val != 0 else "0.0"
-
+ 
         m_val = val / 1_000_000.0
         if unit_type in ["dollar", "grs_u"]:
             if m_val < 0:
@@ -776,11 +776,11 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
             return f"${m_val:,.1f}" if m_val != 0 else "$0.0"
         else:
             return f"{m_val:,.1f}" if m_val != 0 else "0.0"
-
+ 
     tbody_rows = []
-
+ 
     factory_pos_map, pos_val_map, pos_u_map = get_consumption_metrics_monthly_for_model(model_name)
-
+ 
     # Tuple structure: (metric_name, col_key, unit_type, has_yoy)
     metrics_config = [
         ("GRS $", "GRS_USD", "dollar", True),
@@ -790,9 +790,7 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
         ("Unit Ratio", "UNIT_RATIO", "unit_ratio", False),
         ("Price Factor", "PRICE_FACTOR", "ratio", False),
     ]
-
-    ship_bb_df = load_shipment_building_block_data()
-
+ 
     raw_metric_vals = {}
     for yr in years:
         yr_df = month_summary_df[month_summary_df["KV_YEAR"] == yr].sort_values("KV_MO_ID")
@@ -808,30 +806,17 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                     usd_vals[m_i] = float(u_val)
                 if pd.notnull(q_val):
                     qty_vals[m_i] = float(q_val)
-
-        # Apply Shipment Building Block Formula to GRS $:
-        # Shipment GRS $ = Factory POS $ (same Kenvue fiscal month & year) + Innovation + Trade + Club + Retailer Inventory
-        for m_i in range(12):
-            m_nbr = m_i + 1
-            factory_pos = factory_pos_map.get((str(yr), m_i))
-            bb_blocks, bb_total_k, has_bb = get_shipment_building_block_values(model_name, str(yr), m_nbr, bb_df=ship_bb_df)
-
-            if factory_pos is not None:
-                calc_grs = factory_pos + (bb_total_k * 1000.0)
-                if str(yr) == str(latest_year) and m_i >= latest_comp_m_nbr:
-                    usd_vals[m_i] = calc_grs
-                elif has_bb or usd_vals[m_i] is None:
-                    usd_vals[m_i] = calc_grs
-
-        # From current month (incomplete month) to end of year, qty_vals remains None (BLANK for GRS U if incomplete)
+ 
+        # From current month (incomplete month) to end of year, do NOT display values (set to BLANK)
         if str(yr) == str(latest_year):
             m_cutoff_idx = latest_comp_m_nbr
             for m_i in range(12):
                 if m_i >= m_cutoff_idx:
+                    usd_vals[m_i] = None
                     qty_vals[m_i] = None
-
+ 
         raw_metric_vals[yr] = {"GRS_USD": usd_vals, "GRS_QTY": qty_vals}
-
+ 
     for metric_name, col_key, unit_type, has_yoy in metrics_config:
         year_vals = {}
         for yr in years:
@@ -877,9 +862,9 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                 year_vals[yr] = pf_v
             else:
                 year_vals[yr] = raw_metric_vals[yr][col_key]
-
+ 
         yr_rows_tuples = [(str(yr), year_vals[yr], False) for yr in years]
-
+ 
         if has_yoy:
             yoy_m_vals = [None] * 12
             if latest_year in year_vals and prev_year in year_vals:
@@ -888,35 +873,35 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                     p_v = year_vals[prev_year][m_i]
                     yoy_m_vals[m_i] = calc_pct(l_v, p_v)
             yr_rows_tuples.append(("YoY %", yoy_m_vals, True))
-
+ 
         group_size = len(yr_rows_tuples)
-
+ 
         for g_idx, (yr_label, m_vals, is_yoy) in enumerate(yr_rows_tuples):
             td_cells = []
             if g_idx == 0:
                 td_cells.append(html.Td(metric_name, rowSpan=group_size, style=label_td_style))
-
+ 
             is_highlight = (yr_label in [str(latest_year), "YoY %"])
             yr_bg = "#DDDDDD" if is_highlight else "#ffffff"
-
+ 
             td_cells.append(html.Td(yr_label, style={
                 "backgroundColor": yr_bg, "color": "#000000",
                 "fontWeight": "800" if is_highlight else "bold",
                 "textAlign": "center", "border": "1px solid #858585",
                 "fontFamily": "'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, 'Helvetica Neue', Arial, sans-serif"
             }))
-
+ 
             for m_i in range(12):
                 v = m_vals[m_i]
                 v_str = fmt_m_val(v, is_pct=is_yoy, unit_type=unit_type)
-
+ 
                 text_color = "#000000"
                 if is_yoy and v is not None:
                     if v < 0:
                         text_color = "#D9534F"
                     elif v > 0:
                         text_color = "#28A745"
-
+ 
                 td_cells.append(html.Td(v_str, style={
                     "backgroundColor": yr_bg, "color": text_color,
                     "fontWeight": "800" if is_highlight else "500",
@@ -924,7 +909,7 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                     "fontFamily": "'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, 'Helvetica Neue', Arial, sans-serif",
                     **({"borderRight": "3px solid #858585"} if m_i == 11 else {})
                 }))
-
+ 
             if col_key == "B3":
                 def calc_b3_period(yr_key, slice_obj):
                     u_sum = safe_sum(raw_metric_vals[yr_key]["GRS_USD"][slice_obj])
@@ -932,7 +917,7 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                     if u_sum is not None and q_sum is not None and q_sum != 0:
                         return u_sum / q_sum
                     return None
-
+ 
                 if is_yoy:
                     q1_v = calc_pct(calc_b3_period(latest_year, slice(0, 3)), calc_b3_period(prev_year, slice(0, 3)))
                     q2_v = calc_pct(calc_b3_period(latest_year, slice(3, 6)), calc_b3_period(prev_year, slice(3, 6)))
@@ -953,7 +938,7 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
             elif col_key == "BUILD_BLEED":
                 def calc_bb_period(yr_key, slice_obj):
                     return safe_sum(year_vals[yr_key][slice_obj])
-
+ 
                 yr_int = int(yr_label)
                 q1_v = calc_bb_period(yr_int, slice(0, 3))
                 q2_v = calc_bb_period(yr_int, slice(3, 6))
@@ -969,7 +954,7 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                     if g_sum is not None and p_sum is not None and p_sum != 0:
                         return (g_sum / p_sum) * 100.0
                     return None
-
+ 
                 yr_int = int(yr_label)
                 q1_v = calc_ur_period(yr_int, slice(0, 3))
                 q2_v = calc_ur_period(yr_int, slice(3, 6))
@@ -989,7 +974,7 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                     if asp_v is not None and b3_v is not None and b3_v != 0:
                         return asp_v / b3_v
                     return None
-
+ 
                 if is_yoy:
                     q1_v = calc_pct(calc_pf_period(latest_year, slice(0, 3)), calc_pf_period(prev_year, slice(0, 3)))
                     q2_v = calc_pct(calc_pf_period(latest_year, slice(3, 6)), calc_pf_period(prev_year, slice(3, 6)))
@@ -1026,7 +1011,7 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                     fy_v = safe_sum(m_vals[0:12])
                     ytd_v = safe_sum(m_vals[ytd_slice])
                     ytg_v = safe_sum(m_vals[ytg_slice])
-
+ 
             summary_vals = [q1_v, q2_v, q3_v, q4_v, fy_v, ytd_v, ytg_v]
             for s_idx, qv in enumerate(summary_vals):
                 qv_str = fmt_m_val(qv, is_pct=is_yoy, unit_type=unit_type)
@@ -1036,7 +1021,7 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                         s_color = "#D9534F"
                     elif qv > 0:
                         s_color = "#28A745"
-
+ 
                 td_cells.append(html.Td(qv_str, style={
                     "backgroundColor": yr_bg, "color": s_color,
                     "fontWeight": "800" if is_highlight else "700",
@@ -1044,16 +1029,16 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                     "fontFamily": "'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, 'Helvetica Neue', Arial, sans-serif",
                     **({"borderRight": "3px solid #858585"} if s_idx == 3 else {})
                 }))
-
+ 
             row_border = "3px solid #858585" if (g_idx == group_size - 1) else "1px solid #858585"
             tbody_rows.append(html.Tr(td_cells, style={"borderBottom": row_border}))
-
+ 
     table = html.Table([thead, html.Tbody(tbody_rows)], style={
         "width": "100%", "borderCollapse": "collapse",
         "fontFamily": "'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, 'Helvetica Neue', Arial, sans-serif",
         "fontSize": "11px"
     })
-
+ 
     note_elem = html.Div(
         "Note: GRS $ and GRS U are in millions",
         style={
@@ -1065,10 +1050,10 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
             "textAlign": "left"
         }
     )
-
+ 
     return html.Div([table, note_elem])
-
-
+ 
+ 
 # =============================================================================
 # CLI STANDALONE VALIDATION RUNNER
 # =============================================================================
@@ -1078,26 +1063,26 @@ def main():
     print(f"SHIPMENT GRS $ INDEPENDENT VALIDATION FOR MODEL: '{target_model}'")
     print("KENVUE JANUARY 2022 TO AUGUST 2026")
     print("=" * 90)
-
+ 
     model_mapping = load_shipment_model_mapping(model_name=target_model)
     num_mapping_rows = len(model_mapping)
-
+ 
     selected_calendar, selected_months_df = load_kv_calendar()
-
+ 
     items_df = resolve_shipment_model_items(target_model)
     num_matched_items = len(items_df)
-
+ 
     shipment_df = fetch_shipment_data_for_model(target_model)
     num_shipment_rows = len(shipment_df)
-
+ 
     result_df, detail_df = process_monthly_summary(shipment_df, selected_calendar, selected_months_df)
-
+ 
     print("\n" + "=" * 90)
     print(f"MODEL: '{target_model}' MONTH-WISE SHIPMENT GRS $ (56 KENVUE MONTHS)")
     print("=" * 90)
     print(f"{'YEAR':<8}{'KV_MO_ID':<12}{'MONTH':<15}{'GRS_USD':>22}{'GRS_MILLIONS':>22}")
     print("-" * 90)
-
+ 
     for _, row in result_df.iterrows():
         yr = int(row["KV_YEAR"])
         mo_id = str(row["KV_MO_ID"])
@@ -1105,27 +1090,26 @@ def main():
         grs = float(row["GRS_USD"])
         grs_m = float(row["GRS_MILLIONS"])
         print(f"{yr:<8}{mo_id:<12}{m_name:<15}${grs:>21,.2f}${grs_m:>20,.2f} M")
-
+ 
     print("-" * 90)
-
+ 
     for yr in range(START_YEAR, END_YEAR + 1):
         yr_df = result_df[result_df["KV_YEAR"] == yr]
         yr_tot = yr_df["GRS_USD"].sum()
         print(f"{yr} TOTAL{'':<27}${yr_tot:>21,.2f}${yr_tot/1_000_000:>20,.2f} M")
-
+ 
     print("-" * 90)
     total_grs = result_df["GRS_USD"].sum()
     total_grs_m = total_grs / 1_000_000.0
     print(f"{'2022-AUG 2026 GRAND TOTAL':<35}${total_grs:>21,.2f}${total_grs_m:>20,.2f} M")
     print("=" * 90)
-
+ 
     print(f"\nCHECK 1 - Mapping Rows for '{target_model}' : {num_mapping_rows}")
     print(f"CHECK 2 - Matched Unique KV_ITEM_NOs       : {num_matched_items}")
     print(f"CHECK 3 - Shipment Transaction Rows        : {num_shipment_rows:,}")
     print(f"CHECK 4 - Total GRS $                      : ${total_grs:,.2f}")
     print(f"CHECK 5 - Monthly Row Count                : {len(result_df)} (Expected 56)")
     print("\nValidation PASSED")
-
 
 if __name__ == "__main__":
     main()
