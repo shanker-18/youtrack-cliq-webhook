@@ -249,26 +249,28 @@ def resolve_shipment_model_items(model_name: str) -> pd.DataFrame:
     rule_clauses = []
     if not model_mapping.empty:
         for _, row in model_mapping.iterrows():
-            b = str(row.get("GMC_BRAND_NAME", "")).strip()
-            sb = str(row.get("GMC_SUBBRAND_NAME", "")).strip()
-            sc = str(row.get("GMC_SUBCATEGORY_NAME", "")).strip()
-            cat = str(row.get("GMC_CATEGORY_NAME", "")).strip()
+            b = str(row.get("GMC_BRAND_NAME", "")).strip().replace("'", "''")
+            sb = str(row.get("GMC_SUBBRAND_NAME", "")).strip().replace("'", "''")
+            sc = str(row.get("GMC_SUBCATEGORY_NAME", "")).strip().replace("'", "''")
 
-            b_clean = re.sub(r'[^A-Z0-9]', '', b.upper())
-            sb_clean = re.sub(r'[^A-Z0-9]', '', sb.upper())
-            sc_clean = re.sub(r'[^A-Z0-9]', '', sc.upper())
+            conds = []
+            if b:
+                conds.append(f"UPPER(TRIM(COALESCE(GMC_BRAND_NAME, ''))) = '{b}'")
+            if sb:
+                # Extract primary subbrand keyword (e.g. CHILDREN from CHILDREN'S TYLENOL)
+                kw = re.sub(r'[^A-Z0-9]', '', sb.upper()).replace("TYLENOL", "").replace("MOTRIN", "").replace("ZYRTEC", "").replace("BENADRYL", "")
+                if not kw or len(kw) < 3:
+                    kw = re.sub(r'[^A-Z0-9]', '', sb.upper())
 
-            sub_clauses = []
-            if sb_clean:
-                sub_clauses.append(f"REGEXP_REPLACE(UPPER(TRIM(COALESCE(GMC_SUBBRAND_NAME, ''))), '[^A-Z0-9]', '') = '{sb_clean}'")
-                sub_clauses.append(f"REGEXP_REPLACE(UPPER(TRIM(COALESCE(GMC_SUBBRAND_NAME, ''))), '[^A-Z0-9]', '') LIKE '%{sb_clean}%'")
-            if b_clean:
-                sub_clauses.append(f"REGEXP_REPLACE(UPPER(TRIM(COALESCE(GMC_BRAND_NAME, ''))), '[^A-Z0-9]', '') = '{b_clean}'")
-            if sc_clean:
-                sub_clauses.append(f"REGEXP_REPLACE(UPPER(TRIM(COALESCE(GMC_SUBCATEGORY_NAME, ''))), '[^A-Z0-9]', '') = '{sc_clean}'")
+                conds.append(
+                    f"(UPPER(TRIM(COALESCE(GMC_SUBBRAND_NAME, ''))) = '{sb}' "
+                    f"OR REGEXP_REPLACE(UPPER(TRIM(COALESCE(GMC_SUBBRAND_NAME, ''))), '[^A-Z0-9]', '') LIKE '%{kw}%')"
+                )
+            elif sc:
+                conds.append(f"UPPER(TRIM(COALESCE(GMC_SUBCATEGORY_NAME, ''))) = '{sc}'")
 
-            if sub_clauses:
-                rule_clauses.append("(\n            " + "\n            OR ".join(sub_clauses) + "\n        )")
+            if conds:
+                rule_clauses.append("(\n            " + "\n            AND ".join(conds) + "\n        )")
 
     where_clause = "\nOR\n".join(rule_clauses) if rule_clauses else ""
 
