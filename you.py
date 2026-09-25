@@ -827,74 +827,86 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
             m_nbr = m_i + 1
             m_name = MONTHS[m_i]
             factory_pos = factory_pos_map.get((str(latest_year), m_i))
- 
+            pos_src = "Snowflake (Current Year)"
+            prev_pos_val = pos_val_map.get((str(prev_year), m_i))
+            curr_pos_val = pos_val_map.get((str(latest_year), m_i))
+            idx_used = 1.0
+
             if factory_pos is None:
-                # Fallback to previous year same month POS $ * Index if current year POS $ is not in Snowflake yet
-                prev_pos_val = pos_val_map.get((str(prev_year), m_i))
+                pos_src = f"Previous Year ({prev_year}) POS $ * Index"
                 if prev_pos_val is not None:
-                    f_pos_calc, _ = database.get_factory_pos_val(str(latest_year), m_nbr, model_name, prev_pos_val)
+                    f_pos_calc, idx = database.get_factory_pos_val(str(latest_year), m_nbr, model_name, prev_pos_val)
                     factory_pos = f_pos_calc if f_pos_calc is not None else prev_pos_val
+                    if idx is not None:
+                        idx_used = idx
                 else:
                     factory_pos = 0.0
- 
+
             bb_blocks, bb_total_k, has_bb = get_shipment_building_block_values(model_name, str(latest_year), m_nbr, bb_df=ship_bb_df)
- 
+
             bb_total_m = (bb_total_k / 1000.0) if bb_total_k else 0.0
             factory_pos_m = (factory_pos / 1_000_000.0) if factory_pos else 0.0
             calc_grs_m = factory_pos_m + bb_total_m
             calc_grs_usd = calc_grs_m * 1_000_000.0
- 
+
             usd_vals[m_i] = calc_grs_usd
- 
+
             # Calculate Consumption ASP for same month & year
             p_val_m = pos_val_map.get((str(latest_year), m_i))
             p_u_m = pos_u_map.get((str(latest_year), m_i))
             asp_m = (p_val_m / p_u_m) if (p_val_m and p_u_m and p_u_m != 0) else None
- 
+
             if asp_m is None:
                 p_val_prev = pos_val_map.get((str(prev_year), m_i))
                 p_u_prev = pos_u_map.get((str(prev_year), m_i))
                 if p_val_prev and p_u_prev and p_u_prev != 0:
                     asp_m = p_val_prev / p_u_prev
- 
+
             # Calculate Price Factor for same month & year
             pf_m = fy_price_factor_prev
- 
+
             # Calculate B3 = ASP / Price Factor
             b3_proj = (asp_m / pf_m) if (asp_m and pf_m and pf_m != 0) else None
- 
+
             # Calculate GRS U = GRS $ / B3 for current month through December
             if calc_grs_usd is not None and b3_proj and b3_proj != 0:
                 qty_vals[m_i] = calc_grs_usd / b3_proj
- 
+
             # Terminal diagnostics & calculation breakdown for current month through December
             inno_k = bb_blocks.get("Innovation", 0.0)
             trade_k = bb_blocks.get("Trade", 0.0)
             club_k = bb_blocks.get("Club", 0.0)
             inv_k = bb_blocks.get("Retailer Inventory", 0.0)
 
-            print("\n" + "=" * 80)
+            print("\n" + "=" * 85)
             print(f"SHIPMENT BUILDING BLOCK CALCULATION & SUMMARY | MODEL: '{model_name}' | PERIOD: {latest_year}-{m_nbr:02d} ({m_name})")
-            print("=" * 80)
-            print("PostgreSQL Source Tables: public.shipment_planning_rows / shipment_building_blocks / shipment_planning_values")
-            print("Individual Building Block Values (PostgreSQL Query):")
-            print(f"  For Innovation          = SUM(spv.value_in_thousands WHERE sbb.name ILIKE '%INNOVATION%') = ${inno_k:>10,.2f} K (${inno_k/1000.0:>6,.2f} M)")
-            print(f"  For Trade               = SUM(spv.value_in_thousands WHERE sbb.name ILIKE '%TRADE%')      = ${trade_k:>10,.2f} K (${trade_k/1000.0:>6,.2f} M)")
-            print(f"  For Club                = SUM(spv.value_in_thousands WHERE sbb.name ILIKE '%CLUB%')       = ${club_k:>10,.2f} K (${club_k/1000.0:>6,.2f} M)")
-            print(f"  For Retailer Inventory  = SUM(spv.value_in_thousands WHERE sbb.name ILIKE '%INVENTORY%')   = ${inv_k:>10,.2f} K (${inv_k/1000.0:>6,.2f} M)")
-            print("-" * 80)
-            print("Total Building Blocks Calculation:")
-            print(f"  Total Building Blocks = Innovation + Trade + Club + Retailer Inventory")
-            print(f"                        = ${inno_k:,.2f} K + ${trade_k:,.2f} K + ${club_k:,.2f} K + ${inv_k:,.2f} K")
-            print(f"                        = ${bb_total_k:>10,.2f} K (${bb_total_m:>6,.2f} M)")
-            print("-" * 80)
-            print("Shipment GTS $ Calculation:")
-            print(f"  Shipment GTS $        = Factory POS $ + Total Building Blocks")
-            print(f"                        = ${factory_pos_m:>6,.2f} M + ${bb_total_m:>6,.2f} M")
-            print(f"                        = ${calc_grs_m:>6,.2f} M (${calc_grs_usd:>12,.2f} USD)")
-            print(f"  Calculated B3         : ${b3_proj:>10,.2f}" if b3_proj else "  Calculated B3         : N/A")
-            print(f"  Calculated GTS U      : {qty_vals[m_i]:>10,.2f} U" if qty_vals[m_i] else "  Calculated GTS U      : N/A")
-            print("=" * 80 + "\n")
+            print("=" * 85)
+            print("1. Baseline Factory POS $ Calculation:")
+            if curr_pos_val is not None:
+                print(f"   - Current Year ({latest_year}) POS $    : ${curr_pos_val:>12,.2f} (${curr_pos_val/1_000_000.0:.2f} M)")
+            if prev_pos_val is not None:
+                print(f"   - Previous Year ({prev_year}) POS $   : ${prev_pos_val:>12,.2f} (${prev_pos_val/1_000_000.0:.2f} M)")
+            print(f"   - Index Applied                    : {idx_used:.4f}")
+            print(f"   - Calculated Factory POS $         : ${factory_pos:>12,.2f} (${factory_pos_m:.2f} M) [Source: {pos_src}]")
+            print("-" * 85)
+            print("2. Individual Building Block Values (PostgreSQL Data Source):")
+            print(f"   - Innovation                       : ${inno_k:>10,.2f} K (${inno_k/1000.0:.2f} M)")
+            print(f"   - Trade                            : ${trade_k:>10,.2f} K (${trade_k/1000.0:.2f} M)")
+            print(f"   - Club                             : ${club_k:>10,.2f} K (${club_k/1000.0:.2f} M)")
+            print(f"   - Retailer Inventory               : ${inv_k:>10,.2f} K (${inv_k/1000.0:.2f} M)")
+            print("-" * 85)
+            print("3. Addition of Building Blocks (Total Building Blocks):")
+            print(f"   - Formula: Innovation + Trade + Club + Retailer Inventory")
+            print(f"   - Addition: ${inno_k:,.2f} K + ${trade_k:,.2f} K + ${club_k:,.2f} K + ${inv_k:,.2f} K")
+            print(f"   - Total Building Blocks            : ${bb_total_k:>10,.2f} K (${bb_total_m:.2f} M)")
+            print("-" * 85)
+            print("4. Addition of Building Blocks with Factory POS $ (Final Shipment GTS $):")
+            print(f"   - Formula: Factory POS $ + Total Building Blocks")
+            print(f"   - Addition: ${factory_pos_m:.2f} M + ${bb_total_m:.2f} M")
+            print(f"   - Calculated Shipment GTS $         : ${calc_grs_m:.2f} M (${calc_grs_usd:>14,.2f} USD)")
+            print(f"   - Derived B3                       : ${b3_proj:>10,.2f}" if b3_proj else "   - Derived B3                       : N/A")
+            print(f"   - Derived GTS Units                : {qty_vals[m_i]:>12,.2f} U" if qty_vals[m_i] else "   - Derived GTS Units                : N/A")
+            print("=" * 85 + "\n")
  
         raw_metric_vals[latest_year] = {"GRS_USD": usd_vals, "GRS_QTY": qty_vals}
  
