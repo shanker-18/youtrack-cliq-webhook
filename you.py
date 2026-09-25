@@ -867,21 +867,34 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
             if calc_grs_usd is not None and b3_proj and b3_proj != 0:
                 qty_vals[m_i] = calc_grs_usd / b3_proj
  
-            # Terminal diagnostics for current month through December
-            print("\n" + "=" * 70)
-            print(f"SHIPMENT BUILDING BLOCK SUMMARY | MODEL: '{model_name}' | PERIOD: {latest_year}-{m_nbr:02d} ({m_name})")
-            print("=" * 70)
-            for b_name in SHIPMENT_ALLOWED_BUILDING_BLOCKS:
-                val_k = bb_blocks.get(b_name, 0.0)
-                val_m = val_k / 1000.0
-                print(f"  - {b_name:<20} : ${val_k:>10,.2f} K (${val_m:>6,.2f} M)")
-            print("-" * 70)
-            print(f"  TOTAL BUILDING BLOCKS  : ${bb_total_k:>10,.2f} K (${bb_total_m:>6,.2f} M)")
-            print(f"  FACTORY POS $          : ${factory_pos:>10,.2f} (${factory_pos_m:>6,.2f} M)")
-            print(f"  CALCULATED GRS $       : ${calc_grs_usd:>10,.2f} (${calc_grs_m:>6,.2f} M)")
-            print(f"  CALCULATED B3          : ${b3_proj:>10,.2f}" if b3_proj else "  CALCULATED B3          : N/A")
-            print(f"  CALCULATED GRS U       : {qty_vals[m_i]:>10,.2f}" if qty_vals[m_i] else "  CALCULATED GRS U       : N/A")
-            print("=" * 70 + "\n")
+            # Terminal diagnostics & calculation breakdown for current month through December
+            inno_k = bb_blocks.get("Innovation", 0.0)
+            trade_k = bb_blocks.get("Trade", 0.0)
+            club_k = bb_blocks.get("Club", 0.0)
+            inv_k = bb_blocks.get("Retailer Inventory", 0.0)
+
+            print("\n" + "=" * 80)
+            print(f"SHIPMENT BUILDING BLOCK CALCULATION & SUMMARY | MODEL: '{model_name}' | PERIOD: {latest_year}-{m_nbr:02d} ({m_name})")
+            print("=" * 80)
+            print("PostgreSQL Source Tables: public.shipment_planning_rows / shipment_building_blocks / shipment_planning_values")
+            print("Individual Building Block Values (PostgreSQL Query):")
+            print(f"  For Innovation          = SUM(spv.value_in_thousands WHERE sbb.name ILIKE '%INNOVATION%') = ${inno_k:>10,.2f} K (${inno_k/1000.0:>6,.2f} M)")
+            print(f"  For Trade               = SUM(spv.value_in_thousands WHERE sbb.name ILIKE '%TRADE%')      = ${trade_k:>10,.2f} K (${trade_k/1000.0:>6,.2f} M)")
+            print(f"  For Club                = SUM(spv.value_in_thousands WHERE sbb.name ILIKE '%CLUB%')       = ${club_k:>10,.2f} K (${club_k/1000.0:>6,.2f} M)")
+            print(f"  For Retailer Inventory  = SUM(spv.value_in_thousands WHERE sbb.name ILIKE '%INVENTORY%')   = ${inv_k:>10,.2f} K (${inv_k/1000.0:>6,.2f} M)")
+            print("-" * 80)
+            print("Total Building Blocks Calculation:")
+            print(f"  Total Building Blocks = Innovation + Trade + Club + Retailer Inventory")
+            print(f"                        = ${inno_k:,.2f} K + ${trade_k:,.2f} K + ${club_k:,.2f} K + ${inv_k:,.2f} K")
+            print(f"                        = ${bb_total_k:>10,.2f} K (${bb_total_m:>6,.2f} M)")
+            print("-" * 80)
+            print("Shipment GTS $ Calculation:")
+            print(f"  Shipment GTS $        = Factory POS $ + Total Building Blocks")
+            print(f"                        = ${factory_pos_m:>6,.2f} M + ${bb_total_m:>6,.2f} M")
+            print(f"                        = ${calc_grs_m:>6,.2f} M (${calc_grs_usd:>12,.2f} USD)")
+            print(f"  Calculated B3         : ${b3_proj:>10,.2f}" if b3_proj else "  Calculated B3         : N/A")
+            print(f"  Calculated GTS U      : {qty_vals[m_i]:>10,.2f} U" if qty_vals[m_i] else "  Calculated GTS U      : N/A")
+            print("=" * 80 + "\n")
  
         raw_metric_vals[latest_year] = {"GRS_USD": usd_vals, "GRS_QTY": qty_vals}
  
