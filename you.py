@@ -728,38 +728,42 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
         elif rel_diff_pct > 5.0:
             return "#F0AD4E", "#000000"
         return None, "#000000"
- 
     def safe_sum(arr):
         if not arr:
             return None
-        if any(v is None or (isinstance(v, float) and math.isnan(v)) for v in arr):
+        valid_vals = [v for v in arr if v is not None and not (isinstance(v, float) and math.isnan(v))]
+        if not valid_vals:
             return None
-        return sum(arr)
+        return sum(valid_vals)
  
     def fmt_m_val(val, is_pct=False, unit_type="dollar"):
         if val is None or (isinstance(val, float) and math.isnan(val)):
             return ""
+        if val == 0:
+            if is_pct:
+                return "0.0%"
+            return ""
         if is_pct:
-            return f"{val:+.1f}%" if val != 0 else "0.0%"
+            return f"{val:+.1f}%"
         if unit_type == "b3":
-            return f"${val:,.1f}" if val != 0 else "$0.0"
+            return f"${val:,.1f}"
         if unit_type == "unit_ratio":
-            return f"{round(val):.0f}%" if val != 0 else "0%"
+            return f"{round(val):.0f}%"
         if unit_type == "ratio":
-            return f"{val:,.2f}" if val != 0 else "0.00"
+            return f"{val:,.2f}"
         if unit_type == "build_bleed":
             m_val = val / 1_000_000.0
             if m_val < 0:
                 return f"-{abs(m_val):,.1f}"
-            return f"{m_val:,.1f}" if m_val != 0 else "0.0"
- 
+            return f"{m_val:,.1f}"
+
         m_val = val / 1_000_000.0
         if unit_type in ["dollar", "grs_u"]:
             if m_val < 0:
                 return f"-${abs(m_val):,.1f}"
-            return f"${m_val:,.1f}" if m_val != 0 else "$0.0"
+            return f"${m_val:,.1f}"
         else:
-            return f"{m_val:,.1f}" if m_val != 0 else "0.0"
+            return f"{m_val:,.1f}"
  
     tbody_rows = []
  
@@ -885,84 +889,96 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
     for metric_name, col_key, unit_type, has_yoy in metrics_config:
         year_vals = {}
         for yr in years:
+            usd_v = raw_metric_vals[yr]["GRS_USD"]
+            qty_v = raw_metric_vals[yr]["GRS_QTY"]
+
             if col_key == "B3":
-                usd_v = raw_metric_vals[yr]["GRS_USD"]
-                qty_v = raw_metric_vals[yr]["GRS_QTY"]
                 b3_v = [None] * 12
                 for m_i in range(12):
-                    p_val = pos_val_map.get((str(yr), m_i))
-                    p_u = pos_u_map.get((str(yr), m_i))
-                    asp_m = (p_val / p_u) if (p_val is not None and p_u is not None and p_u != 0) else None
- 
-                    if asp_m is None:
-                        p_val_p = pos_val_map.get((str(prev_year), m_i))
-                        p_u_p = pos_u_map.get((str(prev_year), m_i))
-                        if p_val_p and p_u_p and p_u_p != 0:
-                            asp_m = p_val_p / p_u_p
- 
-                    pf_m = None
-                    if usd_v[m_i] is not None and qty_v[m_i] is not None and qty_v[m_i] != 0:
-                        b3_actual = usd_v[m_i] / qty_v[m_i]
-                        if asp_m is not None and b3_actual != 0:
-                            pf_m = asp_m / b3_actual
- 
-                    if pf_m is None or pf_m == 0:
-                        pf_m = fy_price_factor_prev
- 
-                    if asp_m is not None and pf_m is not None and pf_m != 0:
-                        b3_v[m_i] = asp_m / pf_m
-                    elif usd_v[m_i] is not None and qty_v[m_i] is not None and qty_v[m_i] != 0:
-                        b3_v[m_i] = usd_v[m_i] / qty_v[m_i]
- 
+                    gs = usd_v[m_i]
+                    if gs is None or gs == 0 or (isinstance(gs, float) and math.isnan(gs)):
+                        b3_v[m_i] = None
+                    else:
+                        p_val = pos_val_map.get((str(yr), m_i))
+                        p_u = pos_u_map.get((str(yr), m_i))
+                        asp_m = (p_val / p_u) if (p_val is not None and p_u is not None and p_u != 0) else None
+
+                        if asp_m is None:
+                            p_val_p = pos_val_map.get((str(prev_year), m_i))
+                            p_u_p = pos_u_map.get((str(prev_year), m_i))
+                            if p_val_p and p_u_p and p_u_p != 0:
+                                asp_m = p_val_p / p_u_p
+
+                        pf_m = None
+                        if qty_v[m_i] is not None and qty_v[m_i] != 0:
+                            b3_actual = gs / qty_v[m_i]
+                            if asp_m is not None and b3_actual != 0:
+                                pf_m = asp_m / b3_actual
+
+                        if pf_m is None or pf_m == 0:
+                            pf_m = fy_price_factor_prev
+
+                        if asp_m is not None and pf_m is not None and pf_m != 0:
+                            b3_v[m_i] = asp_m / pf_m
+                        elif qty_v[m_i] is not None and qty_v[m_i] != 0:
+                            b3_v[m_i] = gs / qty_v[m_i]
+
                 b3_by_yr[yr] = b3_v
                 year_vals[yr] = b3_v
             elif col_key == "BUILD_BLEED":
-                usd_v = raw_metric_vals[yr]["GRS_USD"]
                 bb_v = [None] * 12
                 for m_i in range(12):
                     gs = usd_v[m_i]
-                    fp = factory_pos_map.get((str(yr), m_i))
-                    if gs is not None and fp is not None:
-                        bb_v[m_i] = gs - fp
-                    elif gs is not None:
-                        bb_v[m_i] = gs
+                    if gs is None or gs == 0 or (isinstance(gs, float) and math.isnan(gs)):
+                        bb_v[m_i] = None
+                    else:
+                        fp = factory_pos_map.get((str(yr), m_i))
+                        if fp is not None:
+                            bb_v[m_i] = gs - fp
+                        else:
+                            bb_v[m_i] = gs
                 year_vals[yr] = bb_v
             elif col_key == "UNIT_RATIO":
-                qty_v = raw_metric_vals[yr]["GRS_QTY"]
                 ur_v = [None] * 12
                 for m_i in range(12):
-                    gu = qty_v[m_i]
-                    pu = pos_u_map.get((str(yr), m_i))
-                    if (pu is None or pu == 0) and prev_year:
-                        pu = pos_u_map.get((str(prev_year), m_i))
- 
-                    if gu is not None and pu is not None and pu != 0:
-                        ur_v[m_i] = (gu / pu) * 100.0
+                    gs = usd_v[m_i]
+                    if gs is None or gs == 0 or (isinstance(gs, float) and math.isnan(gs)):
+                        ur_v[m_i] = None
+                    else:
+                        gu = qty_v[m_i]
+                        pu = pos_u_map.get((str(yr), m_i))
+                        if (pu is None or pu == 0) and prev_year:
+                            pu = pos_u_map.get((str(prev_year), m_i))
+
+                        if gu is not None and pu is not None and pu != 0:
+                            ur_v[m_i] = (gu / pu) * 100.0
                 year_vals[yr] = ur_v
             elif col_key == "PRICE_FACTOR":
-                usd_v = raw_metric_vals[yr]["GRS_USD"]
-                qty_v = raw_metric_vals[yr]["GRS_QTY"]
                 b3_list = b3_by_yr.get(yr, [None] * 12)
                 pf_v = [None] * 12
                 for m_i in range(12):
-                    p_val = pos_val_map.get((str(yr), m_i))
-                    p_u = pos_u_map.get((str(yr), m_i))
-                    asp_m = (p_val / p_u) if (p_val is not None and p_u is not None and p_u != 0) else None
- 
-                    if asp_m is None:
-                        p_val_p = pos_val_map.get((str(prev_year), m_i))
-                        p_u_p = pos_u_map.get((str(prev_year), m_i))
-                        if p_val_p and p_u_p and p_u_p != 0:
-                            asp_m = p_val_p / p_u_p
- 
-                    b3_m = b3_list[m_i] if m_i < len(b3_list) else None
-                    if b3_m is None and usd_v[m_i] is not None and qty_v[m_i] is not None and qty_v[m_i] != 0:
-                        b3_m = usd_v[m_i] / qty_v[m_i]
- 
-                    if asp_m is not None and b3_m is not None and b3_m != 0:
-                        pf_v[m_i] = asp_m / b3_m
+                    gs = usd_v[m_i]
+                    if gs is None or gs == 0 or (isinstance(gs, float) and math.isnan(gs)):
+                        pf_v[m_i] = None
                     else:
-                        pf_v[m_i] = fy_price_factor_prev
+                        p_val = pos_val_map.get((str(yr), m_i))
+                        p_u = pos_u_map.get((str(yr), m_i))
+                        asp_m = (p_val / p_u) if (p_val is not None and p_u is not None and p_u != 0) else None
+
+                        if asp_m is None:
+                            p_val_p = pos_val_map.get((str(prev_year), m_i))
+                            p_u_p = pos_u_map.get((str(prev_year), m_i))
+                            if p_val_p and p_u_p and p_u_p != 0:
+                                asp_m = p_val_p / p_u_p
+
+                        b3_m = b3_list[m_i] if m_i < len(b3_list) else None
+                        if b3_m is None and qty_v[m_i] is not None and qty_v[m_i] != 0:
+                            b3_m = gs / qty_v[m_i]
+
+                        if asp_m is not None and b3_m is not None and b3_m != 0:
+                            pf_v[m_i] = asp_m / b3_m
+                        else:
+                            pf_v[m_i] = fy_price_factor_prev
                 year_vals[yr] = pf_v
             else:
                 year_vals[yr] = raw_metric_vals[yr][col_key]
@@ -1023,12 +1039,15 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
  
             if col_key == "B3":
                 def calc_b3_period(yr_key, slice_obj):
-                    u_sum = safe_sum(raw_metric_vals[yr_key]["GRS_USD"][slice_obj])
+                    g_usd_list = raw_metric_vals.get(yr_key, {}).get("GRS_USD", [None]*12)[slice_obj]
+                    if not any(v for v in g_usd_list if v is not None and not (isinstance(v, float) and math.isnan(v)) and v != 0):
+                        return None
+                    u_sum = safe_sum(g_usd_list)
                     q_sum = safe_sum(raw_metric_vals[yr_key]["GRS_QTY"][slice_obj])
                     if u_sum is not None and q_sum is not None and q_sum != 0:
                         return u_sum / q_sum
                     return None
- 
+
                 if is_yoy:
                     q1_v = calc_pct(calc_b3_period(latest_year, slice(0, 3)), calc_b3_period(prev_year, slice(0, 3)))
                     q2_v = calc_pct(calc_b3_period(latest_year, slice(3, 6)), calc_b3_period(prev_year, slice(3, 6)))
@@ -1048,8 +1067,11 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                     ytg_v = calc_b3_period(yr_int, ytg_slice)
             elif col_key == "BUILD_BLEED":
                 def calc_bb_period(yr_key, slice_obj):
+                    g_usd_list = raw_metric_vals.get(yr_key, {}).get("GRS_USD", [None]*12)[slice_obj]
+                    if not any(v for v in g_usd_list if v is not None and not (isinstance(v, float) and math.isnan(v)) and v != 0):
+                        return None
                     return safe_sum(year_vals[yr_key][slice_obj])
- 
+
                 yr_int = int(yr_label)
                 q1_v = calc_bb_period(yr_int, slice(0, 3))
                 q2_v = calc_bb_period(yr_int, slice(3, 6))
@@ -1060,12 +1082,15 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                 ytg_v = calc_bb_period(yr_int, ytg_slice)
             elif col_key == "UNIT_RATIO":
                 def calc_ur_period(yr_key, slice_obj):
+                    g_usd_list = raw_metric_vals.get(yr_key, {}).get("GRS_USD", [None]*12)[slice_obj]
+                    if not any(v for v in g_usd_list if v is not None and not (isinstance(v, float) and math.isnan(v)) and v != 0):
+                        return None
                     g_sum = safe_sum(raw_metric_vals[yr_key]["GRS_QTY"][slice_obj])
                     p_sum = safe_sum([pos_u_map.get((str(yr_key), i)) for i in range(12)][slice_obj])
                     if g_sum is not None and p_sum is not None and p_sum != 0:
                         return (g_sum / p_sum) * 100.0
                     return None
- 
+
                 yr_int = int(yr_label)
                 q1_v = calc_ur_period(yr_int, slice(0, 3))
                 q2_v = calc_ur_period(yr_int, slice(3, 6))
@@ -1076,16 +1101,19 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                 ytg_v = calc_ur_period(yr_int, ytg_slice)
             elif col_key == "PRICE_FACTOR":
                 def calc_pf_period(yr_key, slice_obj):
+                    g_usd_list = raw_metric_vals.get(yr_key, {}).get("GRS_USD", [None]*12)[slice_obj]
+                    if not any(v for v in g_usd_list if v is not None and not (isinstance(v, float) and math.isnan(v)) and v != 0):
+                        return None
                     p_val_sum = safe_sum([pos_val_map.get((str(yr_key), i)) for i in range(12)][slice_obj])
                     p_u_sum = safe_sum([pos_u_map.get((str(yr_key), i)) for i in range(12)][slice_obj])
-                    g_usd_sum = safe_sum(raw_metric_vals[yr_key]["GRS_USD"][slice_obj])
+                    g_usd_sum = safe_sum(g_usd_list)
                     g_qty_sum = safe_sum(raw_metric_vals[yr_key]["GRS_QTY"][slice_obj])
                     asp_v = (p_val_sum / p_u_sum) if (p_val_sum is not None and p_u_sum is not None and p_u_sum != 0) else None
                     b3_v = (g_usd_sum / g_qty_sum) if (g_usd_sum is not None and g_qty_sum is not None and g_qty_sum != 0) else None
                     if asp_v is not None and b3_v is not None and b3_v != 0:
                         return asp_v / b3_v
                     return None
- 
+
                 if is_yoy:
                     q1_v = calc_pct(calc_pf_period(latest_year, slice(0, 3)), calc_pf_period(prev_year, slice(0, 3)))
                     q2_v = calc_pct(calc_pf_period(latest_year, slice(3, 6)), calc_pf_period(prev_year, slice(3, 6)))
@@ -1115,13 +1143,20 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                     ytd_v = calc_pct(safe_sum(l_m[ytd_slice]), safe_sum(p_m[ytd_slice]))
                     ytg_v = calc_pct(safe_sum(l_m[ytg_slice]), safe_sum(p_m[ytg_slice]))
                 else:
-                    q1_v = safe_sum(m_vals[0:3])
-                    q2_v = safe_sum(m_vals[3:6])
-                    q3_v = safe_sum(m_vals[6:9])
-                    q4_v = safe_sum(m_vals[9:12])
-                    fy_v = safe_sum(m_vals[0:12])
-                    ytd_v = safe_sum(m_vals[ytd_slice])
-                    ytg_v = safe_sum(m_vals[ytg_slice])
+                    def calc_raw_period(slice_obj):
+                        g_usd_list = raw_metric_vals.get(yr_int, {}).get("GRS_USD", [None]*12)[slice_obj]
+                        if not any(v for v in g_usd_list if v is not None and not (isinstance(v, float) and math.isnan(v)) and v != 0):
+                            return None
+                        return safe_sum(m_vals[slice_obj])
+
+                    yr_int = int(yr_label)
+                    q1_v = calc_raw_period(slice(0, 3))
+                    q2_v = calc_raw_period(slice(3, 6))
+                    q3_v = calc_raw_period(slice(6, 9))
+                    q4_v = calc_raw_period(slice(9, 12))
+                    fy_v = calc_raw_period(slice(0, 12))
+                    ytd_v = calc_raw_period(ytd_slice)
+                    ytg_v = calc_raw_period(ytg_slice)
  
             summary_vals = [q1_v, q2_v, q3_v, q4_v, fy_v, ytd_v, ytg_v]
             for s_idx, qv in enumerate(summary_vals):
