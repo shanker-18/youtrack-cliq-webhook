@@ -375,45 +375,29 @@ def fetch_shipment_data_for_model(model_name: str) -> pd.DataFrame:
     where_clause = "\nOR\n".join(row_conditions)
  
 
-    min_date = selected_cal["CAL_DATE"].min()
-    max_date = selected_cal["CAL_DATE"].max()
+
+
  
-    start_id = int(min_date.strftime("%Y%m%d"))
-    end_id = int(max_date.strftime("%Y%m%d"))
+
+
  
-    item_sql = ", ".join(f"'{it.replace(chr(39), chr(39)+chr(39))}'" for it in item_numbers)
+
  
     query = f"""
 SELECT
-    f.tm_per_id,
-    i.itm_no AS kv_item_no,
-    SUM(
-        CASE
-            WHEN f.trns_rec_cd = '2'
-            THEN f.trns_grs_am
-            ELSE 0
-        END
-    ) AS gross_ship_am,
-    SUM(
-        CASE
-            WHEN f.trns_rec_cd = '2'
-            THEN f.trns_qt_cu
-            ELSE 0
-        END
-    ) AS gross_ship_qty
-FROM PROD_CUSTOMER360_GLOBALNA.NAUSINTERNAL_ACCESS.TF_TRNS_INV_DLY_TERR_EXPL f
-INNER JOIN PROD_CUSTOMER360_GLOBALNA.NAUSMASTER_ACCESS.TD_ITM_DIV i
-    ON f.cpnt_itm_id = i.itm_id
+    YEAR,
+    MONTHNUMBER,
+    SUM(GTS_AMT) AS GTS_AMT,
+    SUM(GTS_QTY) AS GTS_QTY
+FROM PROD_CVD_DISC.NAIBP_ACCESS.VW_FACT_F360_SHIPMENTS
 WHERE
-    f.tm_per_id >= {start_id}
-    AND f.tm_per_id <= {end_id}
-    AND f.trns_rec_cd = '2'
-    AND i.itm_no IN ({item_sql})
+    {where_clause}
 GROUP BY
-    f.tm_per_id,
-    i.itm_no
+    YEAR,
+    MONTHNUMBER
 ORDER BY
-    f.tm_per_id
+    YEAR,
+    MONTHNUMBER
 """
     conn = database.get_snowflake_connection()
     cursor = conn.cursor()
@@ -426,10 +410,11 @@ ORDER BY
  
     shipment_df = pd.DataFrame(rows, columns=cols)
     if not shipment_df.empty:
-        shipment_df["TM_PER_ID"] = pd.to_numeric(shipment_df["TM_PER_ID"], errors="coerce")
-        shipment_df["KV_ITEM_NO"] = shipment_df["KV_ITEM_NO"].astype(str).str.strip()
-        shipment_df["GROSS_SHIP_AM"] = pd.to_numeric(shipment_df["GROSS_SHIP_AM"], errors="coerce").fillna(0.0)
-        shipment_df["GROSS_SHIP_QTY"] = pd.to_numeric(shipment_df.get("GROSS_SHIP_QTY", 0.0), errors="coerce").fillna(0.0)
+        shipment_df["YEAR"] = pd.to_numeric(shipment_df.get("YEAR"), errors="coerce").fillna(0).astype(int)
+        shipment_df["MONTHNUMBER"] = pd.to_numeric(shipment_df.get("MONTHNUMBER"), errors="coerce").fillna(0).astype(int)
+        shipment_df["GTS_AMT"] = pd.to_numeric(shipment_df.get("GTS_AMT"), errors="coerce").fillna(0.0)
+        shipment_df["GTS_QTY"] = pd.to_numeric(shipment_df.get("GTS_QTY"), errors="coerce").fillna(0.0)
+        shipment_df["KV_MO_ID"] = shipment_df["YEAR"].astype(str) + shipment_df["MONTHNUMBER"].astype(str).str.zfill(2)
  
     return shipment_df
  
@@ -450,6 +435,10 @@ def aggregate_shipment_monthly(shipment_df: pd.DataFrame) -> pd.DataFrame:
  
     if shipment_df.empty:
         res = selected_months_df.copy()
+        res["GTS_USD"] = 0.0
+        res["GTS_MILLIONS"] = 0.0
+        res["GTS_QTY"] = 0.0
+        res["GTS_QTY_MILLIONS"] = 0.0
         res["GRS_USD"] = 0.0
         res["GRS_MILLIONS"] = 0.0
         res["GRS_QTY"] = 0.0
@@ -457,11 +446,13 @@ def aggregate_shipment_monthly(shipment_df: pd.DataFrame) -> pd.DataFrame:
         return res
  
     df = shipment_df.copy()
-    df["SHIP_DATE"] = pd.to_datetime(df["TM_PER_ID"].astype(str), format="%Y%m%d", errors="coerce")
+    if "KV_MO_ID" not in df.columns:
+        yr_val = pd.to_numeric(df.get("YEAR"), errors="coerce").fillna(0).astype(int)
+        mo_val = pd.to_numeric(df.get("MONTHNUMBER"), errors="coerce").fillna(0).astype(int)
+        df["KV_MO_ID"] = yr_val.astype(str) + mo_val.astype(str).str.zfill(2)
  
-    cal_lookup = selected_cal[["CAL_DATE", "KV_YEAR", "KV_MO_ID", "KV_MONTH_NAME"]].rename(
-        columns={"CAL_DATE": "SHIP_DATE"}
-    ).drop_duplicates("SHIP_DATE")
+    df["GTS_AMT"] = pd.to_numeric(df.get("GTS_AMT", 0.0), errors="coerce").fillna(0.0)
+    df["GTS_QTY"] = pd.to_numeric(df.get("GTS_QTY", 0.0), errors="coerce").fillna(0.0)
  
     df = df.merge(cal_lookup, on="SHIP_DATE", how="left")
  
