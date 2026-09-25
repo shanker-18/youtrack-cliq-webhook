@@ -285,57 +285,7 @@ def resolve_shipment_model_items(model_name: str) -> pd.DataFrame:
     """
     return load_shipment_model_mapping(model_name=model_name)
 
- 
-    if model_mapping.empty:
-        print(f"[WARNING]: Zero mapping rows found in Excel for model '{model_name}'.")
-        return pd.DataFrame()
- 
-    conditions = []
-    for _, row in model_mapping.iterrows():
-        b = str(row.get("GMC_BRAND_NAME", "")).strip().replace("'", "''")
-        sb = str(row.get("GMC_SUBBRAND_NAME", "")).strip().replace("'", "''")
-        sc = str(row.get("GMC_SUBCATEGORY_NAME", "")).strip().replace("'", "''")
- 
-        cond = f"""
-        (
-            UPPER(TRIM(COALESCE(GMC_BRAND_NAME, ''))) = '{b}'
-            AND UPPER(TRIM(COALESCE(GMC_SUBBRAND_NAME, ''))) = '{sb}'
-            AND UPPER(TRIM(COALESCE(GMC_SUBCATEGORY_NAME, ''))) = '{sc}'
-        )
-        """
-        conditions.append(cond)
- 
-    where_clause = "\nOR\n".join(conditions)
- 
-    query = f"""
-SELECT DISTINCT
-    KV_ITEM_NO,
-    GMC_SKU_CODE,
-    GMC_SKU_NAME,
-    GMC_BRAND_NAME,
-    GMC_SUBBRAND_NAME,
-    GMC_SUBCATEGORY_NAME
-FROM PROD_CUSTOMER360_GLOBALNA.NAUSMASTER_ACCESS.VW_DIM_GMC_PRODCUT_HIERARCHY
-WHERE
-    {where_clause}
-"""
-    conn = database.get_snowflake_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute(query)
-        rows = cursor.fetchall()
-        cols = [col[0] for col in cursor.description]
-    finally:
-        cursor.close()
- 
-    items_df = pd.DataFrame(rows, columns=cols)
-    if not items_df.empty:
-        items_df["KV_ITEM_NO"] = items_df["KV_ITEM_NO"].astype(str).str.strip()
-        items_df = items_df[items_df["KV_ITEM_NO"] != ""].drop_duplicates(subset=["KV_ITEM_NO"])
- 
-    return items_df
- 
- 
+
 # Backward-compatible alias for Children's Tylenol
 get_children_tylenol_items = lambda m_map: resolve_shipment_model_items("Children's Tylenol")
  
@@ -454,30 +404,33 @@ def aggregate_shipment_monthly(shipment_df: pd.DataFrame) -> pd.DataFrame:
     df["GTS_AMT"] = pd.to_numeric(df.get("GTS_AMT", 0.0), errors="coerce").fillna(0.0)
     df["GTS_QTY"] = pd.to_numeric(df.get("GTS_QTY", 0.0), errors="coerce").fillna(0.0)
  
-    df = df.merge(cal_lookup, on="SHIP_DATE", how="left")
+
  
-    qty_col = "GROSS_SHIP_QTY" if "GROSS_SHIP_QTY" in df.columns else "GROSS_SHIP_AM"
-    if qty_col not in df.columns:
-        df["GROSS_SHIP_QTY"] = 0.0
-        qty_col = "GROSS_SHIP_QTY"
+
+
  
     monthly_agg = (
         df.dropna(subset=["KV_MO_ID"])
-        .groupby(["KV_YEAR", "KV_MO_ID", "KV_MONTH_NAME"], as_index=False)[["GROSS_SHIP_AM", qty_col]]
+        .groupby(["KV_MO_ID"], as_index=False)[["GTS_AMT", "GTS_QTY"]]
         .sum()
-        .rename(columns={"GROSS_SHIP_AM": "GRS_USD", qty_col: "GRS_QTY"})
+        .rename(columns={"GTS_AMT": "GTS_USD", "GTS_QTY": "GTS_QTY"})
     )
  
     result = selected_months_df[["KV_YEAR", "KV_MO_ID", "KV_MONTH_NAME"]].merge(
         monthly_agg,
-        on=["KV_YEAR", "KV_MO_ID", "KV_MONTH_NAME"],
+        on="KV_MO_ID",
         how="left"
     )
  
-    result["GRS_USD"] = result["GRS_USD"].fillna(0.0)
-    result["GRS_MILLIONS"] = result["GRS_USD"] / 1_000_000.0
-    result["GRS_QTY"] = result["GRS_QTY"].fillna(0.0)
-    result["GRS_QTY_MILLIONS"] = result["GRS_QTY"] / 1_000_000.0
+    result["GTS_USD"] = result["GTS_USD"].fillna(0.0)
+    result["GTS_MILLIONS"] = result["GTS_USD"] / 1_000_000.0
+    result["GTS_QTY"] = result["GTS_QTY"].fillna(0.0)
+    result["GTS_QTY_MILLIONS"] = result["GTS_QTY"] / 1_000_000.0
+
+    result["GRS_USD"] = result["GTS_USD"]
+    result["GRS_MILLIONS"] = result["GTS_MILLIONS"]
+    result["GRS_QTY"] = result["GTS_QTY"]
+    result["GRS_QTY_MILLIONS"] = result["GTS_QTY_MILLIONS"]
     result = result.sort_values(["KV_YEAR", "KV_MO_ID"]).reset_index(drop=True)
  
     return result
@@ -814,8 +767,8 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
  
     # Tuple structure: (metric_name, col_key, unit_type, has_yoy)
     metrics_config = [
-        ("GRS $", "GRS_USD", "dollar", True),
-        ("GRS U", "GRS_QTY", "grs_u", True),
+        ("GTS $", "GRS_USD", "dollar", True),
+        ("GTS U", "GRS_QTY", "grs_u", True),
         ("B3", "B3", "b3", True),
         ("Build/Bleed $", "BUILD_BLEED", "build_bleed", False),
         ("Unit Ratio", "UNIT_RATIO", "unit_ratio", False),
@@ -1209,7 +1162,7 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
     })
  
     note_elem = html.Div(
-        "Note: GRS $ and GRS U are in millions",
+        "Note: GTS $ and GTS U are in millions",
         style={
             "marginTop": "10px",
             "fontSize": "12px",
@@ -1229,7 +1182,7 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
 def main():
     target_model = sys.argv[1] if len(sys.argv) > 1 else "Children's Tylenol"
     print("=" * 90)
-    print(f"SHIPMENT GRS $ INDEPENDENT VALIDATION FOR MODEL: '{target_model}'")
+    print(f"SHIPMENT GTS $ INDEPENDENT VALIDATION FOR MODEL: '{target_model}'")
     print("KENVUE JANUARY 2022 TO AUGUST 2026")
     print("=" * 90)
  
@@ -1247,9 +1200,9 @@ def main():
     result_df, detail_df = process_monthly_summary(shipment_df, selected_calendar, selected_months_df)
  
     print("\n" + "=" * 90)
-    print(f"MODEL: '{target_model}' MONTH-WISE SHIPMENT GRS $ (56 KENVUE MONTHS)")
+    print(f"MODEL: '{target_model}' MONTH-WISE SHIPMENT GTS $ (56 KENVUE MONTHS)")
     print("=" * 90)
-    print(f"{'YEAR':<8}{'KV_MO_ID':<12}{'MONTH':<15}{'GRS_USD':>22}{'GRS_MILLIONS':>22}")
+    print(f"{'YEAR':<8}{'KV_MO_ID':<12}{'MONTH':<15}{'GTS_USD':>22}{'GTS_MILLIONS':>22}")
     print("-" * 90)
  
     for _, row in result_df.iterrows():
@@ -1276,7 +1229,7 @@ def main():
     print(f"\nCHECK 1 - Mapping Rows for '{target_model}' : {num_mapping_rows}")
     print(f"CHECK 2 - Matched Unique KV_ITEM_NOs       : {num_matched_items}")
     print(f"CHECK 3 - Shipment Transaction Rows        : {num_shipment_rows:,}")
-    print(f"CHECK 4 - Total GRS $                      : ${total_grs:,.2f}")
+    print(f"CHECK 4 - Total GTS $                      : ${total_grs:,.2f}")
     print(f"CHECK 5 - Monthly Row Count                : {len(result_df)} (Expected 56)")
     print("\nValidation PASSED")
  
