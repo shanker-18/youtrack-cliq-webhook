@@ -266,10 +266,6 @@ def get_building_block_values(
             total += val
             raw_list.append((canonical_name, val, yr_int, month_nbr))
 
-    has_bb_data = len(raw_list) > 0
-    if not has_bb_data:
-        return {b: None for b in ALLOWED_BUILDING_BLOCKS}, None, [], False
-
     final_blocks = {}
     for b in ALLOWED_BUILDING_BLOCKS:
         final_blocks[b] = blocks.get(b, 0.0)
@@ -403,12 +399,12 @@ def calculate_current_month_pos(
     else:
         print("Building Block display skipped for selected model.")
 
-    pos_display_allowed = is_bb_eligible and has_bb_data and (prev_pos_m is not None)
-    bb_display_allowed = is_bb_eligible and has_bb_data
+    pos_display_allowed = is_bb_eligible and (prev_pos_m is not None)
+    bb_display_allowed = is_bb_eligible
 
     # Calculation: Current-Month Calculated POS ($M) = Previous-Year POS ($M) + Building Block Total ($M)
     calc_pos_m = None
-    if is_bb_eligible and has_bb_data and (prev_pos_m is not None):
+    if is_bb_eligible and (prev_pos_m is not None):
         bb_total_m = (bb_total / 1000.0) if bb_total is not None else 0.0
         calc_pos_m = prev_pos_m + bb_total_m
 
@@ -423,6 +419,7 @@ def calculate_current_month_pos(
             index_val = idx_map[key]
             factory_pos_m = calc_pos_m * index_val
         else:
+            index_val = 1.0
             factory_pos_m = calc_pos_m
 
     # Print exact required CURRENT MONTH DISPLAY GATE diagnostic block
@@ -442,12 +439,12 @@ def calculate_current_month_pos(
     print(f"Final POS $          : {f'${calc_pos_m:.1f} M' if calc_pos_m is not None else 'BLANK'}")
     print(f"Final Factory POS $  : {f'${factory_pos_m:.1f} M' if factory_pos_m is not None else 'BLANK'}")
     calc_asp_val = None
-    if is_bb_eligible and has_bb_data:
+    if is_bb_eligible:
         calc_asp_val = calculate_current_month_asp(df, yr, m_nbr)
 
     print(f"Final POS U          : BLANK")
     print(f"Final ASP            : {f'${calc_asp_val:.2f}' if calc_asp_val is not None else 'BLANK'}")
-    print(f"Final BBI            : {f'{bb_total:.2f}' if (bb_display_allowed and bb_total is not None) else 'BLANK'}")
+    print(f"Final BBI            : {f'{bb_total:.2f}' if (bb_display_allowed and bb_total is not None) else '0.00'}")
     print(f"Final % of Year      : BLANK")
     print("=" * 60)
 
@@ -455,15 +452,12 @@ def calculate_current_month_pos(
         print("\n" + "=" * 70)
         print(f"BUILDING BLOCK SUMMARY | MODEL: '{model_name}' | PERIOD: {yr}-{m_nbr:02d} ({m_name})")
         print("=" * 70)
-        if has_bb_data and bb_blocks:
-            for b_name in ALLOWED_BUILDING_BLOCKS:
-                val_k = bb_blocks.get(b_name, 0.0)
-                print(f"  - {b_name:<20} : ${val_k:>10,.2f} K")
-            print("-" * 70)
-            tot_val_k = bb_total if bb_total is not None else 0.0
-            print(f"  TOTAL BUILDING BLOCKS  : ${tot_val_k:>10,.2f} K (${tot_val_k/1000.0:>6,.2f} M)")
-        else:
-            print("  No building block planning values found for this period.")
+        for b_name in ALLOWED_BUILDING_BLOCKS:
+            val_k = bb_blocks.get(b_name, 0.0) if bb_blocks else 0.0
+            print(f"  - {b_name:<20} : ${val_k:>10,.2f} K")
+        print("-" * 70)
+        tot_val_k = bb_total if bb_total is not None else 0.0
+        print(f"  TOTAL BUILDING BLOCKS  : ${tot_val_k:>10,.2f} K (${tot_val_k/1000.0:>6,.2f} M)")
         print("-" * 70)
         if prev_pos_m is not None:
             print(f"  PREV YEAR SAME MONTH POS $ : ${prev_pos_m:>10,.2f} M")
