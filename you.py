@@ -102,35 +102,31 @@ def fmt_val(val, unit, status):
     if status == "EMPTY" or val is None or (isinstance(val, float) and math.isnan(val)):
         return ""
 
-    def fmt_full(num):
-        s = f"{num:,.6f}".rstrip('0').rstrip('.')
-        return s if s else "0"
-
     if unit == "$M":
         val_m = val / 1_000_000.0
         if val_m < 0:
-            return f"-${fmt_full(abs(val_m))}"
-        return f"${fmt_full(val_m)}"
+            return f"-${abs(val_m):,.1f}"
+        return f"${val_m:,.1f}"
     elif unit == "UnitsM":
         val_m = val / 1_000_000.0
         if val_m < 0:
-            return f"-{fmt_full(abs(val_m))}"
-        return f"{fmt_full(val_m)}"
+            return f"-{abs(val_m):,.1f}"
+        return f"{val_m:,.1f}"
     elif unit == "$":
         if val < 0:
-            return f"-${fmt_full(abs(val))}"
-        return f"${fmt_full(val)}"
+            return f"-${abs(val):,.2f}"
+        return f"${val:,.2f}"
     elif unit == "Units":
         if val < 0:
-            return f"-{fmt_full(abs(val))}"
-        return f"{fmt_full(val)}"
+            return f"-{abs(val):,.1f}"
+        return f"{val:,.1f}"
     elif unit == "Ratio":
-        return f"{fmt_full(val)}"
+        return f"{val:,.2f}"
     elif unit == "%":
-        return f"{fmt_full(val)}%"
+        return f"{val:,.1f}%"
     elif unit == "Status":
         return status
-    return f"{fmt_full(val)}"
+    return f"{val:,.2f}"
  
  
 filter_opts = database.get_filter_options()
@@ -155,7 +151,7 @@ sidebar = html.Div([
                 "color": "#ffffff", "fontSize": "16px", "fontWeight": "700", "textAlign": "center", "lineHeight": "1.2", "pointerEvents": "none"
             })
         ], id="nav-consumption", color="link", n_clicks=0, style={
-            "backgroundColor": "#00B097",
+            "backgroundColor": "#019881",
             "width": "134px",
             "padding": "12px 8px",
             "minHeight": "105px",
@@ -169,7 +165,7 @@ sidebar = html.Div([
             "border": "none",
             "textDecoration": "none"
         }),
- 
+
         dbc.Button([
             html.Img(
                 src=get_asset_src(SHIPMENT_ICON_PATH),
@@ -200,7 +196,7 @@ sidebar = html.Div([
     "left": "0",
     "bottom": "0",
     "width": "156px",
-    "backgroundColor": "#00B097",
+    "backgroundColor": "#b0dfd8",
     "zIndex": "1000",
     "display": "flex",
     "flexDirection": "column",
@@ -671,30 +667,30 @@ def update_dashboard(n_clicks, gbu, squad, model, c_clicks, s_clicks, active_tab
 
  
             # Table Header Construction
-            th_style = {"backgroundColor": "#e6f5f2", "color": "#019881", "fontWeight": "800", "padding": "8px 10px", "border": "1px solid #858585", "textAlign": "center", "whiteSpace": "nowrap", "fontFamily": "'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, 'Helvetica Neue', Arial, sans-serif"}
-            th_q1 = html.Th("Q1", colSpan=3, style={**th_style, "backgroundColor": "#e6f5f2", "color": "#019881"})
-            th_q2 = html.Th("Q2", colSpan=3, style={**th_style, "backgroundColor": "#e6f5f2", "color": "#019881"})
-            th_q3 = html.Th("Q3", colSpan=3, style={**th_style, "backgroundColor": "#e6f5f2", "color": "#019881"})
-            th_q4 = html.Th("Q4", colSpan=3, style={**th_style, "backgroundColor": "#e6f5f2", "color": "#019881", "borderRight": "3px solid #858585"})
-            th_tot = html.Th("TOTALS", colSpan=7, style={**th_style, "backgroundColor": "#e6f5f2", "color": "#019881"})
+            th_style = {"backgroundColor": "#e6f5f2", "color": "#000000", "fontWeight": "800", "padding": "8px 10px", "border": "1px solid #858585", "textAlign": "center", "whiteSpace": "nowrap", "fontFamily": "'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, 'Helvetica Neue', Arial, sans-serif"}
+            th_q1 = html.Th("Q1", colSpan=3, style={**th_style, "backgroundColor": "#e6f5f2", "color": "#000000"})
+            th_q2 = html.Th("Q2", colSpan=3, style={**th_style, "backgroundColor": "#e6f5f2", "color": "#000000"})
+            th_q3 = html.Th("Q3", colSpan=3, style={**th_style, "backgroundColor": "#e6f5f2", "color": "#000000"})
+            th_q4 = html.Th("Q4", colSpan=3, style={**th_style, "backgroundColor": "#e6f5f2", "color": "#000000", "borderRight": "3px solid #858585"})
+            th_tot = html.Th("TOTALS", colSpan=7, style={**th_style, "backgroundColor": "#e6f5f2", "color": "#000000"})
 
             hdr_row1 = html.Tr([
-                html.Th("METRIC NAME", style={**th_style, "backgroundColor": "#e6f5f2", "color": "#019881", "textAlign": "left"}),
-                html.Th("YEAR", style={**th_style, "backgroundColor": "#e6f5f2", "color": "#019881"}),
+                html.Th("METRIC NAME", style={**th_style, "backgroundColor": "#e6f5f2", "color": "#000000", "textAlign": "left"}),
+                html.Th("YEAR", style={**th_style, "backgroundColor": "#e6f5f2", "color": "#000000"}),
                 th_q1, th_q2, th_q3, th_q4, th_tot
             ])
 
             hdr_row2 = html.Tr([
-                html.Th("", style={**th_style, "textAlign": "left", "minWidth": "160px", "backgroundColor": "#e6f5f2", "color": "#019881"}),
-                html.Th("Year", style={**th_style, "minWidth": "50px", "backgroundColor": "#e6f5f2", "color": "#019881"}),
-                *[html.Th(m, style={**th_style, "minWidth": "55px", "backgroundColor": "#e6f5f2", "color": "#019881", **({"borderRight": "3px solid #858585"} if m == "DEC" else {})}) for m in MONTHS],
-                html.Th("Q1", style={**th_style, "minWidth": "60px", "backgroundColor": "#e6f5f2", "color": "#019881"}),
-                html.Th("Q2", style={**th_style, "minWidth": "60px", "backgroundColor": "#e6f5f2", "color": "#019881"}),
-                html.Th("Q3", style={**th_style, "minWidth": "60px", "backgroundColor": "#e6f5f2", "color": "#019881"}),
-                html.Th("Q4", style={**th_style, "minWidth": "60px", "backgroundColor": "#e6f5f2", "color": "#019881", "borderRight": "3px solid #858585"}),
-                html.Th("FY", style={**th_style, "minWidth": "65px", "backgroundColor": "#e6f5f2", "color": "#019881"}),
-                html.Th("YTD", style={**th_style, "minWidth": "65px", "backgroundColor": "#e6f5f2", "color": "#019881"}),
-                html.Th("YTG", style={**th_style, "minWidth": "65px", "backgroundColor": "#e6f5f2", "color": "#019881"})
+                html.Th("", style={**th_style, "textAlign": "left", "minWidth": "160px", "backgroundColor": "#e6f5f2", "color": "#000000"}),
+                html.Th("Year", style={**th_style, "minWidth": "50px", "backgroundColor": "#e6f5f2", "color": "#000000"}),
+                *[html.Th(m, style={**th_style, "minWidth": "55px", "backgroundColor": "#e6f5f2", "color": "#000000", **({"borderRight": "3px solid #858585"} if m == "DEC" else {})}) for m in MONTHS],
+                html.Th("Q1", style={**th_style, "minWidth": "60px", "backgroundColor": "#e6f5f2", "color": "#000000"}),
+                html.Th("Q2", style={**th_style, "minWidth": "60px", "backgroundColor": "#e6f5f2", "color": "#000000"}),
+                html.Th("Q3", style={**th_style, "minWidth": "60px", "backgroundColor": "#e6f5f2", "color": "#000000"}),
+                html.Th("Q4", style={**th_style, "minWidth": "60px", "backgroundColor": "#e6f5f2", "color": "#000000", "borderRight": "3px solid #858585"}),
+                html.Th("FY", style={**th_style, "minWidth": "65px", "backgroundColor": "#e6f5f2", "color": "#000000"}),
+                html.Th("YTD", style={**th_style, "minWidth": "65px", "backgroundColor": "#e6f5f2", "color": "#000000"}),
+                html.Th("YTG", style={**th_style, "minWidth": "65px", "backgroundColor": "#e6f5f2", "color": "#000000"})
             ])
 
             thead = html.Thead([hdr_row2])
@@ -704,7 +700,7 @@ def update_dashboard(n_clicks, gbu, squad, model, c_clicks, s_clicks, active_tab
                 group_rows = []
                 group_size = len(yr_val_tuples)
                 label_td_style = {
-                    "backgroundColor": "#e6f5f2", "color": "#019881", "fontWeight": "900", "fontSize": "14px",
+                    "backgroundColor": "#e6f5f2", "color": "#000000", "fontWeight": "900", "fontSize": "14px",
                     "textAlign": "center", "verticalAlign": "middle", "border": "1px solid #858585", "padding": "8px",
                     "fontFamily": "'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, 'Helvetica Neue', Arial, sans-serif"
                 }
