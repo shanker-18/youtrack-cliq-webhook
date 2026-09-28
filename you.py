@@ -847,12 +847,15 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                 else:
                     factory_pos = 0.0
 
+            factory_pos_map[(str(latest_year), m_i)] = factory_pos
+
             bb_blocks, bb_total_k, has_bb = get_shipment_building_block_values(model_name, str(latest_year), m_nbr, bb_df=ship_bb_df)
 
-            bb_total_m = (bb_total_k / 1000.0) if bb_total_k else 0.0
+            bb_val_usd = (bb_total_k * 1000.0) if bb_total_k else 0.0
+            calc_grs_usd = (factory_pos if factory_pos else 0.0) + bb_val_usd
             factory_pos_m = (factory_pos / 1_000_000.0) if factory_pos else 0.0
-            calc_grs_m = factory_pos_m + bb_total_m
-            calc_grs_usd = calc_grs_m * 1_000_000.0
+            bb_total_m = bb_val_usd / 1_000_000.0
+            calc_grs_m = calc_grs_usd / 1_000_000.0
 
             usd_vals[m_i] = calc_grs_usd
 
@@ -912,9 +915,9 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
             print(f"   - Derived B3                       : ${b3_proj}" if b3_proj else "   - Derived B3                       : N/A")
             print(f"   - Derived GTS Units                : {qty_vals[m_i]} U" if qty_vals[m_i] else "   - Derived GTS Units                : N/A")
             print("=" * 85 + "\n")
- 
+
         raw_metric_vals[latest_year] = {"GRS_USD": usd_vals, "GRS_QTY": qty_vals}
- 
+
     b3_by_yr = {}
     for metric_name, col_key, unit_type, has_yoy in metrics_config:
         year_vals = {}
@@ -926,32 +929,23 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                 b3_v = [None] * 12
                 for m_i in range(12):
                     gs = usd_v[m_i]
-                    if gs is None or gs == 0 or (isinstance(gs, float) and math.isnan(gs)):
-                        b3_v[m_i] = None
+                    gu = qty_v[m_i]
+                    if gs is not None and gu is not None and gu != 0:
+                        b3_v[m_i] = gs / gu
                     else:
                         p_val = pos_val_map.get((str(yr), m_i))
                         p_u = pos_u_map.get((str(yr), m_i))
                         asp_m = (p_val / p_u) if (p_val is not None and p_u is not None and p_u != 0) else None
-
-                        if asp_m is None:
+                        if asp_m is None and prev_year:
                             p_val_p = pos_val_map.get((str(prev_year), m_i))
                             p_u_p = pos_u_map.get((str(prev_year), m_i))
                             if p_val_p and p_u_p and p_u_p != 0:
                                 asp_m = p_val_p / p_u_p
-
-                        pf_m = None
-                        if qty_v[m_i] is not None and qty_v[m_i] != 0:
-                            b3_actual = gs / qty_v[m_i]
-                            if asp_m is not None and b3_actual != 0:
-                                pf_m = asp_m / b3_actual
-
-                        if pf_m is None or pf_m == 0:
-                            pf_m = fy_price_factor_prev
-
+                        pf_m = fy_price_factor_prev
                         if asp_m is not None and pf_m is not None and pf_m != 0:
                             b3_v[m_i] = asp_m / pf_m
-                        elif qty_v[m_i] is not None and qty_v[m_i] != 0:
-                            b3_v[m_i] = gs / qty_v[m_i]
+                        else:
+                            b3_v[m_i] = None
 
                 b3_by_yr[yr] = b3_v
                 year_vals[yr] = b3_v
