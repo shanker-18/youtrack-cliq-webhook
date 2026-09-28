@@ -798,7 +798,8 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                 if pd.notnull(u_val):
                     usd_vals[m_i] = float(u_val)
                 if pd.notnull(q_val):
-                    qty_vals[m_i] = float(q_val)
+                    q_num = float(q_val)
+                    qty_vals[m_i] = abs(q_num) if q_num != 0 else 0.0
  
         raw_metric_vals[yr] = {"GRS_USD": usd_vals, "GRS_QTY": qty_vals}
  
