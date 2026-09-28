@@ -690,8 +690,10 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
  
     thead = html.Thead([hdr_row2])
  
-    years = sorted(month_summary_df["KV_YEAR"].unique())
-    latest_year = years[-1] if years else 2026
+    years = [int(y) for y in sorted(month_summary_df["KV_YEAR"].unique()) if int(y) >= 2023]
+    if not years:
+        years = [2023, 2024, 2025, 2026]
+    latest_year = years[-1]
     prev_year = years[-2] if len(years) >= 2 else (latest_year - 1)
     ref_years = [y for y in years if y < latest_year][-4:]
  
@@ -954,14 +956,16 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                 bb_v = [None] * 12
                 for m_i in range(12):
                     gs = usd_v[m_i]
-                    if gs is None or gs == 0 or (isinstance(gs, float) and math.isnan(gs)):
-                        bb_v[m_i] = None
-                    else:
-                        fp = factory_pos_map.get((str(yr), m_i))
-                        if fp is not None:
+                    fp = factory_pos_map.get((str(yr), m_i))
+                    if gs is not None and not (isinstance(gs, float) and math.isnan(gs)):
+                        if fp is not None and not (isinstance(fp, float) and math.isnan(fp)):
                             bb_v[m_i] = gs - fp
                         else:
                             bb_v[m_i] = gs
+                    elif fp is not None and not (isinstance(fp, float) and math.isnan(fp)):
+                        bb_v[m_i] = 0.0 - fp
+                    else:
+                        bb_v[m_i] = None
                 year_vals[yr] = bb_v
             elif col_key == "UNIT_RATIO":
                 ur_v = [None] * 12
