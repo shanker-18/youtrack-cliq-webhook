@@ -203,7 +203,7 @@ sidebar = html.Div([
     "left": "0",
     "bottom": "0",
     "width": "156px",
-    "backgroundColor": "#e6f5f2",
+    "backgroundColor": "#b0dfd8",
     "zIndex": "1000",
     "display": "flex",
     "flexDirection": "column",
@@ -687,27 +687,33 @@ def update_dashboard(n_clicks, gbu, squad, model, c_clicks, s_clicks, active_tab
                 th_q1, th_q2, th_q3, th_q4, th_tot
             ])
  
+            th_nav_style = {
+                "backgroundColor": "#b0dfd8", "color": "#000000", "fontWeight": "700", "padding": "6px 8px",
+                "border": "1px solid #858585", "textAlign": "center", "whiteSpace": "nowrap", "fontSize": "12px",
+                "fontFamily": "'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, 'Helvetica Neue', Arial, sans-serif"
+            }
+
             hdr_row2 = html.Tr([
-                html.Th("Metric Description", style={**th_style, "textAlign": "left", "minWidth": "160px", "backgroundColor": "#019881"}),
-                html.Th("Year", style={**th_style, "minWidth": "50px", "backgroundColor": "#019881"}),
-                *[html.Th(m, style={**th_style, "minWidth": "55px", "backgroundColor": "#019881", **({"borderRight": "3px solid #858585"} if m == "DEC" else {})}) for m in MONTHS],
-                html.Th("Q1", style={**th_style, "minWidth": "60px", "backgroundColor": "#018571", "color": "#ffffff"}),
-                html.Th("Q2", style={**th_style, "minWidth": "60px", "backgroundColor": "#018571", "color": "#ffffff"}),
-                html.Th("Q3", style={**th_style, "minWidth": "60px", "backgroundColor": "#018571", "color": "#ffffff"}),
-                html.Th("Q4", style={**th_style, "minWidth": "60px", "backgroundColor": "#018571", "color": "#ffffff", "borderRight": "3px solid #858585"}),
-                html.Th("FY", style={**th_style, "minWidth": "65px", "backgroundColor": "#017362", "color": "#ffffff"}),
-                html.Th("YTD", style={**th_style, "minWidth": "65px", "backgroundColor": "#017362", "color": "#ffffff"}),
-                html.Th("YTG", style={**th_style, "minWidth": "65px", "backgroundColor": "#017362", "color": "#ffffff"})
+                html.Th("", style={"border": "none", "backgroundColor": "#ffffff", "minWidth": "160px"}),
+                html.Th("Year", style={**th_nav_style, "minWidth": "50px"}),
+                *[html.Th(m.title(), style={**th_nav_style, "minWidth": "55px", **({"borderRight": "3px solid #858585"} if m == "DEC" else {})}) for m in MONTHS],
+                html.Th("Q1", style={**th_nav_style, "minWidth": "60px"}),
+                html.Th("Q2", style={**th_nav_style, "minWidth": "60px"}),
+                html.Th("Q3", style={**th_nav_style, "minWidth": "60px"}),
+                html.Th("Q4", style={**th_nav_style, "minWidth": "60px", "borderRight": "3px solid #858585"}),
+                html.Th("FY", style={**th_nav_style, "minWidth": "65px"}),
+                html.Th("YTD", style={**th_nav_style, "minWidth": "65px"}),
+                html.Th("YTG", style={**th_nav_style, "minWidth": "65px"})
             ])
 
             thead = html.Thead([hdr_row2])
             tbody_rows = []
- 
+
             def make_grouped_rows(metric_name, unit, yr_val_tuples, metric_key, year_metrics):
                 group_rows = []
                 group_size = len(yr_val_tuples)
                 label_td_style = {
-                    "backgroundColor": "#DDDDDD", "color": "#000000", "fontWeight": "900", "fontSize": "14px",
+                    "backgroundColor": "#b0dfd8", "color": "#000000", "fontWeight": "900", "fontSize": "14px",
                     "textAlign": "center", "verticalAlign": "middle", "border": "1px solid #858585", "padding": "8px",
                     "fontFamily": "'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, 'Helvetica Neue', Arial, sans-serif"
                 }
