@@ -408,13 +408,20 @@ def update_dashboard(n_clicks, gbu, squad, model, c_clicks, s_clicks, active_tab
             nav_cons_style = active_nav_style
             nav_ship_style = inactive_nav_style
 
-        if triggered_id in ["filter-gbu", "filter-squad", "filter-model"]:
+        if triggered_id in ["filter-gbu", "filter-squad"]:
             print(f"\nFilter changed ('{triggered_id}') -> returning lightweight dropdown updates")
+            prompt_text = "Please select a Need State." if triggered_id == "filter-gbu" else "Please select a Model."
+            table_elem = html.Div([
+                html.Div([
+                    html.H6("Dashboard Filter Selection", style={"color": "#00B097", "fontWeight": "700", "marginBottom": "8px", "fontSize": "16px"}),
+                    html.P(prompt_text, style={"color": "#495057", "fontSize": "13px", "marginBottom": "0", "fontWeight": "500"})
+                ], style={"textAlign": "center", "padding": "48px 24px", "backgroundColor": "#ffffff", "borderRadius": "10px", "border": "1px dashed #00B097", "boxShadow": "0 2px 8px rgba(0,0,0,0.04)"})
+            ])
             return (
                 active_tab,
                 dash.no_update,
-                dash.no_update,
-                dash.no_update,
+                "Filter Selection Updated",
+                table_elem,
                 gbu_opts,
                 squad_opts,
                 model_opts,
@@ -429,12 +436,11 @@ def update_dashboard(n_clicks, gbu, squad, model, c_clicks, s_clicks, active_tab
                 nav_ship_style
             )
 
-        should_fetch_snowflake = (triggered_id == "btn-refresh" and can_refresh)
- 
+        should_fetch_snowflake = can_refresh
+
         current_loaded_store = loaded_dashboard_state if isinstance(loaded_dashboard_state, dict) else {}
 
         if active_tab == "shipments":
-            stored_ship_model = current_loaded_store.get("shipment_model")
             if should_fetch_snowflake:
                 ship_df = ship.fetch_shipment_data_for_model(model)
                 if not ship_df.empty:
@@ -454,20 +460,11 @@ def update_dashboard(n_clicks, gbu, squad, model, c_clicks, s_clicks, active_tab
                         ], style={"textAlign": "center", "padding": "48px 24px", "backgroundColor": "#f8d7da", "borderRadius": "10px", "border": "1px solid #f5c6cb", "boxShadow": "0 2px 8px rgba(0,0,0,0.04)"})
                     ])
                     record_str = f"No Shipment Mapping / Records for '{model}'"
-            elif stored_ship_model and stored_ship_model == model:
-                ship_df = ship.fetch_shipment_data_for_model(stored_ship_model)
-                if not ship_df.empty:
-                    month_summary = ship.aggregate_shipment_monthly(ship_df)
-                    table_elem = ship.render_shipment_matrix_table(month_summary, model_name=stored_ship_model)
-                    record_str = f"Shipment GMC Mapped Records: {len(ship_df)} | Read-Only (Loaded for '{stored_ship_model}')"
-                else:
-                    table_elem = html.Div("No Shipment Data Available", style={"padding": "20px", "textAlign": "center", "color": "#721c24"})
-                    record_str = f"No Shipment Mapping / Records for '{stored_ship_model}'"
             else:
                 table_elem = html.Div([
                     html.Div([
                         html.H6("Shipment GTS Dashboard", style={"color": "#019881", "fontWeight": "700", "marginBottom": "8px", "fontSize": "16px"}),
-                        html.P("Select GBU, Need State, and Model, then click REFRESH DATA.", style={"color": "#495057", "fontSize": "13px", "marginBottom": "0", "fontWeight": "500"})
+                        html.P("Select GBU, Need State, and Model to view Shipment data.", style={"color": "#495057", "fontSize": "13px", "marginBottom": "0", "fontWeight": "500"})
                     ], style={"textAlign": "center", "padding": "48px 24px", "backgroundColor": "#ffffff", "borderRadius": "10px", "border": "1px dashed #019881", "boxShadow": "0 2px 8px rgba(0,0,0,0.04)"})
                 ])
                 record_str = "Shipment GTS Mode (Excel GMC Hierarchy Mapping)"
