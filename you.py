@@ -829,7 +829,7 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
         m_cutoff_idx = latest_comp_m_nbr
         ship_bb_df = load_shipment_building_block_data()
  
-        for m_i in range(12):
+        for m_i in range(m_cutoff_idx, 12):
             m_nbr = m_i + 1
             m_name = MONTHS[m_i]
             factory_pos = factory_pos_map.get((str(latest_year), m_i))
@@ -1024,8 +1024,7 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
         for g_idx, (yr_label, m_vals, is_yoy) in enumerate(yr_rows_tuples):
             td_cells = []
             if g_idx == 0:
-                cur_label_style = {**label_td_style, "backgroundColor": "#00B097", "color": "#ffffff"} if metric_name == "GTS $" else label_td_style
-                td_cells.append(html.Td(metric_name, rowSpan=group_size, style=cur_label_style))
+                td_cells.append(html.Td(metric_name, rowSpan=group_size, style=label_td_style))
  
             is_highlight = (yr_label in [str(latest_year), "YoY %"])
             yr_bg = "#DDDDDD" if is_highlight else "#ffffff"
