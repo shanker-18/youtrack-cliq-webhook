@@ -196,7 +196,7 @@ sidebar = html.Div([
     "left": "0",
     "bottom": "0",
     "width": "156px",
-    "backgroundColor": "#b0dfd8",
+    "backgroundColor": "#019881",
     "zIndex": "1000",
     "display": "flex",
     "flexDirection": "column",
