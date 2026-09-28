@@ -103,9 +103,8 @@ def fmt_val(val, unit, status):
         return ""
 
     def fmt_full(num):
-        if num == 0:
-            return "0"
-        return f"{num}"
+        s = f"{num:,.6f}".rstrip('0').rstrip('.')
+        return s if s else "0"
 
     if unit == "$M":
         val_m = val / 1_000_000.0
@@ -145,7 +144,7 @@ sidebar = html.Div([
             style={"maxHeight": "55px", "maxWidth": "125px", "objectFit": "contain"}
         )
     ], style={"marginTop": "24px", "marginBottom": "40px", "textAlign": "center", "width": "100%"}),
-
+ 
     html.Div([
         dbc.Button([
             html.Img(
@@ -153,11 +152,10 @@ sidebar = html.Div([
                 style={"width": "44px", "height": "44px", "marginBottom": "8px", "pointerEvents": "none"}
             ),
             html.Span("Consumption", style={
-                "color": "inherit", "fontSize": "16px", "fontWeight": "700", "textAlign": "center", "lineHeight": "1.2", "pointerEvents": "none"
+                "color": "#ffffff", "fontSize": "16px", "fontWeight": "700", "textAlign": "center", "lineHeight": "1.2", "pointerEvents": "none"
             })
         ], id="nav-consumption", color="link", n_clicks=0, style={
-            "backgroundColor": "#019881",
-            "color": "#ffffff",
+            "backgroundColor": "#00B097",
             "width": "134px",
             "padding": "12px 8px",
             "minHeight": "105px",
@@ -167,18 +165,18 @@ sidebar = html.Div([
             "alignItems": "center",
             "justifyContent": "center",
             "cursor": "pointer",
-            "boxShadow": "0 4px 12px rgba(1, 152, 129, 0.45)",
+            "boxShadow": "0 2px 6px rgba(0,0,0,0.2)",
             "border": "none",
             "textDecoration": "none"
         }),
-
+ 
         dbc.Button([
             html.Img(
                 src=get_asset_src(SHIPMENT_ICON_PATH),
                 style={"width": "44px", "height": "44px", "marginBottom": "8px", "pointerEvents": "none"}
             ),
             html.Span("Shipment", style={
-                "color": "inherit", "fontSize": "16px", "fontWeight": "700", "textAlign": "center", "lineHeight": "1.2", "pointerEvents": "none"
+                "color": "#ffffff", "fontSize": "16px", "fontWeight": "700", "textAlign": "center", "lineHeight": "1.2", "pointerEvents": "none"
             })
         ], id="nav-shipments", color="link", n_clicks=0, style={
             "width": "134px",
@@ -192,7 +190,6 @@ sidebar = html.Div([
             "cursor": "pointer",
             "opacity": "0.85",
             "backgroundColor": "transparent",
-            "color": "#005446",
             "border": "none",
             "textDecoration": "none"
         })
@@ -203,12 +200,12 @@ sidebar = html.Div([
     "left": "0",
     "bottom": "0",
     "width": "156px",
-    "backgroundColor": "#b0dfd8",
+    "backgroundColor": "#00B097",
     "zIndex": "1000",
     "display": "flex",
     "flexDirection": "column",
     "alignItems": "center",
-    "boxShadow": "2px 0 10px rgba(0,0,0,0.1)"
+    "boxShadow": "2px 0 10px rgba(0,0,0,0.15)"
 })
  
 main_content = html.Div([
@@ -394,10 +391,10 @@ def update_dashboard(n_clicks, gbu, squad, model, c_clicks, s_clicks, active_tab
             "backgroundColor": "#019881", "color": "#ffffff", "width": "134px", "padding": "12px 8px",
             "minHeight": "105px", "borderRadius": "12px", "display": "flex", "flexDirection": "column",
             "alignItems": "center", "justifyContent": "center", "cursor": "pointer",
-            "boxShadow": "0 4px 12px rgba(1, 152, 129, 0.45)", "border": "none", "textDecoration": "none"
+            "boxShadow": "0 2px 6px rgba(0,0,0,0.2)", "border": "none", "textDecoration": "none"
         }
         inactive_nav_style = {
-            "backgroundColor": "transparent", "color": "#005446", "width": "134px", "padding": "12px 8px",
+            "backgroundColor": "transparent", "color": "#ffffff", "width": "134px", "padding": "12px 8px",
             "minHeight": "105px", "borderRadius": "12px", "display": "flex", "flexDirection": "column",
             "alignItems": "center", "justifyContent": "center", "cursor": "pointer",
             "opacity": "0.85", "border": "none", "textDecoration": "none"
@@ -674,36 +671,30 @@ def update_dashboard(n_clicks, gbu, squad, model, c_clicks, s_clicks, active_tab
 
  
             # Table Header Construction
-            th_style = {"backgroundColor": "#019881", "color": "#ffffff", "fontWeight": "800", "padding": "8px 10px", "border": "1px solid #858585", "textAlign": "center", "whiteSpace": "nowrap", "fontFamily": "'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, 'Helvetica Neue', Arial, sans-serif"}
-            th_q1 = html.Th("Q1", colSpan=3, style={**th_style, "backgroundColor": "#018571"})
-            th_q2 = html.Th("Q2", colSpan=3, style={**th_style, "backgroundColor": "#018571"})
-            th_q3 = html.Th("Q3", colSpan=3, style={**th_style, "backgroundColor": "#018571"})
-            th_q4 = html.Th("Q4", colSpan=3, style={**th_style, "backgroundColor": "#018571", "borderRight": "3px solid #858585"})
-            th_tot = html.Th("TOTALS", colSpan=7, style={**th_style, "backgroundColor": "#017362"})
- 
+            th_style = {"backgroundColor": "#e6f5f2", "color": "#019881", "fontWeight": "800", "padding": "8px 10px", "border": "1px solid #858585", "textAlign": "center", "whiteSpace": "nowrap", "fontFamily": "'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, 'Helvetica Neue', Arial, sans-serif"}
+            th_q1 = html.Th("Q1", colSpan=3, style={**th_style, "backgroundColor": "#e6f5f2", "color": "#019881"})
+            th_q2 = html.Th("Q2", colSpan=3, style={**th_style, "backgroundColor": "#e6f5f2", "color": "#019881"})
+            th_q3 = html.Th("Q3", colSpan=3, style={**th_style, "backgroundColor": "#e6f5f2", "color": "#019881"})
+            th_q4 = html.Th("Q4", colSpan=3, style={**th_style, "backgroundColor": "#e6f5f2", "color": "#019881", "borderRight": "3px solid #858585"})
+            th_tot = html.Th("TOTALS", colSpan=7, style={**th_style, "backgroundColor": "#e6f5f2", "color": "#019881"})
+
             hdr_row1 = html.Tr([
-                html.Th("METRIC NAME", style={**th_style, "backgroundColor": "#019881", "textAlign": "left"}),
-                html.Th("YEAR", style={**th_style, "backgroundColor": "#019881"}),
+                html.Th("METRIC NAME", style={**th_style, "backgroundColor": "#e6f5f2", "color": "#019881", "textAlign": "left"}),
+                html.Th("YEAR", style={**th_style, "backgroundColor": "#e6f5f2", "color": "#019881"}),
                 th_q1, th_q2, th_q3, th_q4, th_tot
             ])
- 
-            th_nav_style = {
-                "backgroundColor": "#b0dfd8", "color": "#000000", "fontWeight": "700", "padding": "6px 8px",
-                "border": "1px solid #858585", "textAlign": "center", "whiteSpace": "nowrap", "fontSize": "12px",
-                "fontFamily": "'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, 'Helvetica Neue', Arial, sans-serif"
-            }
 
             hdr_row2 = html.Tr([
-                html.Th("", style={"border": "none", "backgroundColor": "#ffffff", "minWidth": "160px"}),
-                html.Th("Year", style={**th_nav_style, "minWidth": "50px"}),
-                *[html.Th(m.title(), style={**th_nav_style, "minWidth": "55px", **({"borderRight": "3px solid #858585"} if m == "DEC" else {})}) for m in MONTHS],
-                html.Th("Q1", style={**th_nav_style, "minWidth": "60px"}),
-                html.Th("Q2", style={**th_nav_style, "minWidth": "60px"}),
-                html.Th("Q3", style={**th_nav_style, "minWidth": "60px"}),
-                html.Th("Q4", style={**th_nav_style, "minWidth": "60px", "borderRight": "3px solid #858585"}),
-                html.Th("FY", style={**th_nav_style, "minWidth": "65px"}),
-                html.Th("YTD", style={**th_nav_style, "minWidth": "65px"}),
-                html.Th("YTG", style={**th_nav_style, "minWidth": "65px"})
+                html.Th("", style={**th_style, "textAlign": "left", "minWidth": "160px", "backgroundColor": "#e6f5f2", "color": "#019881"}),
+                html.Th("Year", style={**th_style, "minWidth": "50px", "backgroundColor": "#e6f5f2", "color": "#019881"}),
+                *[html.Th(m, style={**th_style, "minWidth": "55px", "backgroundColor": "#e6f5f2", "color": "#019881", **({"borderRight": "3px solid #858585"} if m == "DEC" else {})}) for m in MONTHS],
+                html.Th("Q1", style={**th_style, "minWidth": "60px", "backgroundColor": "#e6f5f2", "color": "#019881"}),
+                html.Th("Q2", style={**th_style, "minWidth": "60px", "backgroundColor": "#e6f5f2", "color": "#019881"}),
+                html.Th("Q3", style={**th_style, "minWidth": "60px", "backgroundColor": "#e6f5f2", "color": "#019881"}),
+                html.Th("Q4", style={**th_style, "minWidth": "60px", "backgroundColor": "#e6f5f2", "color": "#019881", "borderRight": "3px solid #858585"}),
+                html.Th("FY", style={**th_style, "minWidth": "65px", "backgroundColor": "#e6f5f2", "color": "#019881"}),
+                html.Th("YTD", style={**th_style, "minWidth": "65px", "backgroundColor": "#e6f5f2", "color": "#019881"}),
+                html.Th("YTG", style={**th_style, "minWidth": "65px", "backgroundColor": "#e6f5f2", "color": "#019881"})
             ])
 
             thead = html.Thead([hdr_row2])
@@ -713,7 +704,7 @@ def update_dashboard(n_clicks, gbu, squad, model, c_clicks, s_clicks, active_tab
                 group_rows = []
                 group_size = len(yr_val_tuples)
                 label_td_style = {
-                    "backgroundColor": "#b0dfd8", "color": "#000000", "fontWeight": "900", "fontSize": "14px",
+                    "backgroundColor": "#e6f5f2", "color": "#019881", "fontWeight": "900", "fontSize": "14px",
                     "textAlign": "center", "verticalAlign": "middle", "border": "1px solid #858585", "padding": "8px",
                     "fontFamily": "'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, 'Helvetica Neue', Arial, sans-serif"
                 }
