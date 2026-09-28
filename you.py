@@ -1116,7 +1116,14 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                     if not any(v for v in g_usd_list if v is not None and not (isinstance(v, float) and math.isnan(v)) and v != 0):
                         return None
                     g_sum = safe_sum(raw_metric_vals[yr_key]["GRS_QTY"][slice_obj])
-                    p_sum = safe_sum([pos_u_map.get((str(yr_key), i)) for i in range(12)][slice_obj])
+                    p_u_list = []
+                    for i in list(range(12))[slice_obj]:
+                        pu = pos_u_map.get((str(yr_key), i))
+                        if (pu is None or pu == 0) and prev_year:
+                            pu = pos_u_map.get((str(prev_year), i))
+                        if pu is not None:
+                            p_u_list.append(pu)
+                    p_sum = safe_sum(p_u_list)
                     if g_sum is not None and p_sum is not None and p_sum != 0:
                         return (g_sum / p_sum) * 100.0
                     return None
@@ -1134,14 +1141,28 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                     g_usd_list = raw_metric_vals.get(yr_key, {}).get("GRS_USD", [None]*12)[slice_obj]
                     if not any(v for v in g_usd_list if v is not None and not (isinstance(v, float) and math.isnan(v)) and v != 0):
                         return None
-                    p_val_sum = safe_sum([pos_val_map.get((str(yr_key), i)) for i in range(12)][slice_obj])
-                    p_u_sum = safe_sum([pos_u_map.get((str(yr_key), i)) for i in range(12)][slice_obj])
+                    p_val_list = []
+                    p_u_list = []
+                    for i in list(range(12))[slice_obj]:
+                        pv = pos_val_map.get((str(yr_key), i))
+                        pu = pos_u_map.get((str(yr_key), i))
+                        if (pv is None or pu is None or pu == 0) and prev_year:
+                            pv = pos_val_map.get((str(prev_year), i))
+                            pu = pos_u_map.get((str(prev_year), i))
+                        if pv is not None:
+                            p_val_list.append(pv)
+                        if pu is not None:
+                            p_u_list.append(pu)
+                    p_val_sum = safe_sum(p_val_list)
+                    p_u_sum = safe_sum(p_u_list)
                     g_usd_sum = safe_sum(g_usd_list)
                     g_qty_sum = safe_sum(raw_metric_vals[yr_key]["GRS_QTY"][slice_obj])
                     asp_v = (p_val_sum / p_u_sum) if (p_val_sum is not None and p_u_sum is not None and p_u_sum != 0) else None
                     b3_v = (g_usd_sum / g_qty_sum) if (g_usd_sum is not None and g_qty_sum is not None and g_qty_sum != 0) else None
                     if asp_v is not None and b3_v is not None and b3_v != 0:
                         return asp_v / b3_v
+                    elif fy_price_factor_prev:
+                        return fy_price_factor_prev
                     return None
 
                 if is_yoy:
