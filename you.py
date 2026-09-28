@@ -690,10 +690,8 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
  
     thead = html.Thead([hdr_row2])
  
-    years = [int(y) for y in sorted(month_summary_df["KV_YEAR"].unique()) if int(y) >= 2023]
-    if not years:
-        years = [2023, 2024, 2025, 2026]
-    latest_year = years[-1]
+    years = sorted(month_summary_df["KV_YEAR"].unique())
+    latest_year = years[-1] if years else 2026
     prev_year = years[-2] if len(years) >= 2 else (latest_year - 1)
     ref_years = [y for y in years if y < latest_year][-4:]
  
@@ -1026,7 +1024,8 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
         for g_idx, (yr_label, m_vals, is_yoy) in enumerate(yr_rows_tuples):
             td_cells = []
             if g_idx == 0:
-                td_cells.append(html.Td(metric_name, rowSpan=group_size, style=label_td_style))
+                cur_label_style = {**label_td_style, "backgroundColor": "#00B097", "color": "#ffffff"} if metric_name == "GTS $" else label_td_style
+                td_cells.append(html.Td(metric_name, rowSpan=group_size, style=cur_label_style))
  
             is_highlight = (yr_label in [str(latest_year), "YoY %"])
             yr_bg = "#DDDDDD" if is_highlight else "#ffffff"
@@ -1059,7 +1058,7 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                 td_cells.append(html.Td(v_str, style={
                     "backgroundColor": cell_bg, "color": text_color,
                     "fontWeight": "800" if is_highlight else "500",
-                    "textAlign": "right", "padding": "4px 6px", "border": "1px solid #858585", "fontSize": "11px",
+                    "textAlign": "right", "padding": "6px 8px", "border": "1px solid #858585", "fontSize": "11px",
                     "fontFamily": "'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, 'Helvetica Neue', Arial, sans-serif",
                     **({"borderRight": "3px solid #858585"} if m_i == 11 else {})
                 }))
@@ -1230,7 +1229,7 @@ def render_shipment_matrix_table(month_summary_df: pd.DataFrame, model_name: str
                 td_cells.append(html.Td(qv_str, style={
                     "backgroundColor": s_bg, "color": s_color,
                     "fontWeight": "800" if is_highlight else "700",
-                    "textAlign": "right", "padding": "4px 6px", "border": "1px solid #858585", "fontSize": "11px",
+                    "textAlign": "right", "padding": "6px 8px", "border": "1px solid #858585", "fontSize": "11px",
                     "fontFamily": "'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, 'Helvetica Neue', Arial, sans-serif",
                     **({"borderRight": "3px solid #858585"} if s_idx == 3 else {})
                 }))
