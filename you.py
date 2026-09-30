@@ -729,7 +729,7 @@ def update_dashboard(n_clicks, gbu, squad, model, c_clicks, s_clicks, active_tab
                     if not ym:
                         return None
  
-                    if metric_key in ["pos_val", "factory_pos", "pos_u", "gross_ship", "gross_case", "net_ship", "share"]:
+                    if metric_key in ["pos_val", "factory_pos", "pos_u", "gross_ship", "gross_case", "net_ship"]:
                         arr = ym.get(metric_key, [None]*12)[slice_obj]
                         valid_vals = [v for v in arr if v is not None and not (isinstance(v, float) and math.isnan(v))]
                         return sum(valid_vals) if valid_vals else None
@@ -793,6 +793,15 @@ def update_dashboard(n_clicks, gbu, squad, model, c_clicks, s_clicks, active_tab
                         if pos_u_sum == 0:
                             return None
                         return pos_v_sum / pos_u_sum
+                    elif metric_key == "share":
+                        pos_arr = ym.get("pos_val", [None]*12) if ym else []
+                        fy_pos_list = [v for v in pos_arr if v is not None and not (isinstance(v, float) and math.isnan(v))]
+                        fy_pos_sum = sum(fy_pos_list) if fy_pos_list else None
+                        if fy_pos_sum and fy_pos_sum != 0:
+                            period_pos_list = [v for v in pos_arr[slice_obj] if v is not None and not (isinstance(v, float) and math.isnan(v))]
+                            if period_pos_list:
+                                return (sum(period_pos_list) / fy_pos_sum) * 100.0
+                        return None
                     else:
                         arr = ym.get(metric_key, [None]*12)[slice_obj]
                         valid_vals = [v for v in arr if v is not None and not (isinstance(v, float) and math.isnan(v))]
