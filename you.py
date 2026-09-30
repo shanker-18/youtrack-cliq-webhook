@@ -758,7 +758,21 @@ def update_dashboard(n_clicks, gbu, squad, model, c_clicks, s_clicks, active_tab
                         elif slice_obj == slice(0, 12):  # FY
                             p_yr = str(int(target_yr) - 1) if target_yr.isdigit() else None
                             prev_pos_sum = get_pos_sum_for_year_slice(p_yr, slice(0, 12))  # Previous Year FY
-                        else:  # YTD / YTG
+                        elif slice_obj == ytd_slice:  # YTD
+                            # User formula: YTD of POS U / YTD of ASP
+                            u_arr = ym.get("pos_u", [None]*12)[ytd_slice]
+                            v_arr = ym.get("pos_val", [None]*12)[ytd_slice]
+                            valid_u = [v for v in u_arr if v is not None and not (isinstance(v, float) and math.isnan(v))]
+                            valid_v = [v for v in v_arr if v is not None and not (isinstance(v, float) and math.isnan(v))]
+                            if valid_u and valid_v:
+                                ytd_pos_u = sum(valid_u)
+                                ytd_pos_v = sum(valid_v)
+                                if ytd_pos_u != 0 and ytd_pos_v != 0:
+                                    ytd_asp = ytd_pos_v / ytd_pos_u
+                                    if ytd_asp != 0:
+                                        return ytd_pos_u / ytd_asp
+                            return None
+                        else:  # YTG
                             start_idx = slice_obj.start or 0
                             stop_idx = slice_obj.stop or 12
                             length = stop_idx - start_idx
