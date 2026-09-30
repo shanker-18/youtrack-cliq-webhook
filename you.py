@@ -102,7 +102,12 @@ def fmt_val(val, unit, status):
     if status == "EMPTY" or val is None or (isinstance(val, float) and math.isnan(val)):
         return ""
 
-    if unit == "$M":
+    if unit == "$RAW":
+        val_int = int(round(val))
+        if val_int < 0:
+            return f"-${abs(val_int):,}"
+        return f"${val_int:,}"
+    elif unit == "$M":
         val_m = val / 1_000_000.0
         if val_m < 0:
             return f"-${abs(val_m):,.1f}"
@@ -981,7 +986,7 @@ def update_dashboard(n_clicks, gbu, squad, model, c_clicks, s_clicks, active_tab
                 pos_u_tuples.append(("YoY %", yoy_u))
                 asp_tuples.append(("YoY %", yoy_asp))
  
-                tbody_rows.extend(make_grouped_rows("POS $", "$M", pos_dollar_tuples, "pos_val", year_metrics))
+                tbody_rows.extend(make_grouped_rows("POS $", "$RAW", pos_dollar_tuples, "pos_val", year_metrics))
                 tbody_rows.extend(make_grouped_rows("FACTORY POS $", "$M", factory_pos_tuples, "factory_pos", year_metrics))
                 tbody_rows.extend(make_grouped_rows("POS U", "UnitsM", pos_u_tuples, "pos_u", year_metrics))
                 tbody_rows.extend(make_grouped_rows("ASP", "ASP", asp_tuples, "asp", year_metrics))
