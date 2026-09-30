@@ -729,10 +729,15 @@ def update_dashboard(n_clicks, gbu, squad, model, c_clicks, s_clicks, active_tab
                     if not ym:
                         return None
  
-                    if metric_key in ["pos_val", "factory_pos", "pos_u", "gross_ship", "gross_case", "net_ship"]:
+                    if metric_key in ["pos_val", "factory_pos", "pos_u", "gross_ship", "gross_case", "net_ship", "build_bleed"]:
                         arr = ym.get(metric_key, [None]*12)[slice_obj]
                         valid_vals = [v for v in arr if v is not None and not (isinstance(v, float) and math.isnan(v))]
-                        return sum(valid_vals) if valid_vals else None
+                        if not valid_vals:
+                            return None
+                        if unit in ["$M", "UnitsM"]:
+                            rounded_m_vals = [round(v / 1_000_000.0, 1) for v in valid_vals]
+                            return sum(rounded_m_vals) * 1_000_000.0
+                        return sum(valid_vals)
                     elif metric_key == "build":
                         def get_pos_sum_for_year_slice(yr_str, slc):
                             if not yr_str or yr_str not in data_by_year:
