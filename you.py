@@ -117,8 +117,8 @@ def fmt_val(val, unit, status):
     elif unit == "$M":
         val_m = val / 1_000_000.0
         if val_m < 0:
-            return f"-${abs(val_m):,.2f}"
-        return f"${val_m:,.2f}"
+            return f"-${abs(val_m):,.1f}"
+        return f"${val_m:,.1f}"
     elif unit == "UnitsM":
         val_m = val / 1_000_000.0
         if val_m < 0:
