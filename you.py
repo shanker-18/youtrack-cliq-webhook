@@ -734,9 +734,45 @@ def update_dashboard(n_clicks, gbu, squad, model, c_clicks, s_clicks, active_tab
                         valid_vals = [v for v in arr if v is not None and not (isinstance(v, float) and math.isnan(v))]
                         return sum(valid_vals) if valid_vals else None
                     elif metric_key == "build":
-                        arr = ym.get("build", [None]*12)[slice_obj]
-                        valid_vals = [v for v in arr if v is not None and not (isinstance(v, float) and math.isnan(v))]
-                        return (sum(valid_vals) / len(valid_vals)) if valid_vals else None
+                        def get_pos_sum_for_year_slice(yr_str, slc):
+                            if not yr_str or yr_str not in data_by_year:
+                                return None
+                            arr = data_by_year[yr_str]["pos_val"][slc]
+                            valid = [v for v in arr if v is not None and not (isinstance(v, float) and math.isnan(v))]
+                            return sum(valid) if valid else None
+
+                        curr_pos_sum = get_pos_sum_for_year_slice(target_yr, slice_obj)
+                        if curr_pos_sum is None or curr_pos_sum == 0:
+                            return None
+
+                        prev_pos_sum = None
+                        if slice_obj == slice(0, 3):  # Q1
+                            p_yr = str(int(target_yr) - 1) if target_yr.isdigit() else None
+                            prev_pos_sum = get_pos_sum_for_year_slice(p_yr, slice(9, 12))  # Previous Year Q4
+                        elif slice_obj == slice(3, 6):  # Q2
+                            prev_pos_sum = get_pos_sum_for_year_slice(target_yr, slice(0, 3))  # Current Year Q1
+                        elif slice_obj == slice(6, 9):  # Q3
+                            prev_pos_sum = get_pos_sum_for_year_slice(target_yr, slice(3, 6))  # Current Year Q2
+                        elif slice_obj == slice(9, 12):  # Q4
+                            prev_pos_sum = get_pos_sum_for_year_slice(target_yr, slice(6, 9))  # Current Year Q3
+                        elif slice_obj == slice(0, 12):  # FY
+                            p_yr = str(int(target_yr) - 1) if target_yr.isdigit() else None
+                            prev_pos_sum = get_pos_sum_for_year_slice(p_yr, slice(0, 12))  # Previous Year FY
+                        else:  # YTD / YTG
+                            start_idx = slice_obj.start or 0
+                            stop_idx = slice_obj.stop or 12
+                            length = stop_idx - start_idx
+                            if start_idx >= length:
+                                prev_slice = slice(start_idx - length, start_idx)
+                                prev_pos_sum = get_pos_sum_for_year_slice(target_yr, prev_slice)
+                            else:
+                                p_yr = str(int(target_yr) - 1) if target_yr.isdigit() else None
+                                prev_slice = slice(12 - (length - start_idx), 12)
+                                prev_pos_sum = get_pos_sum_for_year_slice(p_yr, prev_slice)
+
+                        if prev_pos_sum is not None and prev_pos_sum != 0:
+                            return curr_pos_sum / prev_pos_sum
+                        return None
                     elif metric_key == "asp":
                         pos_v_sum = sum([v for v in ym["pos_val"][slice_obj] if v is not None and not (isinstance(v, float) and math.isnan(v))])
                         pos_u_sum = sum([v for v in ym["pos_u"][slice_obj] if v is not None and not (isinstance(v, float) and math.isnan(v))])
