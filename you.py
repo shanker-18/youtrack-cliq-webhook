@@ -99,6 +99,8 @@ def calc_share(month_val, total_val):
  
  
 def fmt_val(val, unit, status):
+    if val == "-":
+        return "-"
     if status == "EMPTY" or val is None or (isinstance(val, float) and math.isnan(val)):
         return ""
 
@@ -115,13 +117,13 @@ def fmt_val(val, unit, status):
     elif unit == "$M":
         val_m = val / 1_000_000.0
         if val_m < 0:
-            return f"-${abs(val_m):,.1f}"
-        return f"${val_m:,.1f}"
+            return f"-${abs(val_m):,.2f}"
+        return f"${val_m:,.2f}"
     elif unit == "UnitsM":
         val_m = val / 1_000_000.0
         if val_m < 0:
-            return f"-{abs(val_m):,.1f}"
-        return f"{val_m:,.1f}"
+            return f"-{abs(val_m):,.2f}"
+        return f"{val_m:,.2f}"
     elif unit in ["$", "ASP"]:
         if val < 0:
             return f"-${abs(val):,.1f}"
@@ -766,8 +768,7 @@ def update_dashboard(n_clicks, gbu, squad, model, c_clicks, s_clicks, active_tab
                         elif slice_obj == slice(9, 12):  # Q4
                             prev_pos_sum = get_pos_sum_for_year_slice(target_yr, slice(6, 9))  # Current Year Q3
                         elif slice_obj == slice(0, 12):  # FY
-                            p_yr = str(int(target_yr) - 1) if target_yr.isdigit() else None
-                            prev_pos_sum = get_pos_sum_for_year_slice(p_yr, slice(0, 12))  # Previous Year FY
+                            return "-"
                         elif slice_obj == ytd_slice:  # YTD
                             # User formula: YTD of POS U / YTD of ASP
                             u_arr = ym.get("pos_u", [None]*12)[ytd_slice]
@@ -782,7 +783,14 @@ def update_dashboard(n_clicks, gbu, squad, model, c_clicks, s_clicks, active_tab
                                     if ytd_asp != 0:
                                         return round(ytd_pos_u / ytd_asp, 2)
                             return None
-                        else:  # YTG
+                        elif slice_obj == ytg_slice:  # YTG
+                            # User formula: YTG = YTG POS $ / YTD POS $
+                            ytg_pos = get_pos_sum_for_year_slice(target_yr, ytg_slice)
+                            ytd_pos = get_pos_sum_for_year_slice(target_yr, ytd_slice)
+                            if ytg_pos is not None and ytd_pos is not None and ytd_pos != 0:
+                                return round(ytg_pos / ytd_pos, 2)
+                            return None
+                        else:
                             start_idx = slice_obj.start or 0
                             stop_idx = slice_obj.stop or 12
                             length = stop_idx - start_idx
@@ -816,14 +824,14 @@ def update_dashboard(n_clicks, gbu, squad, model, c_clicks, s_clicks, active_tab
                         arr = ym.get(metric_key, [None]*12)[slice_obj]
                         valid_vals = [v for v in arr if v is not None and not (isinstance(v, float) and math.isnan(v))]
                         return sum(valid_vals) if valid_vals else None
- 
+
                 for idx, (yr, m_vals) in enumerate(yr_val_tuples):
                     td_cells = []
                     if idx == 0:
                         td_cells.append(html.Td(metric_name, rowSpan=group_size, style=label_td_style))
- 
+
                     is_grey_highlight = (yr in [latest_year, "YoY %"])
-                    yr_bg_color = "#b0dfd8" if is_grey_highlight else "#ffffff"
+                    yr_bg_color = "#f1ebfb" if is_grey_highlight else "#ffffff"
  
                     td_cells.append(html.Td(yr, style={
                         "backgroundColor": yr_bg_color, "color": "#000000",
@@ -991,7 +999,7 @@ def update_dashboard(n_clicks, gbu, squad, model, c_clicks, s_clicks, active_tab
                 pos_u_tuples.append(("YoY %", yoy_u))
                 asp_tuples.append(("YoY %", yoy_asp))
  
-                tbody_rows.extend(make_grouped_rows("POS $", "$RAW_M", pos_dollar_tuples, "pos_val", year_metrics))
+                tbody_rows.extend(make_grouped_rows("POS $", "$M", pos_dollar_tuples, "pos_val", year_metrics))
                 tbody_rows.extend(make_grouped_rows("FACTORY POS $", "$M", factory_pos_tuples, "factory_pos", year_metrics))
                 tbody_rows.extend(make_grouped_rows("POS U", "UnitsM", pos_u_tuples, "pos_u", year_metrics))
                 tbody_rows.extend(make_grouped_rows("ASP", "ASP", asp_tuples, "asp", year_metrics))
