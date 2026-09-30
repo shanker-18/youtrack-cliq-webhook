@@ -770,7 +770,7 @@ def update_dashboard(n_clicks, gbu, squad, model, c_clicks, s_clicks, active_tab
                         elif slice_obj == slice(0, 12):  # FY
                             return "-"
                         elif slice_obj == ytd_slice:  # YTD
-                            # User formula: YTD of POS U / YTD of ASP
+                            # User formula: YTD of POS U (in M) / YTD of ASP
                             u_arr = ym.get("pos_u", [None]*12)[ytd_slice]
                             v_arr = ym.get("pos_val", [None]*12)[ytd_slice]
                             valid_u = [v for v in u_arr if v is not None and not (isinstance(v, float) and math.isnan(v))]
@@ -781,7 +781,8 @@ def update_dashboard(n_clicks, gbu, squad, model, c_clicks, s_clicks, active_tab
                                 if ytd_pos_u != 0 and ytd_pos_v != 0:
                                     ytd_asp = ytd_pos_v / ytd_pos_u
                                     if ytd_asp != 0:
-                                        return round(ytd_pos_u / ytd_asp, 2)
+                                        ytd_pos_u_m = ytd_pos_u / 1_000_000.0
+                                        return round(ytd_pos_u_m / ytd_asp, 2)
                             return None
                         elif slice_obj == ytg_slice:  # YTG
                             # User formula: YTG = YTG POS $ / YTD POS $
