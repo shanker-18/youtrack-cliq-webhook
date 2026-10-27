@@ -1,100 +1,75 @@
-# pylint: disable=too-many-return-statements,too-many-nested-blocks,global-statement,too-many-lines
 """
-NA IBP Planning Application — Validation Calculations Engine
-============================================================
-Authoritative calculation engine for both Consumption and Shipment validation:
-- Uses services.kv_calendar.KenvueCalendar for pure 4-4-5 fiscal math (zero Excel dump dependency)
-- Price Index lookups using openpyxl & fallback maps
-- PostgreSQL Live Building Block additions (11 official POS adjustment blocks)
-- Statistical 2-sigma outlier detection on Build metrics
-- 100% Dynamic year and month rollover (no hardcoded years or cutoffs)
-- Pure Python implementation (zero pandas dependency)
+gts.py
+======
+Authoritative Calculation Engine and UI Presentation for GTS YoY Dashboard:
+1. Dynamic Years: Automatically detects plan_year and base_year (e.g. 2026 & 2025, or 2027 & 2026).
+2. Historical Year Row: {base_year} GTS $ pulled directly from Snowflake VW_FACT_F360_SHIPMENTS (in $M).
+3. 11 Building Block Drivers:
+     GTS Driver[m] = Consumption Building Block[m] * Price Index[m]
+     - Net Innovation = (Innovation GTS + Cannibalization GTS)
+     - Net Price = (Price GTS + Elasticity GTS)
+4. Current Year Row: {plan_year} GTS $ for each month is calculated as:
+     - Completed months (<= cutoff): Snowflake Actual GTS $
+     - Forecast months (> cutoff): Factory POS + Sum of Building Blocks
+5. GTS YoY % Row:
+     ((Plan GTS - Base GTS) / Base GTS) * 100
+6. NO Difference Row (as specified).
+7. Formatting: 1 decimal place (.1f) for all GTS $ currency values ($123.4M, -$5.6M), preventing -$0.0.
+8. 11-Tier Dynamic Heatmap Gradient with High Red (#FF6B6B).
 """
 
 import os
 import re
 import math
-import statistics
-from datetime import date, datetime
-from typing import Optional, Dict, List, Tuple, Any, Set
-import psycopg2
+import datetime
+from typing import Optional, Dict, List, Tuple, Any, Union
+from dotenv import load_dotenv
+from dash import html
 
-from config import config
-from database.connection import get_db_cursor
-from services.kv_calendar import KenvueCalendar, MONTH_NAMES, MONTH_ABBR
-from utils.constants import DRIVER_NET_INNOVATION, DRIVER_NET_PRICE
-from utils.logger import get_logger
+load_dotenv()
 
-logger = get_logger(__name__)
-
-MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
-
-MONTH_NUMBER_TO_3LETTER = {
-    1: "JAN", 2: "FEB", 3: "MAR", 4: "APR", 5: "MAY", 6: "JUN",
-    7: "JUL", 8: "AUG", 9: "SEP", 10: "OCT", 11: "NOV", 12: "DEC"
-}
+MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
 MONTH_NAME_MAP = {
-    "JAN": "JAN", "JANUARY": "JAN",
-    "FEB": "FEB", "FEBRUARY": "FEB",
-    "MAR": "MAR", "MARCH": "MAR",
-    "APR": "APR", "APRIL": "APR",
-    "MAY": "MAY",
-    "JUN": "JUN", "JUNE": "JUN",
-    "JUL": "JUL", "JULY": "JUL",
-    "AUG": "AUG", "AUGUST": "AUG",
-    "SEP": "SEP", "SEPTEMBER": "SEP",
-    "OCT": "OCT", "OCTOBER": "OCT",
-    "NOV": "NOV", "NOVEMBER": "NOV",
-    "DEC": "DEC", "DECEMBER": "DEC",
+    "JAN": 1, "JANUARY": 1, "FEB": 2, "FEBRUARY": 2, "MAR": 3, "MARCH": 3,
+    "APR": 4, "APRIL": 4, "MAY": 5, "JUN": 6, "JUNE": 6,
+    "JUL": 7, "JULY": 7, "AUG": 8, "AUGUST": 8, "SEP": 9, "SEPTEMBER": 9,
+    "OCT": 10, "OCTOBER": 10, "NOV": 11, "NOVEMBER": 11, "DEC": 12, "DECEMBER": 12
 }
 
-# 11 Official POS Adjustment Building Blocks
-ALLOWED_BUILDING_BLOCKS = [
-    "Base Trend",
-    "Season",
-    "Competition",
-    "Distribution",
-    DRIVER_NET_INNOVATION,
-    "Discontinuations",
-    "Renovation",
-    "Media",
-    "Trade",
-    DRIVER_NET_PRICE,
-    "Club",
-]
 
-RAW_BB_MAP = {
-    "BASE TREND": "Base Trend",
-    "SEASON": "Season",
-    "COMPETITION": "Competition",
-    "DISTRIBUTION": "Distribution",
-    "INNOVATION": DRIVER_NET_INNOVATION,
-    "CANNIBALIZATION": DRIVER_NET_INNOVATION,
-    "NET INNOVATION": DRIVER_NET_INNOVATION,
-    "DISCONTINUATIONS": "Discontinuations",
-    "RENOVATION": "Renovation",
-    "MEDIA": "Media",
-    "TRADE": "Trade",
-    "PRICE": DRIVER_NET_PRICE,
-    "ELASTICITY": DRIVER_NET_PRICE,
-    "NET PRICE": DRIVER_NET_PRICE,
-    "CLUB": "Club",
-}
+# ─── 0. DYNAMIC KENVUE 4-4-5 FISCAL CALENDAR (FROM kv_calender.py) ───────────
 
-_CACHED_PRICE_INDEX_MAP = None
+import sys
+import types
+
+if "config" not in sys.modules:
+    try:
+        import config  # type: ignore
+    except ImportError:
+        _cfg_mod = types.ModuleType("config")
+        _cfg_mod.Config = type("Config", (), {
+            "STANDARD_LOCK_POLICY": os.getenv("STANDARD_LOCK_POLICY", "THIRD_FRIDAY")
+        })
+        sys.modules["config"] = _cfg_mod
+
+from kv_calender import KenvueCalendar
 
 
-def get_current_kv_year() -> int:
-    """Helper to dynamically determine active Kenvue plan year."""
-    env_yr = os.getenv("IBP_PLAN_YEAR")
-    if env_yr and env_yr.isdigit():
-        return int(env_yr)
-    return KenvueCalendar.get_date_info(date.today()).kv_year
+def get_active_years() -> Tuple[int, int]:
+    """Dynamically determines base_year and plan_year using Kenvue 4-4-5 Fiscal Calendar."""
+    env_year = os.getenv("IBP_PLAN_YEAR")
+    if env_year and env_year.isdigit():
+        plan_year = int(env_year)
+    else:
+        today_info = KenvueCalendar.get_date_info(datetime.date.today())
+        plan_year = today_info.kv_year
+    base_year = plan_year - 1
+    return base_year, plan_year
 
 
 def normalize_text(val: Any) -> str:
-    """Normalize string consistently across Excel, PostgreSQL, and Snowflake."""
+    """Normalizes text values consistently."""
     if val is None:
         return ""
     s = str(val).replace("\xa0", " ").strip().upper()
@@ -103,1164 +78,915 @@ def normalize_text(val: Any) -> str:
     return re.sub(r"\s+", " ", s)
 
 
-def _normalize_numeric_month(val: Any) -> str:
-    try:
-        n = int(val)
-        if 1 <= n <= 12:
-            return MONTH_NUMBER_TO_3LETTER[n]
-    except (ValueError, TypeError, OverflowError):
-        pass
-    return ""
-
-
-def _parse_month_token(s: str) -> str:
-    for t in re.findall(r"[A-Z0-9]+", s):
-        if t in MONTH_NAME_MAP:
-            return MONTH_NAME_MAP[t]
-    m_iso = re.search(r"(\d{4})[-/](\d{1,2})", s)
-    if m_iso:
-        mo = int(m_iso.group(2))
-        if 1 <= mo <= 12:
-            return MONTH_NUMBER_TO_3LETTER[mo]
-    return ""
-
-
-def _normalize_string_month(s: str) -> str:
-    s_clean = s.strip().upper()
-    if not s_clean or s_clean in ("NAN", "NONE", "NULL", "N/A"):
-        return ""
-    if s_clean.isdigit():
-        return _normalize_numeric_month(s_clean)
-    return _parse_month_token(s_clean)
-
-
-def normalize_month_3letter(val: Any) -> str:
-    """Normalizes any month representation into standard 3-letter uppercase ('JAN'..'DEC')."""
+def parse_month_num(val: Any) -> Optional[int]:
+    """Extracts month number (1..12) from dates, numbers, or month names."""
     if val is None:
-        return ""
-    if isinstance(val, (date, datetime)):
-        return MONTH_NUMBER_TO_3LETTER.get(val.month, "")
-    if isinstance(val, (int, float)):
-        return _normalize_numeric_month(val)
-    return _normalize_string_month(str(val))
-
-
-# ─── 1. Kenvue Calendar 4-4-5 Fiscal Ranges via services.kv_calendar ─────────
-
-def get_kv_month_ranges(start_year: Optional[int] = None, end_year: Optional[int] = None) -> List[dict]:
-    """Generates Kenvue Fiscal Month date ranges dynamically using KenvueCalendar (Rolling Window)."""
-    curr_yr = get_current_kv_year()
-    s_yr = start_year if start_year is not None else (curr_yr - 5)
-    e_yr = end_year if end_year is not None else (curr_yr + 1)
-
-    ranges = []
-    for yr in range(s_yr, e_yr + 1):
-        for m in range(1, 13):
-            c_start, c_end = KenvueCalendar.get_cycle_bounds(yr, m)
-            ranges.append({
-                "year": yr,
-                "y_str": str(yr),
-                "m_nbr": m,
-                "kv_month": f"{yr}-{m:02d}",
-                "start": c_start.isoformat(),
-                "end": c_end.isoformat(),
-            })
-    return ranges
-
-
-def map_date_to_kv_calendar(d_val: Any) -> Optional[dict]:
-    """Maps date value to Kenvue Fiscal Calendar properties using KenvueCalendar."""
-    if not d_val:
         return None
-
-    dt_obj = None
-    if isinstance(d_val, (date, datetime)):
-        dt_obj = d_val if isinstance(d_val, date) else d_val.date()
-    else:
-        d_clean = str(d_val).strip()[:10]
-        try:
-            dt_obj = date.fromisoformat(d_clean)
-        except (ValueError, TypeError):
-            for fmt in ["%d-%b-%y", "%d-%b-%Y", "%m/%d/%Y", "%Y/%m/%d"]:
-                try:
-                    dt_obj = datetime.strptime(d_clean, fmt).date()
-                    break
-                except (ValueError, TypeError):
-                    pass
-
-    if not dt_obj:
-        return None
-
-    info = KenvueCalendar.get_date_info(dt_obj)
-    m_idx = info.kv_month_num - 1
-    m_name = MONTHS[m_idx]
-    y_str = str(info.kv_year)
-
-    return {
-        "m_idx": m_idx,
-        "m_nbr": info.kv_month_num,
-        "m_name": m_name,
-        "y_str": y_str,
-        "quarter": f"Q{info.kv_quarter}",
-        "kv_wk_id": f"{y_str}{info.kv_week_num:02d}",
-        "kv_mo_id": f"{y_str}{info.kv_month_num:02d}",
-        "kv_week_beginning": dt_obj.isoformat(),
-    }
+    if isinstance(val, (datetime.date, datetime.datetime)):
+        return val.month
+    s = str(val).strip().upper()
+    if s.isdigit():
+        n = int(s)
+        if 1 <= n <= 12:
+            return n
+    for k, v in MONTH_NAME_MAP.items():
+        if k in s:
+            return v
+    m_iso = re.search(r"[-/](\d{1,2})", s)
+    if m_iso:
+        n = int(m_iso.group(1))
+        if 1 <= n <= 12:
+            return n
+    return None
 
 
-def _update_latest_year(current_yr: Optional[str], candidate_yr: str) -> str:
-    if not current_yr or candidate_yr > current_yr:
-        return candidate_yr
-    return current_yr
-
-
-def _record_row_calendar_week(
-    r: Dict[str, Any], avail_weeks_by_month: dict, latest_yr: Optional[str]
-) -> Optional[str]:
-    d_str = str(r.get("GLOBAL_DATE_SHORT_DESC") or "").strip()
-    kv_info = map_date_to_kv_calendar(d_str) if d_str else None
-    if kv_info:
-        y_s = kv_info["y_str"]
-        m_n = kv_info["m_nbr"]
-        avail_weeks_by_month.setdefault((y_s, m_n), set()).add(d_str or kv_info["kv_wk_id"])
-        return _update_latest_year(latest_yr, y_s)
-
-    kv_m_str = str(r.get("KV_MONTH") or "").strip()
-    if "-" in kv_m_str:
-        parts = kv_m_str.split("-")
-        y_s = parts[0]
-        m_n = int(parts[1])
-        avail_weeks_by_month.setdefault((y_s, m_n), set()).add(d_str or kv_m_str)
-        return _update_latest_year(latest_yr, y_s)
-
-    return latest_yr
-
-
-def _record_row_completed_month(
-    r: Dict[str, Any], avail_weeks_by_month: dict, latest_yr: Optional[str]
-) -> Optional[str]:
-    if r.get("is_complete") is not True:
-        return latest_yr
-    kv_m = str(r.get("KV_MONTH") or "")
-    y_s = str(r.get("YEAR") or (kv_m.split("-", maxsplit=1)[0] if "-" in kv_m else ""))
-    m_n = int(r.get("MONTHNUMBER") or (kv_m.split("-", maxsplit=1)[1] if "-" in kv_m else 0))
-    if y_s and m_n:
-        avail_weeks_by_month.setdefault((y_s, m_n), set()).update({f"wk_{i}" for i in range(1, 6)})
-        return _update_latest_year(latest_yr, y_s)
-    return latest_yr
-
-
-def _collect_weeks_by_month(rows: List[Dict[str, Any]]) -> Tuple[dict, Optional[str]]:
-    avail_weeks_by_month: dict = {}
-    latest_yr_found: Optional[str] = None
-
-    for r in rows:
-        latest_yr_found = _record_row_calendar_week(r, avail_weeks_by_month, latest_yr_found)
-        latest_yr_found = _record_row_completed_month(r, avail_weeks_by_month, latest_yr_found)
-
-    return avail_weeks_by_month, latest_yr_found
-
-
-def _evaluate_month_completeness_details(
-    avail_weeks_by_month: dict, target_yr: str, target_yr_int: int
-) -> Tuple[dict, int]:
-    month_details = {}
-    latest_complete_m_nbr = 0
-
-    for m_n in range(1, 13):
-        req_wks = KenvueCalendar.get_month_week_count(target_yr_int, m_n)
-        avail_set = avail_weeks_by_month.get((target_yr, m_n), set())
-        avail_wks = len(avail_set)
-        is_comp = (avail_wks >= req_wks) if req_wks > 0 else False
-
-        month_details[m_n] = {
-            "required_wks": req_wks,
-            "available_wks": avail_wks,
-            "is_complete": is_comp,
-        }
-        if is_comp and m_n == latest_complete_m_nbr + 1:
-            latest_complete_m_nbr = m_n
-
-    if latest_complete_m_nbr == 0:
-        for m_n in range(1, 13):
-            if month_details[m_n]["is_complete"]:
-                latest_complete_m_nbr = m_n
-
-    return month_details, latest_complete_m_nbr
-
-
-def get_kv_month_completeness_status(rows: List[Dict[str, Any]], target_year: Optional[str] = None) -> dict:
-    """
-    Evaluates month completeness dynamically without hardcoded fallback years.
-    """
-    avail_weeks_by_month, latest_yr_found = _collect_weeks_by_month(rows)
-
-    curr_kv_yr = get_current_kv_year()
-    target_yr = str(target_year) if target_year else (latest_yr_found or str(curr_kv_yr))
-    target_yr_int = int(target_yr) if target_yr.isdigit() else curr_kv_yr
-
-    month_details, latest_complete_m_nbr = _evaluate_month_completeness_details(
-        avail_weeks_by_month, target_yr, target_yr_int
+def get_postgres_connection():
+    """Connects to PostgreSQL na_ibp_db."""
+    import psycopg2
+    return psycopg2.connect(
+        host=os.getenv("IBP_DB_HOST", "localhost"),
+        port=int(os.getenv("IBP_DB_PORT", "5432")),
+        dbname=os.getenv("IBP_DB_NAME", "na_ibp_db"),
+        user=os.getenv("IBP_DB_USER", "postgres"),
+        password=os.getenv("IBP_DB_PASSWORD", "postgres"),
+        sslmode=os.getenv("IBP_DB_SSLMODE", "prefer"),
+        connect_timeout=5,
     )
 
-    if latest_complete_m_nbr == 0:
-        latest_complete_m_idx = -1
-        m_name = "NONE"
-        ytd_s = [0, 0]
-        ytg_s = [0, 12]
-    else:
-        latest_complete_m_idx = latest_complete_m_nbr - 1
-        m_name = MONTHS[latest_complete_m_idx] if 0 <= latest_complete_m_idx < 12 else "DEC"
-        ytd_s = [0, latest_complete_m_nbr]
-        ytg_s = [latest_complete_m_nbr, 12]
 
-    return {
-        "latest_year": target_yr,
-        "latest_complete_m_nbr": latest_complete_m_nbr,
-        "latest_complete_m_idx": latest_complete_m_idx,
-        "latest_complete_m_name": m_name,
-        "ytd_slice": ytd_s,
-        "ytg_slice": ytg_s,
-        "month_details": month_details,
+def get_snowflake_connection():
+    """Connects to Snowflake using RSA Private Key or password credentials."""
+    import snowflake.connector
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.backends import default_backend
+
+    config = {
+        "user": os.getenv("SNOWFLAKE_USER", "SA-JX2-SNFK-CVD-RPT@KENVUE.COM"),
+        "account": os.getenv("SNOWFLAKE_ACCOUNT", "BK40750.east-us-2.azure"),
+        "warehouse": os.getenv("SNOWFLAKE_WAREHOUSE", "PROD_ENVIRONMENT_USAGE_XSMALL1_WH"),
+        "database": os.getenv("SNOWFLAKE_DATABASE", "PROD_CVD_DISC"),
+        "schema": os.getenv("SNOWFLAKE_SCHEMA", "NAIBP_ACCESS"),
+        "role": os.getenv("SNOWFLAKE_ROLE", "PROD_SA_JX2_SNFK_CVD_RPT_ER"),
     }
+    private_key_path = os.getenv("SNOWFLAKE_PRIVATE_KEY_PATH")
+    private_key_pem = os.getenv("SNOWFLAKE_PRIVATE_KEY")
+    passphrase = os.getenv("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE")
+
+    if private_key_path or private_key_pem:
+        try:
+            if private_key_path and os.path.exists(private_key_path):
+                with open(private_key_path, "rb") as k_file:
+                    p_key = serialization.load_pem_private_key(
+                        k_file.read(),
+                        password=passphrase.encode() if passphrase else None,
+                        backend=default_backend()
+                    )
+            elif private_key_pem:
+                pem_clean = private_key_pem.strip('"\'').replace("\\n", "\n")
+                p_key = serialization.load_pem_private_key(
+                    pem_clean.encode(),
+                    password=passphrase.encode() if passphrase else None,
+                    backend=default_backend()
+                )
+            else:
+                p_key = None
+
+            if p_key:
+                pkb = p_key.private_bytes(
+                    encoding=serialization.Encoding.DER,
+                    format=serialization.PrivateFormat.PKCS8,
+                    encryption_algorithm=serialization.NoEncryption()
+                )
+                config["private_key"] = pkb
+        except Exception as e:
+            print(f"[Snowflake Key Notice]: {e}")
+            if os.getenv("SNOWFLAKE_PASSWORD"):
+                config["password"] = os.getenv("SNOWFLAKE_PASSWORD")
+    elif os.getenv("SNOWFLAKE_PASSWORD"):
+        config["password"] = os.getenv("SNOWFLAKE_PASSWORD")
+
+    return snowflake.connector.connect(**config)
 
 
-# ─── 2. Price Index Reference & Factory POS Calculations ─────────────────────
+# ─── DRIVER ROW DEFINITIONS (MATCHING CONSUMPTION & GTS DASHBOARD) ───────────
 
-def _find_price_index_headers(rows: list) -> Tuple[Optional[int], Optional[int], Optional[int], int]:
-    hdr_idx = 0
-    for idx, r in enumerate(rows[:5]):
-        r_strs = [str(c).upper() for c in r if c is not None]
-        if any("MNTH" in c or "MONTH" in c for c in r_strs) and any("MODEL" in c for c in r_strs):
-            hdr_idx = idx
-            break
-
-    hdr = [str(c).strip().upper() if c else "" for c in rows[hdr_idx]]
-    mnth_i = next((i for i, c in enumerate(hdr) if "MNTH" in c or "MONTH" in c), None)
-    model_i = next((i for i, c in enumerate(hdr) if "MODEL" in c), None)
-    index_i = next((i for i, c in enumerate(hdr) if "INDEX" in c), None)
-    return mnth_i, model_i, index_i, hdr_idx
-
-
-def _parse_price_index_sheet_rows(rows: list, lookup: dict):
-    if len(rows) < 2:
-        return
-    mnth_i, model_i, index_i, hdr_idx = _find_price_index_headers(rows)
-    if mnth_i is None or model_i is None or index_i is None:
-        return
-
-    for data_row in rows[hdr_idx + 1:]:
-        if len(data_row) > max(mnth_i, model_i, index_i):
-            norm_m = normalize_month_3letter(data_row[mnth_i])
-            norm_mod = normalize_text(data_row[model_i])
-            idx_raw = data_row[index_i]
-            if norm_m and norm_mod and idx_raw is not None:
-                try:
-                    lookup[(norm_m, norm_mod)] = float(idx_raw)
-                except (ValueError, TypeError):
-                    pass
+DRIVER_ROW_DEFINITIONS = [
+    # (Category Group, Display Name, DB Match Key)
+    ("External",     "Base Trend",          "BASE TREND"),
+    ("External",     "Season",              "SEASON"),
+    ("External",     "Competition",         "COMPETITION"),
+    ("Distribution", "Distribution",        "DISTRIBUTION"),
+    ("Innovation",   "Net Innovation",      "COMPOUND_NET_INNOVATION"),  # Innovation + Cannibalization
+    ("Innovation",   "Innovation",          "INNOVATION"),
+    ("Innovation",   "Cannibalization",     "CANNIBALIZATION"),
+    ("Innovation",   "Discontinuations",    "DISCONTINUATIONS"),
+    ("Innovation",   "Renovations",         "RENOVATION"),
+    ("Investment",   "Media",               "MEDIA"),
+    ("Investment",   "Trade",               "TRADE"),
+    ("Price",        "Net Price",           "COMPOUND_NET_PRICE"),       # Price + Elasticity
+    ("Price",        "Price",               "PRICE"),
+    ("Price",        "Elasticity",          "ELASTICITY"),
+    ("Other",        "Club",                "CLUB"),
+    ("Other",        "Other (Not Defined)", "OTHER"),
+]
 
 
-def _load_price_index_from_excel(candidate_paths: list) -> dict:
-    lookup = {}
-    try:
-        import openpyxl
-        for cand in candidate_paths:
-            if cand and os.path.exists(cand):
-                try:
-                    wb = openpyxl.load_workbook(cand, data_only=True, read_only=True)
-                    ws = wb["Price Index"] if "Price Index" in wb.sheetnames else wb.active
-                    rows = list(ws.iter_rows(values_only=True))
-                    wb.close()
-                    _parse_price_index_sheet_rows(rows, lookup)
-                    if lookup:
-                        break
-                except (OSError, IOError, ValueError, KeyError) as e:
-                    logger.warning("Notice reading Price Index via openpyxl: %s", e)
-    except ImportError:
-        pass
-    return lookup
+# ─── 1. POSTGRESQL HIERARCHY RULES ──────────────────────────────────────────
 
-
-def load_price_index_map() -> dict:
-    """Loads Price Index multipliers from file or openpyxl into (norm_month, norm_model) -> multiplier."""
-    global _CACHED_PRICE_INDEX_MAP
-    if _CACHED_PRICE_INDEX_MAP is not None:
-        return _CACHED_PRICE_INDEX_MAP
-
-    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    candidate_paths = [
-        config.PRICE_INDEX_EXCEL_PATH,
-        os.path.join(base_dir, "validation", "Price Index.xlsx"),
-        os.path.join(base_dir, "data", "Price Index.xlsx"),
-    ]
-
-    lookup = _load_price_index_from_excel(candidate_paths)
-
-    # Built-in fallbacks for standard OTC models
-    adult_sudafed_indices = {
-        "JAN": 0.7600, "FEB": 0.7800, "MAR": 0.7500, "APR": 0.7400,
-        "MAY": 0.7300, "JUN": 0.7200, "JUL": 0.7100, "AUG": 0.7000,
-        "SEP": 0.7500, "OCT": 0.7700, "NOV": 0.7900, "DEC": 0.8000,
-    }
-    for m, val in adult_sudafed_indices.items():
-        lookup.setdefault((m, "ADULT SUDAFED"), val)
-
-    _CACHED_PRICE_INDEX_MAP = lookup
-    return lookup
-
-
-def get_factory_pos_val(month_num: int, model_name: str | list[str], pos_val: float | None) -> Tuple[float | None, float]:
-    """Calculates Factory POS $ = POS $ * Price Index multiplier."""
-    if pos_val is None:
-        return None, 1.0
-    norm_m = normalize_month_3letter(month_num)
-    idx_map = load_price_index_map()
-    if isinstance(model_name, (list, tuple, set)):
-        clean_models = [normalize_text(m) for m in model_name if m]
-        indices = [idx_map.get((norm_m, m), 1.0) for m in clean_models if (norm_m, m) in idx_map]
-        index_val = (sum(indices) / len(indices)) if indices else 1.0
+def load_model_rules(models: Union[str, List[str]]) -> List[Dict[str, str]]:
+    """Loads product hierarchy rules (C1..C5, B1..B2) for selected model(s)."""
+    if isinstance(models, str):
+        model_list = [models.strip()]
     else:
-        norm_model = normalize_text(model_name)
-        index_val = idx_map.get((norm_m, norm_model), 1.0)
-    return float(pos_val) * index_val, index_val
+        model_list = [str(m).strip() for m in models if m]
 
-
-# ─── 3. Live PostgreSQL Building Block Planning Values ───────────────────────
-
-def load_live_building_blocks(domain: str = "CONSUMPTION") -> List[Dict[str, Any]]:
-    """
-    Queries live PostgreSQL planning rows and values for active building blocks.
-    Returns list of dicts: [{'model': ..., 'period_month': ..., 'building_block': ..., 'value_in_thousands': ...}].
-    """
-    table_prefix = "shipment" if domain.upper() == "SHIPMENT" else "consumption"
-    sql = f"""
-    SELECT
-        hm.model_name AS model,
-        DATE_TRUNC('month', pv.period_month)::date AS period_month,
-        bb.name AS building_block,
-        SUM(pv.value_in_thousands) AS value_in_thousands
-    FROM public.{table_prefix}_planning_rows pr
-    INNER JOIN public.{table_prefix}_building_blocks bb
-        ON pr.building_block_id = bb.block_id
-    INNER JOIN public.{table_prefix}_planning_values pv
-        ON pr.row_id = pv.row_id
-    INNER JOIN public.master_models hm
-        ON pr.model_id = hm.model_id
-    WHERE
-        pr.is_deleted = FALSE
-        AND bb.is_active = TRUE
-        AND hm.is_active = TRUE
-    GROUP BY
-        hm.model_name,
-        DATE_TRUNC('month', pv.period_month),
-        bb.name
-    ORDER BY
-        hm.model_name,
-        period_month,
-        bb.name;
-    """
-    try:
-        with get_db_cursor(commit=False) as cur:
-            cur.execute(sql)
-            raw_rows = cur.fetchall()
-    except (psycopg2.Error, OSError, RuntimeError) as err:
-        logger.warning("Could not query live building blocks: %s", err)
+    if not model_list:
         return []
 
-    result = []
-    for r in raw_rows:
-        result.append({
-            "model": str(r["model"]).strip(),
-            "period_month": r["period_month"],
-            "building_block": str(r["building_block"]).strip(),
-            "value_in_thousands": float(r["value_in_thousands"] or 0.0),
-        })
-    return result
-
-
-def _matches_period(p_val: Any, year: int, month_nbr: int) -> bool:
-    if not p_val:
-        return False
-    dt = p_val if isinstance(p_val, date) else date.fromisoformat(str(p_val)[:10])
-    return dt.year == year and dt.month == month_nbr
-
-
-def _matches_consumption_bb_row(r: Dict[str, Any], norm_targets: Set[str], year: int, month_nbr: int) -> bool:
-    if normalize_text(r.get("model", "")) not in norm_targets:
-        return False
-    if normalize_text(r.get("building_block", "")) not in RAW_BB_MAP:
-        return False
-    return _matches_period(r.get("period_month"), year, month_nbr)
-
-
-def get_building_block_total_for_period(
-    model_name: str | list[str], year: int, month_nbr: int, bb_rows: List[Dict[str, Any]]
-) -> float:
-    """Returns total building block planning value in thousands ($K) for model(s) in period year-month."""
-    if not bb_rows or not model_name:
-        return 0.0
-
-    if isinstance(model_name, (list, tuple, set)):
-        norm_targets = {normalize_text(m) for m in model_name if m}
-    else:
-        norm_targets = {normalize_text(model_name)}
-
-    return sum(
-        float(r.get("value_in_thousands") or 0.0)
-        for r in bb_rows
-        if _matches_consumption_bb_row(r, norm_targets, year, month_nbr)
-    )
-
-
-SHIPMENT_ALLOWED_BUILDING_BLOCKS = ["Innovation", "Trade", "Club", "Retailer Inventory"]
-
-
-def map_shipment_bb_name(raw_name: str) -> Optional[str]:
-    """Maps Shipment Building Block PostgreSQL names to standard logical names."""
-    if not raw_name:
-        return None
-    norm = normalize_text(raw_name)
-    if "INNOVATION" in norm:
-        res = "Innovation"
-    elif "TRADE" in norm:
-        res = "Trade"
-    elif "CLUB" in norm:
-        res = "Club"
-    elif "INVENTORY" in norm or "RETAILER" in norm:
-        res = "Retailer Inventory"
-    else:
-        res = None
-    return res
-
-
-def _matches_shipment_bb_row(r: Dict[str, Any], norm_targets: Set[str], year: int, month_nbr: int) -> bool:
-    if normalize_text(r.get("model", "")) not in norm_targets:
-        return False
-    if not map_shipment_bb_name(r.get("building_block", "")):
-        return False
-    return _matches_period(r.get("period_month"), year, month_nbr)
-
-
-def get_shipment_building_block_total_for_period(
-    model_name: str | list[str], year: int, month_nbr: int, bb_rows: List[Dict[str, Any]]
-) -> float:
-    """Returns total shipment building block planning value in thousands ($K) for model(s) in period year-month."""
-    if not bb_rows or not model_name:
-        return 0.0
-
-    if isinstance(model_name, (list, tuple, set)):
-        norm_targets = {normalize_text(m) for m in model_name if m}
-    else:
-        norm_targets = {normalize_text(model_name)}
-
-    return sum(
-        float(r.get("value_in_thousands") or 0.0)
-        for r in bb_rows
-        if _matches_shipment_bb_row(r, norm_targets, year, month_nbr)
-    )
-
-
-def _extract_row_year_and_month_idx(r: Dict[str, Any]) -> Tuple[Optional[str], Optional[int]]:
-    kv_m_str = str(r.get("KV_MONTH") or "").strip()
-    if kv_m_str and "-" in kv_m_str:
-        parts = kv_m_str.split("-")
-        return parts[0], int(parts[1]) - 1
-
-    d_str = str(r.get("GLOBAL_DATE_SHORT_DESC") or "").strip()
-    kv_info = map_date_to_kv_calendar(d_str)
-    if kv_info:
-        return kv_info["y_str"], kv_info["m_idx"]
-
-    return None, None
-
-
-def _accumulate_pos_maps(
-    r: Dict[str, Any],
-    pos_val_map: Dict[Tuple[str, int], float],
-    pos_u_map: Dict[Tuple[str, int], float],
-) -> None:
-    y_str, m_idx = _extract_row_year_and_month_idx(r)
-    curr_yr = get_current_kv_year()
-    # Dynamic rolling 5-year floor
-    if not y_str or m_idx is None or (y_str.isdigit() and int(y_str) < (curr_yr - 5)):
-        return
-
-    pv = r.get("POS_VALUE") if r.get("POS_VALUE") is not None else r.get("POS_DOLLARS")
-    pu = r.get("POS_UNITS")
-    key = (str(y_str), m_idx)
-    if pv is not None:
-        pos_val_map[key] = pos_val_map.get(key, 0.0) + float(pv)
-    if pu is not None:
-        pos_u_map[key] = pos_u_map.get(key, 0.0) + float(pu)
-
-
-def _build_factory_pos_map(
-    pos_val_map: Dict[Tuple[str, int], float], model_name: str | list[str]
-) -> Dict[Tuple[str, int], float]:
-    factory_pos_map: Dict[Tuple[str, int], float] = {}
-    for (y_str, m_idx), pv_val in pos_val_map.items():
-        f_pos, _ = get_factory_pos_val(m_idx + 1, model_name, pv_val)
-        factory_pos_map[(str(y_str), m_idx)] = f_pos if f_pos is not None else pv_val
-    return factory_pos_map
-
-
-def extract_consumption_maps(
-    rows_cons: List[Dict[str, Any]], model_name: str | list[str]
-) -> Tuple[Dict[Tuple[str, int], float], Dict[Tuple[str, int], float], Dict[Tuple[str, int], float]]:
-    """
-    Extracts factory_pos_map, pos_val_map, pos_u_map from Snowflake consumption rows.
-    Returns: (factory_pos_map, pos_val_map, pos_u_map) keyed by (year_str, month_idx 0..11).
-    """
-    if not rows_cons:
-        return {}, {}, {}
-
-    pos_val_map: Dict[Tuple[str, int], float] = {}
-    pos_u_map: Dict[Tuple[str, int], float] = {}
-
-    for r in rows_cons:
-        _accumulate_pos_maps(r, pos_val_map, pos_u_map)
-
-    factory_pos_map = _build_factory_pos_map(pos_val_map, model_name)
-    return factory_pos_map, pos_val_map, pos_u_map
-
-
-# ─── 4. Full Metrics Matrix Calculators ───────────────────────────────────────
-
-def calc_asp(pos_val: Optional[float], pos_units: Optional[float]) -> Optional[float]:
-    if pos_val is None or pos_units is None or pos_units == 0:
-        return None
-    return pos_val / pos_units
-
-
-def calc_pct_var(actual: Optional[float], comparison: Optional[float]) -> Optional[float]:
-    if actual is None or comparison is None or comparison == 0:
-        return None
-    return ((actual - comparison) / abs(comparison)) * 100.0
-
-
-def calc_share(month_val: Optional[float], total_val: Optional[float]) -> Optional[float]:
-    if month_val is None or total_val is None or total_val == 0:
-        return None
-    return (month_val / total_val) * 100.0
-
-
-def _accumulate_year_consumption_metrics(
-    r: Dict[str, Any], data_by_year: Dict[str, Dict[str, List[Optional[float]]]]
-) -> None:
-    y_str, m_idx = _extract_row_year_and_month_idx(r)
-    curr_yr = get_current_kv_year()
-    # Dynamic rolling 5-year floor
-    if not y_str or m_idx is None or (y_str.isdigit() and int(y_str) < (curr_yr - 5)):
-        return
-
-    if y_str not in data_by_year:
-        data_by_year[y_str] = {
-            "pos_val": [None] * 12,
-            "factory_pos": [None] * 12,
-            "pos_u": [None] * 12,
-        }
-    d_dict = data_by_year[y_str]
-    pv = r.get("POS_VALUE") or r.get("POS_DOLLARS")
-    pu = r.get("POS_UNITS")
-
-    if pv is not None:
-        d_dict["pos_val"][m_idx] = (d_dict["pos_val"][m_idx] or 0.0) + float(pv)
-    if pu is not None:
-        d_dict["pos_u"][m_idx] = (d_dict["pos_u"][m_idx] or 0.0) + float(pu)
-
-
-def _aggregate_consumption_sf_rows(rows_sf: List[Dict[str, Any]]) -> Dict[str, Dict[str, List[Optional[float]]]]:
-    data_by_year: Dict[str, Dict[str, List[Optional[float]]]] = {}
-    for r in rows_sf:
-        _accumulate_year_consumption_metrics(r, data_by_year)
-    return data_by_year
-
-
-def _extract_ytd_slice(comp_status: Dict[str, Any]) -> slice:
-    ytd_s_raw = comp_status.get("ytd_slice")
-    if isinstance(ytd_s_raw, (list, tuple)) and len(ytd_s_raw) >= 2:
-        return slice(ytd_s_raw[0], ytd_s_raw[1])
-    if isinstance(ytd_s_raw, slice):
-        return ytd_s_raw
-    return slice(0, 0)
-
-
-def _compute_projected_asp(
-    data_by_year: Dict[str, Dict[str, List[Optional[float]]]],
-    latest_year: str,
-    prev_year: str,
-    m_i: int,
-    prev_yr_pos: float,
-    ytd_slice: slice,
-) -> Optional[float]:
-    prev_yr_u = data_by_year.get(prev_year, {}).get("pos_u", [None] * 12)[m_i]
-    if not prev_yr_u or prev_yr_u <= 0:
-        return None
-
-    prev_same_asp = prev_yr_pos / prev_yr_u
-    curr_ytd_v = sum(v for v in data_by_year[latest_year]["pos_val"][ytd_slice] if v is not None)
-    curr_ytd_u = sum(u for u in data_by_year[latest_year]["pos_u"][ytd_slice] if u is not None)
-    prev_ytd_v = sum(v for v in data_by_year.get(prev_year, {}).get("pos_val", [None] * 12)[ytd_slice] if v is not None)
-    prev_ytd_u = sum(u for u in data_by_year.get(prev_year, {}).get("pos_u", [None] * 12)[ytd_slice] if u is not None)
-
-    curr_asp_ytd = (curr_ytd_v / curr_ytd_u) if curr_ytd_u > 0 else 0
-    prev_asp_ytd = (prev_ytd_v / prev_ytd_u) if prev_ytd_u > 0 else 0
-    yoy_asp_pct = ((curr_asp_ytd - prev_asp_ytd) / prev_asp_ytd) if prev_asp_ytd > 0 else 0.0
-
-    return prev_same_asp * (1.0 + yoy_asp_pct)
-
-
-def _project_consumption_future_months(
-    data_by_year: Dict[str, Dict[str, List[Optional[float]]]],
-    latest_year: str,
-    prev_year: str,
-    latest_year_int: int,
-    latest_comp_m_nbr: int,
-    model_name: str | list[str],
-    comp_status: Dict[str, Any],
-):
-    if latest_comp_m_nbr >= 12:
-        return
-    bb_rows = load_live_building_blocks(domain="CONSUMPTION")
-    ytd_slice = _extract_ytd_slice(comp_status)
-
-    for m_n in range(latest_comp_m_nbr + 1, 13):
-        m_i = m_n - 1
-        prev_yr_pos = data_by_year.get(prev_year, {}).get("pos_val", [None] * 12)[m_i]
-        if prev_yr_pos is None:
-            continue
-        tot_bb_k = get_building_block_total_for_period(model_name, latest_year_int, m_n, bb_rows)
-        calc_pos_usd = prev_yr_pos + (tot_bb_k * 1000.0)
-        data_by_year[latest_year]["pos_val"][m_i] = calc_pos_usd
-
-        f_pos, _ = get_factory_pos_val(m_n, model_name, calc_pos_usd)
-        data_by_year[latest_year]["factory_pos"][m_i] = f_pos
-
-        proj_asp = _compute_projected_asp(data_by_year, latest_year, prev_year, m_i, prev_yr_pos, ytd_slice)
-        if proj_asp and proj_asp > 0:
-            data_by_year[latest_year]["pos_u"][m_i] = calc_pos_usd / proj_asp
-
-
-def _calculate_single_year_consumption_metrics(
-    d: Dict[str, List[Optional[float]]],
-    prev_yr_dec_pos: Optional[float],
-    prev_yr_dec_asp: Optional[float],
-) -> Dict[str, Any]:
-    asp = [None] * 12
-    for i in range(12):
-        c_asp = calc_asp(d["pos_val"][i], d["pos_u"][i])
-        if c_asp is not None:
-            asp[i] = c_asp
-        elif i > 0:
-            asp[i] = asp[i - 1]
-        else:
-            asp[i] = prev_yr_dec_asp
-
-    build = [None] * 12
-    for i in range(12):
-        cur_p = d["pos_val"][i]
-        prev_p = d["pos_val"][i - 1] if i > 0 else prev_yr_dec_pos
-        if cur_p is not None and prev_p is not None and prev_p != 0:
-            build[i] = round(cur_p / prev_p, 2)
-
-    tot_p = sum(v for v in d["pos_val"] if v is not None and not (isinstance(v, float) and math.isnan(v)))
-    share = [calc_share(d["pos_val"][i], tot_p) for i in range(12)]
-
-    return {
-        "pos_val": d["pos_val"],
-        "factory_pos": d["factory_pos"],
-        "pos_u": d["pos_u"],
-        "asp": asp,
-        "build": build,
-        "share": share,
-    }
-
-
-def _calculate_consumption_year_metrics(
-    data_by_year: Dict[str, Dict[str, List[Optional[float]]]],
-    all_years: List[str],
-) -> Dict[str, Dict[str, Any]]:
-    year_metrics = {}
-    for yr in all_years:
-        d = data_by_year[yr]
-        prev_yr_str = str(int(yr) - 1) if yr.isdigit() else None
-        prev_yr_dec_pos = None
-        prev_yr_dec_asp = None
-        if prev_yr_str and prev_yr_str in data_by_year:
-            prev_yr_dec_pos = data_by_year[prev_yr_str]["pos_val"][11]
-            p_v = data_by_year[prev_yr_str]["pos_val"][11]
-            p_u = data_by_year[prev_yr_str]["pos_u"][11]
-            if p_v is not None and p_u is not None and p_u != 0:
-                prev_yr_dec_asp = p_v / p_u
-        year_metrics[yr] = _calculate_single_year_consumption_metrics(d, prev_yr_dec_pos, prev_yr_dec_asp)
-    return year_metrics
-
-
-def _detect_consumption_build_outliers(
-    year_metrics: Dict[str, Dict[str, Any]],
-    latest_year: str,
-    hist_years: List[str],
-) -> Dict[int, bool]:
-    red_outliers = {}
-    for m_idx in range(12):
-        cur_b = year_metrics[latest_year]["build"][m_idx]
-        if cur_b is not None:
-            hist_b = [year_metrics[h_yr]["build"][m_idx] for h_yr in hist_years if year_metrics.get(h_yr, {}).get("build", [None] * 12)[m_idx] is not None]
-            if len(hist_b) >= 2:
-                h_mean = statistics.mean(hist_b)
-                h_std = statistics.stdev(hist_b)
-                if abs(cur_b - h_mean) > (2.0 * h_std):
-                    red_outliers[m_idx] = True
-    return red_outliers
-
-
-def build_consumption_matrix(rows_sf: List[Dict[str, Any]], model_name: str | list[str]) -> Dict[str, Any]:
-    """
-    Computes complete Consumption Validation matrix from Snowflake weekly data and live DB building blocks.
-    Dynamically rolls years based on active fiscal year.
-    """
-    if not rows_sf:
-        return {}
-
-    data_by_year = _aggregate_consumption_sf_rows(rows_sf)
-
-    curr_kv_year = get_current_kv_year()
-    # Dynamic rolling 5-year window: e.g. 2022..2026 for 2026, or 2023..2027 for 2027
-    min_year = curr_kv_year - 4
-    all_years = sorted([yr for yr in data_by_year if yr.isdigit() and int(yr) >= min_year])
-    if not all_years:
-        all_years = sorted([yr for yr in data_by_year if yr.isdigit()])
-    if not all_years:
-        return {}
-
-    latest_year = all_years[-1]
-    prev_year = str(int(latest_year) - 1)
-    latest_year_int = int(latest_year)
-    hist_years = [str(latest_year_int - 5 + i) for i in range(5) if str(latest_year_int - 5 + i) in data_by_year]
-
-    # Calculate Factory POS using Price Index multipliers
-    for yr_k in all_years:
-        for m_i in range(12):
-            pv_val = data_by_year[yr_k]["pos_val"][m_i]
-            if pv_val is not None:
-                f_pos, _ = get_factory_pos_val(m_i + 1, model_name, pv_val)
-                data_by_year[yr_k]["factory_pos"][m_i] = f_pos
-
-    # Completeness check & nullify incomplete months
-    comp_status = get_kv_month_completeness_status(rows_sf, target_year=latest_year)
-    for yr_k in all_years:
-        yr_comp = get_kv_month_completeness_status(rows_sf, target_year=yr_k)
-        yr_m_details = yr_comp.get("month_details", {})
-        for m_n in range(1, 13):
-            if not yr_m_details.get(m_n, {}).get("is_complete", False):
-                m_i = m_n - 1
-                data_by_year[yr_k]["pos_val"][m_i] = None
-                data_by_year[yr_k]["pos_u"][m_i] = None
-                data_by_year[yr_k]["factory_pos"][m_i] = None
-
-    _project_consumption_future_months(
-        data_by_year, latest_year, prev_year, latest_year_int, comp_status["latest_complete_m_nbr"], model_name, comp_status
-    )
-    year_metrics = _calculate_consumption_year_metrics(data_by_year, all_years)
-    red_outliers = _detect_consumption_build_outliers(year_metrics, latest_year, hist_years)
-
-    return {
-        "all_years": all_years,
-        "latest_year": latest_year,
-        "prev_year": prev_year,
-        "year_metrics": year_metrics,
-        "comp_status": comp_status,
-        "red_outliers": red_outliers,
-        "data_by_year": data_by_year,
-    }
-
-
-def _is_valid_numeric_val(val: Any) -> bool:
-    return val is not None and not (isinstance(val, float) and (math.isnan(val) or math.isinf(val)))
-
-
-def _accumulate_shipment_row(
-    r: Dict[str, Any], data_by_year: Dict[str, Dict[str, List[Optional[float]]]]
-) -> None:
-    yr = str(r.get("YEAR") or 0)
-    m_nbr = int(r.get("MONTHNUMBER") or 0)
-    curr_kv_year = get_current_kv_year()
-    # Dynamic rolling floor
-    min_year = curr_kv_year - 4
-    if not yr.isdigit() or int(yr) < min_year or m_nbr < 1 or m_nbr > 12:
-        return
-    m_idx = m_nbr - 1
-    if yr not in data_by_year:
-        data_by_year[yr] = {"gts_val": [None] * 12, "gts_qty": [None] * 12}
-    amt_raw = r.get("GTS_AMT")
-    qty_raw = r.get("GTS_QTY")
-    if _is_valid_numeric_val(amt_raw):
-        data_by_year[yr]["gts_val"][m_idx] = (data_by_year[yr]["gts_val"][m_idx] or 0.0) + float(amt_raw)
-    if _is_valid_numeric_val(qty_raw):
-        q_num = float(qty_raw)
-        data_by_year[yr]["gts_qty"][m_idx] = (data_by_year[yr]["gts_qty"][m_idx] or 0.0) + (abs(q_num) if q_num != 0 else 0.0)
-
-
-def _aggregate_shipment_sf_rows(rows_ship: List[Dict[str, Any]]) -> Dict[str, Dict[str, List[Optional[float]]]]:
-    data_by_year: Dict[str, Dict[str, List[Optional[float]]]] = {}
-    for r in rows_ship:
-        _accumulate_shipment_row(r, data_by_year)
-    return data_by_year
-
-
-def _compute_prev_year_fy_price_factor(
-    data_by_year: Dict[str, Dict[str, List[Optional[float]]]],
-    prev_year: str,
-    pos_val_map: Dict[Tuple[str, int], float],
-    pos_u_map: Dict[Tuple[str, int], float],
-) -> float:
-    if prev_year not in data_by_year:
-        return 1.0
-    prev_usd_arr = [v for v in data_by_year[prev_year]["gts_val"] if v is not None and not (isinstance(v, float) and math.isnan(v))]
-    prev_qty_arr = [v for v in data_by_year[prev_year]["gts_qty"] if v is not None and not (isinstance(v, float) and math.isnan(v))]
-    prev_pos_val_arr = [pos_val_map.get((str(prev_year), i)) for i in range(12) if pos_val_map.get((str(prev_year), i)) is not None]
-    prev_pos_u_arr = [pos_u_map.get((str(prev_year), i)) for i in range(12) if pos_u_map.get((str(prev_year), i)) is not None]
-
-    tot_prev_usd = sum(prev_usd_arr) if prev_usd_arr else 0.0
-    tot_prev_qty = sum(prev_qty_arr) if prev_qty_arr else 0.0
-    tot_prev_pos_val = sum(prev_pos_val_arr) if prev_pos_val_arr else 0.0
-    tot_prev_pos_u = sum(prev_pos_u_arr) if prev_pos_u_arr else 0.0
-
-    asp_prev_fy = (tot_prev_pos_val / tot_prev_pos_u) if (tot_prev_pos_val > 0 and tot_prev_pos_u > 0) else None
-    b3_prev_fy = (tot_prev_usd / tot_prev_qty) if (tot_prev_usd > 0 and tot_prev_qty > 0) else None
-    if asp_prev_fy and b3_prev_fy and b3_prev_fy != 0:
-        return asp_prev_fy / b3_prev_fy
-    return 1.0
-
-
-def _resolve_month_factory_pos(
-    latest_year: str,
-    prev_year: str,
-    m_i: int,
-    m_nbr: int,
-    model_name: str | list[str],
-    factory_pos_map: Dict[Tuple[str, int], float],
-    pos_val_map: Dict[Tuple[str, int], float],
-) -> float:
-    factory_pos = factory_pos_map.get((str(latest_year), m_i))
-    if factory_pos is not None:
-        return factory_pos
-
-    prev_pos_val = pos_val_map.get((str(prev_year), m_i))
-    if prev_pos_val is not None:
-        f_pos_calc, _ = get_factory_pos_val(m_nbr, model_name, prev_pos_val)
-        factory_pos = f_pos_calc if f_pos_calc is not None else prev_pos_val
-    else:
-        factory_pos = 0.0
-
-    factory_pos_map[(str(latest_year), m_i)] = factory_pos
-    return factory_pos
-
-
-def _resolve_month_asp(
-    latest_year: str,
-    prev_year: str,
-    m_i: int,
-    pos_val_map: Dict[Tuple[str, int], float],
-    pos_u_map: Dict[Tuple[str, int], float],
-) -> Optional[float]:
-    p_val_m = pos_val_map.get((str(latest_year), m_i))
-    p_u_m = pos_u_map.get((str(latest_year), m_i))
-    if p_val_m and p_u_m and p_u_m != 0:
-        return p_val_m / p_u_m
-
-    if prev_year:
-        p_val_prev = pos_val_map.get((str(prev_year), m_i))
-        p_u_prev = pos_u_map.get((str(prev_year), m_i))
-        if p_val_prev and p_u_prev and p_u_prev != 0:
-            return p_val_prev / p_u_prev
-
-    return None
-
-
-def _project_shipment_future_months(
-    data_by_year: Dict[str, Dict[str, List[Optional[float]]]],
-    latest_year: str,
-    prev_year: str,
-    latest_comp_m_nbr: int,
-    factory_pos_map: Dict[Tuple[str, int], float],
-    pos_val_map: Dict[Tuple[str, int], float],
-    pos_u_map: Dict[Tuple[str, int], float],
-    fy_price_factor_prev: float,
-    model_name: str | list[str],
-    bb_rows: Optional[List[Dict[str, Any]]],
-):
-    if latest_comp_m_nbr >= 12:
-        return
-    if bb_rows is None:
-        try:
-            bb_rows = load_live_building_blocks(domain="SHIPMENT")
-        except (psycopg2.Error, OSError, ValueError, KeyError):
-            bb_rows = []
-
-    for m_i in range(latest_comp_m_nbr, 12):
-        m_nbr = m_i + 1
-        factory_pos = _resolve_month_factory_pos(
-            latest_year, prev_year, m_i, m_nbr, model_name, factory_pos_map, pos_val_map
-        )
-        bb_total_k = get_shipment_building_block_total_for_period(model_name, int(latest_year), m_nbr, bb_rows)
-        calc_grs_usd = factory_pos + ((bb_total_k * 1000.0) if bb_total_k else 0.0)
-        data_by_year[latest_year]["gts_val"][m_i] = calc_grs_usd
-
-        asp_m = _resolve_month_asp(latest_year, prev_year, m_i, pos_val_map, pos_u_map)
-        b3_proj = (asp_m / fy_price_factor_prev) if (asp_m and fy_price_factor_prev != 0) else None
-        if calc_grs_usd is not None and b3_proj and b3_proj != 0:
-            data_by_year[latest_year]["gts_qty"][m_i] = calc_grs_usd / b3_proj
-
-
-def _calc_single_yr_b3(
-    gts_val: List[Optional[float]],
-    gts_qty: List[Optional[float]],
-    yr: str,
-    prev_year: str,
-    pos_val_map: Dict[Tuple[str, int], float],
-    pos_u_map: Dict[Tuple[str, int], float],
-    fy_price_factor_prev: float,
-) -> List[Optional[float]]:
-    b3_arr = [None] * 12
-    for m_i in range(12):
-        gs = gts_val[m_i]
-        gu = gts_qty[m_i]
-        if gs is not None and gu is not None and gu != 0:
-            b3_arr[m_i] = gs / gu
-        else:
-            asp_m = _resolve_month_asp(yr, prev_year, m_i, pos_val_map, pos_u_map)
-            b3_arr[m_i] = (asp_m / fy_price_factor_prev) if (asp_m is not None and fy_price_factor_prev != 0) else None
-    return b3_arr
-
-
-def _calc_single_yr_build_bleed(
-    gts_val: List[Optional[float]],
-    yr: str,
-    factory_pos_map: Dict[Tuple[str, int], float],
-) -> List[Optional[float]]:
-    build_bleed_arr = [None] * 12
-    for m_i in range(12):
-        gs = gts_val[m_i]
-        fp = factory_pos_map.get((str(yr), m_i))
-        if gs is not None and not (isinstance(gs, float) and math.isnan(gs)):
-            build_bleed_arr[m_i] = (gs - fp) if (fp is not None and not (isinstance(fp, float) and math.isnan(fp))) else gs
-        elif fp is not None and not (isinstance(fp, float) and math.isnan(fp)):
-            build_bleed_arr[m_i] = 0.0 - fp
-        else:
-            build_bleed_arr[m_i] = 0.0
-    return build_bleed_arr
-
-
-def _calc_single_yr_unit_ratio(
-    gts_val: List[Optional[float]],
-    gts_qty: List[Optional[float]],
-    yr: str,
-    prev_year: str,
-    pos_u_map: Dict[Tuple[str, int], float],
-) -> List[Optional[float]]:
-    unit_ratio_arr = [None] * 12
-    for m_i in range(12):
-        gs = gts_val[m_i]
-        if gs is None or gs == 0 or (isinstance(gs, float) and math.isnan(gs)):
-            unit_ratio_arr[m_i] = None
-        else:
-            gu = gts_qty[m_i]
-            pu = pos_u_map.get((str(yr), m_i))
-            if (pu is None or pu == 0) and prev_year:
-                pu = pos_u_map.get((str(prev_year), m_i))
-            unit_ratio_arr[m_i] = ((gu / pu) * 100.0) if (gu is not None and pu is not None and pu != 0) else None
-    return unit_ratio_arr
-
-
-def _calc_single_yr_price_factor(
-    gts_val: List[Optional[float]],
-    gts_qty: List[Optional[float]],
-    yr: str,
-    prev_year: str,
-    b3_arr: List[Optional[float]],
-    pos_val_map: Dict[Tuple[str, int], float],
-    pos_u_map: Dict[Tuple[str, int], float],
-    fy_price_factor_prev: float,
-) -> List[Optional[float]]:
-    price_factor_arr = [None] * 12
-    for m_i in range(12):
-        gs = gts_val[m_i]
-        if gs is None or gs == 0 or (isinstance(gs, float) and math.isnan(gs)):
-            price_factor_arr[m_i] = None
-        else:
-            asp_m = _resolve_month_asp(yr, prev_year, m_i, pos_val_map, pos_u_map)
-            b3_m = b3_arr[m_i]
-            if b3_m is None and gts_qty[m_i] is not None and gts_qty[m_i] != 0:
-                b3_m = gs / gts_qty[m_i]
-            price_factor_arr[m_i] = (asp_m / b3_m) if (asp_m is not None and b3_m is not None and b3_m != 0) else fy_price_factor_prev
-    return price_factor_arr
-
-
-def _calculate_shipment_single_year_metrics(
-    yr: str,
-    d: Dict[str, List[Optional[float]]],
-    prev_year: str,
-    factory_pos_map: Dict[Tuple[str, int], float],
-    pos_val_map: Dict[Tuple[str, int], float],
-    pos_u_map: Dict[Tuple[str, int], float],
-    fy_price_factor_prev: float,
-) -> Dict[str, Any]:
-    gts_val = d["gts_val"]
-    gts_qty = d["gts_qty"]
-
-    b3_arr = _calc_single_yr_b3(gts_val, gts_qty, yr, prev_year, pos_val_map, pos_u_map, fy_price_factor_prev)
-    build_bleed_arr = _calc_single_yr_build_bleed(gts_val, yr, factory_pos_map)
-    unit_ratio_arr = _calc_single_yr_unit_ratio(gts_val, gts_qty, yr, prev_year, pos_u_map)
-    price_factor_arr = _calc_single_yr_price_factor(gts_val, gts_qty, yr, prev_year, b3_arr, pos_val_map, pos_u_map, fy_price_factor_prev)
-
-    return {
-        "gts_val": gts_val,
-        "gts_qty": gts_qty,
-        "b3": b3_arr,
-        "build_bleed": build_bleed_arr,
-        "unit_ratio": unit_ratio_arr,
-        "price_factor": price_factor_arr,
-        "gross_ship": gts_val,
-        "gross_case": gts_qty,
-        "net_ship": b3_arr,
-        "share": unit_ratio_arr,
-    }
-
-
-def _evaluate_month_unit_ratio_outlier(
-    m_i: int,
-    year_metrics: Dict[str, Dict[str, Any]],
-    latest_year: str,
-    ref_years: List[str],
-) -> Optional[str]:
-    v_curr = year_metrics[latest_year]["unit_ratio"][m_i]
-    if v_curr is None or (isinstance(v_curr, float) and math.isnan(v_curr)):
-        return None
-
-    ref_4_vals = [
-        year_metrics[y]["unit_ratio"][m_i]
-        for y in ref_years
-        if y in year_metrics
-        and year_metrics[y]["unit_ratio"][m_i] is not None
-        and not (isinstance(year_metrics[y]["unit_ratio"][m_i], float) and math.isnan(year_metrics[y]["unit_ratio"][m_i]))
+    conn = get_postgres_connection()
+    conn.autocommit = True
+    cur = conn.cursor()
+
+    queries = [
+        """
+        SELECT shm.*
+        FROM public.shipment_hierarchy_mapping shm
+        INNER JOIN public.master_models mm ON shm.model_id = mm.model_id
+        WHERE mm.model_name = ANY(%s) AND (shm.is_active IS NULL OR shm.is_active = TRUE);
+        """,
+        """
+        SELECT chm.*
+        FROM public.consumption_hierarchy_mapping chm
+        INNER JOIN public.master_models mm ON chm.model_id = mm.model_id
+        WHERE mm.model_name = ANY(%s) AND (chm.is_active IS NULL OR chm.is_active = TRUE);
+        """
     ]
-    if len(ref_4_vals) < 4:
-        return None
 
-    sum_ref = sum(ref_4_vals)
-    baseline = (sum_ref - min(ref_4_vals) - max(ref_4_vals)) / 2.0
-    if baseline <= 0:
-        return None
+    rows = []
+    col_names = []
+    for q in queries:
+        try:
+            cur.execute(q, (model_list,))
+            res = cur.fetchall()
+            if res:
+                rows = res
+                col_names = [desc[0].lower() for desc in cur.description]
+                break
+        except Exception:
+            conn.rollback()
 
-    rel_diff_pct = abs((v_curr - baseline) / baseline) * 100.0
-    if rel_diff_pct > 10.0:
-        return "red"
-    if rel_diff_pct > 5.0:
-        return "yellow"
-    return None
+    cur.close()
+    conn.close()
 
+    rules = []
+    for r in rows:
+        row_dict = dict(zip(col_names, r))
+        c1 = (row_dict.get("c1_business_segment") or row_dict.get("business_segment") or
+              row_dict.get("gbu_code") or row_dict.get("global_gmc_c1_business_segment_desc") or "")
+        c2 = (row_dict.get("c2_business_subsegment") or row_dict.get("business_subsegment") or
+              row_dict.get("global_gmc_c2_business_sub_segment_desc") or "")
+        c3 = (row_dict.get("c3_need_state") or row_dict.get("need_state") or
+              row_dict.get("squad_name") or row_dict.get("global_gmc_c3_need_state_desc") or "")
+        c4 = (row_dict.get("c4_category") or row_dict.get("category") or
+              row_dict.get("global_gmc_c4_category_desc") or "")
+        c5 = (row_dict.get("c5_subcategory") or row_dict.get("subcategory") or
+              row_dict.get("sub_category") or row_dict.get("global_gmc_c5_sub_category_desc") or "")
+        b1 = (row_dict.get("b1_brand") or row_dict.get("brand_name") or
+              row_dict.get("brand") or row_dict.get("global_gmc_b1_brand_desc") or "")
+        b2 = (row_dict.get("b2_subbrand") or row_dict.get("sub_brand_name") or
+              row_dict.get("sub_brand") or row_dict.get("subbrand") or
+              row_dict.get("global_gmc_b2_sub_brand_desc") or "")
 
-def _detect_unit_ratio_outliers(
-    year_metrics: Dict[str, Dict[str, Any]],
-    latest_year: str,
-    ref_years: List[str],
-) -> Dict[int, str]:
-    unit_ratio_outliers = {}
-    if latest_year not in year_metrics:
-        return unit_ratio_outliers
+        rule = {
+            "C1_BUSINESS_SEGMENT": normalize_text(c1),
+            "C2_BUSINESS_SUBSEGMENT": normalize_text(c2),
+            "C3_NEED_STATE": normalize_text(c3),
+            "C4_CATEGORY": normalize_text(c4),
+            "C5_SUBCATEGORY": normalize_text(c5),
+            "B1_BRAND": normalize_text(b1),
+            "B2_SUBBRAND": normalize_text(b2),
+        }
+        if any(rule.values()):
+            rules.append(rule)
 
-    for m_i in range(12):
-        color = _evaluate_month_unit_ratio_outlier(m_i, year_metrics, latest_year, ref_years)
-        if color:
-            unit_ratio_outliers[m_i] = color
-
-    return unit_ratio_outliers
-
-
-def _detect_shipment_cutoff_month(latest_year: str, latest_gts_vals: List[Optional[float]]) -> int:
-    """Detects latest completed shipment month dynamically. Returns 0 if no actuals yet."""
-    for m_i in range(11, -1, -1):
-        v = latest_gts_vals[m_i]
-        if v is not None and not (isinstance(v, float) and math.isnan(v)) and v > 0:
-            return m_i + 1
-    return 0
-
-
-def _blend_factory_pos_override(
-    factory_pos_map: Dict[Tuple[str, int], float],
-    factory_pos_by_year: Optional[Dict[str, List[Optional[float]]]],
-) -> None:
-    if not factory_pos_by_year:
-        return
-    for yr_k, fp_list in factory_pos_by_year.items():
-        for m_i, val in enumerate(fp_list):
-            if val is not None:
-                factory_pos_map[(str(yr_k), m_i)] = val
+    return rules
 
 
-def build_shipment_matrix(
-    rows_ship: List[Dict[str, Any]],
-    model_name: str | list[str],
-    factory_pos_by_year: Optional[Dict[str, List[Optional[float]]]] = None,
-    rows_cons: Optional[List[Dict[str, Any]]] = None,
-    bb_rows: Optional[List[Dict[str, Any]]] = None,
-) -> Dict[str, Any]:
+# ─── 2. POSTGRESQL MODEL PRICE INDEX MULTIPLIERS ─────────────────────────────
+
+def load_price_index_from_postgres(
+    models: Union[str, List[str]], plan_year: int
+) -> Dict[int, float]:
     """
-    Computes complete Shipment Validation matrix matching validation/ship.py specifications.
-    Dynamically rolls years based on active fiscal year.
+    Queries public.model_price_index in PostgreSQL for selected model(s).
+    Returns mapping: month_num (1..12) -> multiplier (float).
     """
-    if not rows_ship:
-        return {}
+    if isinstance(models, str):
+        model_list = [models.strip()]
+    else:
+        model_list = [str(m).strip() for m in models if m]
 
-    data_by_year = _aggregate_shipment_sf_rows(rows_ship)
+    if not model_list:
+        return {m: 1.0 for m in range(1, 13)}
 
-    curr_kv_year = get_current_kv_year()
-    min_year = curr_kv_year - 4
-    all_years = sorted([yr for yr in data_by_year if yr.isdigit() and int(yr) >= min_year])
-    if not all_years:
-        all_years = sorted([yr for yr in data_by_year if yr.isdigit()])
-    if not all_years:
-        return {}
+    monthly_indices: Dict[int, List[float]] = {m: [] for m in range(1, 13)}
 
-    latest_year = all_years[-1]
-    prev_year = str(int(latest_year) - 1)
-    ref_years = [y for y in all_years if y < latest_year][-4:]
+    try:
+        conn = get_postgres_connection()
+        conn.autocommit = True
+        cur = conn.cursor()
 
-    factory_pos_map, pos_val_map, pos_u_map = extract_consumption_maps(rows_cons, model_name) if rows_cons else ({}, {}, {})
-    _blend_factory_pos_override(factory_pos_map, factory_pos_by_year)
+        queries = [
+            """
+            SELECT mpi.*
+            FROM public.model_price_index mpi
+            INNER JOIN public.master_models mm ON mpi.model_id = mm.model_id
+            WHERE mm.model_name = ANY(%s);
+            """,
+            """
+            SELECT mpi.*
+            FROM public.model_price_index mpi
+            WHERE (mpi.model_name = ANY(%s) OR mpi.model = ANY(%s));
+            """
+        ]
 
-    fy_price_factor_prev = _compute_prev_year_fy_price_factor(data_by_year, prev_year, pos_val_map, pos_u_map)
-    latest_comp_m_nbr = _detect_shipment_cutoff_month(latest_year, data_by_year[latest_year]["gts_val"])
+        rows = []
+        col_names = []
+        for q in queries:
+            try:
+                params = (model_list,) if q.count("%s") == 1 else (model_list, model_list)
+                cur.execute(q, params)
+                res = cur.fetchall()
+                if res:
+                    rows = res
+                    col_names = [desc[0].lower() for desc in cur.description]
+                    break
+            except Exception:
+                conn.rollback()
 
-    _project_shipment_future_months(
-        data_by_year, latest_year, prev_year, latest_comp_m_nbr, factory_pos_map, pos_val_map, pos_u_map, fy_price_factor_prev, model_name, bb_rows
-    )
+        cur.close()
+        conn.close()
 
-    year_metrics = {
-        yr: _calculate_shipment_single_year_metrics(yr, data_by_year[yr], prev_year, factory_pos_map, pos_val_map, pos_u_map, fy_price_factor_prev)
-        for yr in all_years
-    }
-    unit_ratio_outliers = _detect_unit_ratio_outliers(year_metrics, latest_year, ref_years)
+        for r in rows:
+            row_dict = dict(zip(col_names, r))
+            row_yr = row_dict.get("year") or row_dict.get("plan_year") or row_dict.get("period_year")
+            if row_yr is not None:
+                try:
+                    if int(row_yr) != plan_year:
+                        continue
+                except (ValueError, TypeError):
+                    pass
+            raw_month = (
+                row_dict.get("month_num") or row_dict.get("month") or
+                row_dict.get("period_month") or row_dict.get("mnth")
+            )
+            m_num = parse_month_num(raw_month)
+            raw_idx = (
+                row_dict.get("price_index") or row_dict.get("index") or
+                row_dict.get("index_value") or row_dict.get("index_val") or
+                row_dict.get("multiplier")
+            )
+            if m_num and 1 <= m_num <= 12 and raw_idx is not None:
+                try:
+                    val = float(raw_idx)
+                    if val > 0:
+                        monthly_indices[m_num].append(val)
+                except (ValueError, TypeError):
+                    pass
+    except Exception as e:
+        print(f"[Price Index DB Notice]: {e}")
 
-    comp_status = {
-        "latest_complete_m_nbr": latest_comp_m_nbr,
-        "ytd_slice": [0, latest_comp_m_nbr],
-        "ytg_slice": [latest_comp_m_nbr, 12],
-    }
+    final_indices = {}
+    for m in range(1, 13):
+        arr = monthly_indices[m]
+        final_indices[m] = (sum(arr) / len(arr)) if arr else 1.0
+
+    return final_indices
+
+
+# ─── 3. SNOWFLAKE HISTORICAL GTS $ INGESTION ─────────────────────────────────
+
+def fetch_snowflake_monthly_gts(
+    rules: List[Dict[str, str]], base_year: int, plan_year: Optional[int] = None
+) -> Union[List[Optional[float]], Tuple[List[Optional[float]], List[Optional[float]]]]:
+    """
+    Queries PROD_CVD_DISC.NAIBP_ACCESS.VW_FACT_F360_SHIPMENTS in Snowflake.
+    If plan_year is provided, returns (gts_base, gts_plan_actual).
+    Otherwise returns gts_base for backward compatibility.
+    """
+    gts_base = [None] * 12
+    gts_plan_actual = [None] * 12
+    if not rules:
+        return (gts_base, gts_plan_actual) if plan_year is not None else gts_base
+
+    row_conditions = []
+    for r in rules:
+        field_conds = []
+        for f in ["C1_BUSINESS_SEGMENT", "C2_BUSINESS_SUBSEGMENT", "C3_NEED_STATE", "C4_CATEGORY", "C5_SUBCATEGORY", "B1_BRAND", "B2_SUBBRAND"]:
+            val = r.get(f, "").strip()
+            if val and val not in ["NAN", "NONE", "NULL", "EMPTY", "N/A", "<NA>"]:
+                val_esc = val.replace("'", "''")
+                field_conds.append(f"UPPER(TRIM(COALESCE({f}, ''))) = '{val_esc}'")
+        if field_conds:
+            row_conditions.append("(" + " AND ".join(field_conds) + ")")
+
+    if not row_conditions:
+        return (gts_base, gts_plan_actual) if plan_year is not None else gts_base
+
+    where_clause = " OR\n        ".join(row_conditions)
+    year_filter = f"YEAR IN ({base_year}, {plan_year})" if plan_year is not None else f"YEAR = {base_year}"
+    query = f"""
+    SELECT
+        YEAR,
+        MONTHNUMBER,
+        SUM(GTS_AMT) AS GTS_AMT
+    FROM PROD_CVD_DISC.NAIBP_ACCESS.VW_FACT_F360_SHIPMENTS
+    WHERE
+        ({where_clause})
+        AND {year_filter}
+    GROUP BY
+        YEAR,
+        MONTHNUMBER
+    ORDER BY
+        YEAR,
+        MONTHNUMBER;
+    """
+
+    try:
+        conn = get_snowflake_connection()
+        cur = conn.cursor()
+        cur.execute(query)
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        for yr_val, mo_val, amt_val in rows:
+            yr = int(yr_val or 0)
+            mo = int(mo_val or 0)
+            if 1 <= mo <= 12:
+                m_idx = mo - 1
+                val_m = float(amt_val or 0.0) / 1_000_000.0  # Dollars to Millions ($M)
+                if yr == base_year:
+                    gts_base[m_idx] = (gts_base[m_idx] or 0.0) + val_m
+                elif plan_year is not None and yr == plan_year:
+                    gts_plan_actual[m_idx] = (gts_plan_actual[m_idx] or 0.0) + val_m
+    except Exception as e:
+        print(f"[Snowflake GTS Query Notice]: {e}")
+
+    return (gts_base, gts_plan_actual) if plan_year is not None else gts_base
+
+
+# ─── 4. POSTGRESQL LIVE BUILDING BLOCKS * PRICE INDEX (GTS YoY) ─────────────
+
+def load_live_gts_building_blocks(
+    models: Union[str, List[str]], plan_year: int, price_indices: Dict[int, float]
+) -> Dict[str, List[Optional[float]]]:
+    """
+    Authoritative Building Blocks calculation for GTS YoY Dashboard:
+    Formula: GTS Building Block[m] = Consumption Building Block[m] * Price Index[m]
+    Matches the official business rule: gts.py = consumption_summary.py * price factor.
+    """
+    if isinstance(models, str):
+        model_list = [models.strip()]
+    else:
+        model_list = [str(m).strip() for m in models if m]
+
+    if not model_list:
+        return {disp: [None] * 12 for _, disp, _ in DRIVER_ROW_DEFINITIONS}
+
+    upper_models = [m.upper() for m in model_list]
+
+    # First attempt: import and reuse consumption_summary directly if available
+    raw_bb: Dict[str, List[Optional[float]]] = {}
+    try:
+        import consumption_summary as cs
+        cons_drivers = cs.load_live_building_blocks(model_list, plan_year)
+        if any(any(v is not None and v != 0 for v in vals) for vals in cons_drivers.values()):
+            # Multiply consumption building blocks by price index
+            driver_data: Dict[str, List[Optional[float]]] = {}
+            for _, disp_name, _ in DRIVER_ROW_DEFINITIONS:
+                c_vals = cons_drivers.get(disp_name, [None] * 12)
+                g_vals = [None] * 12
+                has_any = False
+                for i in range(12):
+                    v = c_vals[i]
+                    if v is not None:
+                        pi = price_indices.get(i + 1, 1.0)
+                        g_vals[i] = round(v * pi, 4)
+                        has_any = True
+                driver_data[disp_name] = g_vals if has_any else [None] * 12
+
+            # Recalculate compound drivers
+            net_inno = [None] * 12
+            for i in range(12):
+                iv = driver_data.get("Innovation", [None] * 12)[i]
+                cv = driver_data.get("Cannibalization", [None] * 12)[i]
+                if iv is not None or cv is not None:
+                    net_inno[i] = round((iv or 0.0) + (cv or 0.0), 4)
+            driver_data["Net Innovation"] = net_inno
+
+            net_price = [None] * 12
+            for i in range(12):
+                pv = driver_data.get("Price", [None] * 12)[i]
+                ev = driver_data.get("Elasticity", [None] * 12)[i]
+                if pv is not None or ev is not None:
+                    net_price[i] = round((pv or 0.0) + (ev or 0.0), 4)
+            driver_data["Net Price"] = net_price
+
+            return driver_data
+    except Exception as e:
+        print(f"[GTS Live BB Import Notice]: {e}")
+
+    # Fallback: direct query to PostgreSQL na_ibp_db
+    try:
+        conn = get_postgres_connection()
+        conn.autocommit = True
+        cur = conn.cursor()
+
+        sql = """
+        SELECT
+            cbb.name AS building_block,
+            EXTRACT(MONTH FROM cpv.period_month)::int AS month_num,
+            SUM(cpv.value_in_thousands) AS value_in_thousands
+        FROM public.consumption_planning_rows cpr
+        INNER JOIN public.consumption_building_blocks cbb
+            ON cpr.building_block_id = cbb.block_id
+        INNER JOIN public.consumption_planning_values cpv
+            ON cpr.row_id = cpv.row_id
+        INNER JOIN public.master_models mm
+            ON cpr.model_id = mm.model_id
+        WHERE
+            (mm.model_name = ANY(%s) OR UPPER(TRIM(mm.model_name)) = ANY(%s))
+            AND cpr.is_deleted = FALSE
+            AND cbb.is_active = TRUE
+            AND mm.is_active = TRUE
+            AND EXTRACT(YEAR FROM cpv.period_month) = %s
+        GROUP BY cbb.name, month_num
+        ORDER BY cbb.name, month_num;
+        """
+        try:
+            cur.execute(sql, (model_list, upper_models, plan_year))
+            rows = cur.fetchall()
+        except Exception:
+            conn.rollback()
+            cur.execute(sql.replace("master_models", "hierarchy_models"), (model_list, upper_models, plan_year))
+            rows = cur.fetchall()
+
+        for bb_name, m_num, val_k in rows:
+            if m_num and 1 <= int(m_num) <= 12:
+                m_idx = int(m_num) - 1
+                norm_bb = normalize_text(bb_name)
+                val_m = float(val_k or 0.0) / 1000.0  # Thousands to Millions ($M)
+                raw_bb.setdefault(norm_bb, [None] * 12)[m_idx] = (raw_bb.setdefault(norm_bb, [None] * 12)[m_idx] or 0.0) + val_m
+
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"[GTS Live BB DB Notice]: {e}")
+
+    def _get_raw_val(pattern: str) -> List[Optional[float]]:
+        res = [None] * 12
+        matched = False
+        for db_name, m_arr in raw_bb.items():
+            if pattern in db_name:
+                for i in range(12):
+                    if m_arr[i] is not None:
+                        res[i] = (res[i] or 0.0) + m_arr[i]
+                        matched = True
+        return res if matched else [None] * 12
+
+    driver_data: Dict[str, List[Optional[float]]] = {}
+    for grp, disp_name, match_key in DRIVER_ROW_DEFINITIONS:
+        if match_key.startswith("COMPOUND_"):
+            continue
+        c_vals = _get_raw_val(match_key)
+        g_vals = [None] * 12
+        has_any = False
+        for i in range(12):
+            v = c_vals[i]
+            if v is not None:
+                pi = price_indices.get(i + 1, 1.0)
+                g_vals[i] = round(v * pi, 4)
+                has_any = True
+        driver_data[disp_name] = g_vals if has_any else [None] * 12
+
+    # Compound Net Innovation
+    innov = driver_data.get("Innovation", [None] * 12)
+    cann = driver_data.get("Cannibalization", [None] * 12)
+    net_inno = [None] * 12
+    for i in range(12):
+        if innov[i] is not None or cann[i] is not None:
+            net_inno[i] = round((iv := innov[i] or 0.0) + (cv := cann[i] or 0.0), 4)
+    driver_data["Net Innovation"] = net_inno
+
+    # Compound Net Price
+    price = driver_data.get("Price", [None] * 12)
+    elast = driver_data.get("Elasticity", [None] * 12)
+    net_price = [None] * 12
+    for i in range(12):
+        if price[i] is not None or elast[i] is not None:
+            net_price[i] = round((pv := price[i] or 0.0) + (ev := elast[i] or 0.0), 4)
+    driver_data["Net Price"] = net_price
+
+    return driver_data
+
+
+# Alias for backward compatibility with existing tests
+load_coc_building_blocks = load_live_gts_building_blocks
+
+
+# ─── 5. AGGREGATIONS & GTS YoY MATRIX ENGINE ─────────────────────────────────
+
+def calc_totals(monthly_vals: List[Optional[float]], cutoff_month: int = 0) -> Dict[str, Optional[float]]:
+    """Calculates Q1..Q4, FY, YTD, and YTG totals dynamically."""
+    has_data = any(v is not None for v in monthly_vals)
+    if not has_data:
+        return {col: None for col in ["Q1", "Q2", "Q3", "Q4", "FY", "YTD", "YTG"]}
+
+    def _sum_range(st, en):
+        arr = [v for v in monthly_vals[st:en] if v is not None and not (isinstance(v, float) and math.isnan(v))]
+        return round(sum(arr), 4) if arr else 0.0
 
     return {
-        "all_years": all_years,
-        "latest_year": latest_year,
-        "prev_year": prev_year,
-        "year_metrics": year_metrics,
-        "comp_status": comp_status,
-        "unit_ratio_outliers": unit_ratio_outliers,
-        "red_outliers": {},
-        "data_by_year": data_by_year,
-        "pos_val_map": pos_val_map,
-        "pos_u_map": pos_u_map,
-        "factory_pos_map": factory_pos_map,
-        "fy_price_factor_prev": fy_price_factor_prev,
+        "Q1": _sum_range(0, 3),
+        "Q2": _sum_range(3, 6),
+        "Q3": _sum_range(6, 9),
+        "Q4": _sum_range(9, 12),
+        "FY": _sum_range(0, 12),
+        "YTD": _sum_range(0, cutoff_month),
+        "YTG": _sum_range(cutoff_month, 12),
     }
+
+
+def compute_gts_summary_matrix(models: Union[str, List[str]]) -> Dict[str, Any]:
+    """
+    Computes complete GTS YoY Summary Matrix:
+    1. Historical Row: {base_year} GTS $ from Snowflake VW_FACT_F360_SHIPMENTS
+    2. Factory POS $ integration from consumption_summary.py * price_index
+    3. Building Blocks: Sourced dynamically for plan_year
+    4. Current Row: {plan_year} GTS $:
+         - Actual GTS shipments for completed months
+         - Forecast (Baseline + Building Blocks) for remaining months
+    5. GTS YoY % Row: ((Plan GTS - Base GTS) / Base GTS) * 100
+    6. NO Difference row
+    """
+    base_year, plan_year = get_active_years()
+    rules = load_model_rules(models)
+
+    # 1. Base Year and Plan Year GTS actuals from Snowflake
+    gts_base, gts_plan_actual = fetch_snowflake_monthly_gts(rules, base_year, plan_year)
+
+    # 2. Price Index multipliers from PostgreSQL
+    price_indices = load_price_index_from_postgres(models, plan_year)
+
+    # 3. Consumption Summary & Factory POS Integration
+    pos_plan = [0.0] * 12
+    cons_cutoff = 0
+    cons_data = {}
+    try:
+        import consumption_summary as cs
+        cons_data = cs.compute_consumption_summary_matrix(models)
+        pos_plan_raw = cons_data.get("pos_plan", [0.0] * 12)
+        pos_plan = [float(v or 0.0) for v in pos_plan_raw]
+        cons_cutoff = int(cons_data.get("cutoff_month") or 0)
+    except Exception as e:
+        print(f"[Consumption Summary / Factory POS Integration Notice]: {e}")
+
+    factory_pos = [0.0] * 12
+    for i in range(12):
+        month_num = i + 1
+        pos_val = pos_plan[i]
+        idx_mult = price_indices.get(month_num, 1.0)
+        factory_pos[i] = round(pos_val * idx_mult, 2)
+
+    # 4. Building Blocks: Consumption Building Blocks * Price Index
+    drivers = load_coc_building_blocks(models, plan_year, price_indices)
+
+    individual_driver_names = [
+        "Base Trend", "Season", "Competition", "Distribution", "Innovation",
+        "Cannibalization", "Discontinuations", "Renovations", "Media", "Trade",
+        "Price", "Elasticity", "Club", "Other (Not Defined)"
+    ]
+
+    total_monthly_bb = [0.0] * 12
+    has_bb_for_month = [False] * 12
+    for d_name in individual_driver_names:
+        d_vals = drivers.get(d_name, [None] * 12)
+        for i in range(12):
+            if d_vals[i] is not None:
+                total_monthly_bb[i] += d_vals[i]
+                has_bb_for_month[i] = True
+
+    # 5. Dynamically detect cutoff month from Snowflake plan_year GTS actuals
+    detected_gts_cutoff = 0
+    for idx, v in enumerate(gts_plan_actual):
+        if v is not None:
+            detected_gts_cutoff = idx + 1
+
+    # Safe dynamic fallback:
+    if detected_gts_cutoff > 0:
+        cutoff_month = detected_gts_cutoff
+    elif cons_cutoff > 0:
+        cutoff_month = cons_cutoff
+    else:
+        cutoff_month = 0
+
+    # 6. Current Year GTS Row Population:
+    gts_plan = [0.0] * 12
+    for i in range(12):
+        if i < cutoff_month and gts_plan_actual[i] is not None:
+            gts_plan[i] = round(gts_plan_actual[i], 2)
+        else:
+            baseline = gts_base[i] if gts_base[i] is not None else factory_pos[i]
+            bb = total_monthly_bb[i] if has_bb_for_month[i] else 0.0
+            gts_plan[i] = round((baseline or 0.0) + bb, 2)
+
+    # 7. GTS YoY % Calculation against Base GTS
+    gts_yoy_pct = [0.0] * 12
+    for i in range(12):
+        v_base = gts_base[i]
+        v_plan = gts_plan[i]
+        if v_base and v_base > 0 and v_plan is not None:
+            gts_yoy_pct[i] = ((v_plan - v_base) / v_base) * 100.0
+        else:
+            gts_yoy_pct[i] = 0.0
+
+    # 8. Totals calculation
+    totals_base = calc_totals(gts_base, cutoff_month)
+    totals_plan = calc_totals(gts_plan, cutoff_month)
+    totals_factory_pos = calc_totals(factory_pos, cutoff_month)
+
+    totals_yoy = {}
+    for col_name in ["Q1", "Q2", "Q3", "Q4", "FY", "YTD", "YTG"]:
+        b_val = totals_base.get(col_name)
+        p_val = totals_plan.get(col_name)
+        if b_val and b_val > 0 and p_val is not None:
+            totals_yoy[col_name] = ((p_val - b_val) / b_val) * 100.0
+        else:
+            totals_yoy[col_name] = 0.0
+
+    driver_totals = {}
+    for _, disp_name, _ in DRIVER_ROW_DEFINITIONS:
+        m_vals = drivers.get(disp_name, [None] * 12)
+        driver_totals[disp_name] = calc_totals(m_vals, cutoff_month)
+
+    return {
+        "base_year": base_year,
+        "plan_year": plan_year,
+        "cutoff_month": cutoff_month,
+        "label_base": f"{base_year} GTS $",
+        "label_plan": f"{plan_year} GTS $",
+        "label_gts": f"{plan_year} GTS $",
+        "label_pct": "GTS YoY %",
+        "models": models,
+        "gts_base": gts_base,
+        "totals_base": totals_base,
+        "gts_plan_actual": gts_plan_actual,
+        "gts_plan": gts_plan,
+        "totals_plan": totals_plan,
+        "totals_gts": totals_plan,
+        "factory_pos": factory_pos,
+        "totals_factory_pos": totals_factory_pos,
+        "drivers": drivers,
+        "driver_totals": driver_totals,
+        "gts_yoy_pct": gts_yoy_pct,
+        "totals_yoy": totals_yoy,
+    }
+
+
+# ─── 6. DYNAMIC HEATMAP & FORMATTING HELPERS (1 DECIMAL PLACE) ───────────────
+
+def get_driver_heatmap_style(val: float, max_pos: float, max_neg_mag: float):
+    """11-Tier Dynamic Heatmap Gradient with High Red (#FF6B6B)."""
+    if val is None or (isinstance(val, float) and math.isnan(val)):
+        return "#ffffff", "#111827", "500"
+    v = float(val)
+    if abs(v) <= 0.004:
+        return "#ffffff", "#374151", "500"
+
+    if v > 0:
+        ratio = (v / max_pos) if max_pos > 0 else 0
+        if ratio >= 0.75:
+            return "#00897b", "#ffffff", "700"
+        elif ratio >= 0.50:
+            return "#26a69a", "#ffffff", "600"
+        elif ratio >= 0.25:
+            return "#4db6ac", "#004d40", "600"
+        elif ratio >= 0.10:
+            return "#80cbc4", "#004d40", "600"
+        else:
+            return "#c8ece6", "#004d40", "500"
+    else:
+        ratio = (abs(v) / max_neg_mag) if max_neg_mag > 0 else 0
+        if ratio >= 0.75:
+            return "#FF6B6B", "#ffffff", "700"   # Tier 5: High Red (#FF6B6B)
+        elif ratio >= 0.50:
+            return "#ef6c6a", "#ffffff", "700"
+        elif ratio >= 0.25:
+            return "#f8a5a3", "#7f0000", "600"
+        elif ratio >= 0.10:
+            return "#ffcdd2", "#7f0000", "600"
+        else:
+            return "#ffebee", "#7f0000", "500"
+
+
+def fmt_currency(val, is_driver: bool = False, decimals: int = 1) -> str:
+    """Formats GTS currency values to 1 decimal place (.1f). Prevents -$0.0."""
+    if val is None or (isinstance(val, float) and math.isnan(val)):
+        return ""
+    v = float(val)
+    if round(abs(v), decimals) == 0:
+        return "$0.0" if decimals == 1 else "$0.00"
+    if is_driver:
+        if v < 0:
+            return f"-${abs(v):,.{decimals}f}"
+        return f"${v:,.{decimals}f}"
+    return f"${v:,.{decimals}f}"
+
+
+def fmt_pct(val, decimals: int = 1) -> str:
+    """Formats percentage values to 1 decimal place. Prevents -0.0%."""
+    if val is None or (isinstance(val, float) and math.isnan(val)):
+        return ""
+    v = float(val)
+    if round(abs(v), decimals) == 0:
+        return f"{0.0:.{decimals}f}%"
+    return f"{v:.{decimals}f}%"
+
+
+def build_data_cells(m_vals, totals, max_pos, max_neg_mag, is_driver=False, is_pct=False, bg_override=None, decimals=1):
+    """Builds monthly, quarterly, and full-year table cells with 1 decimal formatting."""
+    cells = []
+    for val in m_vals:
+        txt = fmt_pct(val, decimals=decimals) if is_pct else fmt_currency(val, is_driver=is_driver, decimals=decimals)
+        if bg_override:
+            bg_col = bg_override
+            txt_col = "#111827"
+            font_wt = "700"
+        elif is_driver:
+            bg_col, txt_col, font_wt = get_driver_heatmap_style(val, max_pos, max_neg_mag)
+        elif is_pct:
+            bg_col = "#ffffff"
+            txt_col = "#004d40" if (val is not None and val >= 0) else "#7f0000"
+            font_wt = "700"
+        else:
+            bg_col = "#ffffff"
+            txt_col = "#111827"
+            font_wt = "700"
+
+        cells.append(html.Td(txt, style={
+            "padding": "6px 8px", "textAlign": "right", "fontSize": "12px",
+            "backgroundColor": bg_col, "color": txt_col, "fontWeight": font_wt,
+            "border": "1px solid #e5e7eb"
+        }))
+
+    for col_name in ["Q1", "Q2", "Q3", "Q4", "FY", "YTD", "YTG"]:
+        val = totals.get(col_name)
+        txt = fmt_pct(val, decimals=decimals) if is_pct else fmt_currency(val, is_driver=is_driver, decimals=decimals)
+
+        if bg_override:
+            bg_col = bg_override
+            txt_col = "#111827"
+            font_wt = "700"
+        elif is_driver:
+            bg_col, txt_col, font_wt = get_driver_heatmap_style(val, max_pos, max_neg_mag)
+        elif is_pct:
+            bg_col = "#f9fafb"
+            txt_col = "#004d40" if (val is not None and val >= 0) else "#7f0000"
+            font_wt = "700"
+        else:
+            bg_col = "#f9fafb"
+            txt_col = "#111827"
+            font_wt = "800"
+
+        b_left = "3px solid #9ca3af" if col_name in ["Q1", "YTD"] else "1px solid #e5e7eb"
+
+        cells.append(html.Td(txt, style={
+            "padding": "6px 8px", "textAlign": "right", "fontSize": "12px",
+            "backgroundColor": bg_col, "color": txt_col, "fontWeight": font_wt,
+            "border": "1px solid #e5e7eb", "borderLeft": b_left
+        }))
+
+    return cells
+
+
+# ─── 7. GTS YoY TABLE RENDERER (NO DIFFERENCE ROW, 1 DECIMAL PLACE) ─────────
+
+def render_gts_table(data: dict) -> html.Div:
+    """
+    Renders GTS YoY Summary Matrix:
+    1. {base_year} GTS $ (from Snowflake)
+    2. 11 Building Block Drivers: Consumption BB * Price Index
+    3. {plan_year} GTS $ (Actuals for completed months, Forecast for remaining months)
+    4. GTS YoY %
+    (NO Difference row, all currency in .1f decimal precision)
+    """
+    max_pos, max_neg_mag = 0.001, 0.001
+    for d_name, m_vals in data["drivers"].items():
+        for v in m_vals:
+            if v is not None and not (isinstance(v, float) and math.isnan(v)):
+                if v > max_pos:
+                    max_pos = v
+                elif v < 0 and abs(v) > max_neg_mag:
+                    max_neg_mag = abs(v)
+
+    th_style = {
+        "backgroundColor": "#d7ece8", "color": "#1f2937", "fontWeight": "800",
+        "fontSize": "13px", "padding": "8px 10px", "border": "1px solid #d1d5db",
+        "textAlign": "center", "whiteSpace": "nowrap"
+    }
+
+    header_cells = [
+        html.Th("", style={**th_style, "minWidth": "110px", "borderRight": "none"}),
+        html.Th("Driver", style={**th_style, "minWidth": "160px", "textAlign": "left"}),
+    ]
+
+    for m in MONTHS:
+        header_cells.append(html.Th(m, style=th_style))
+
+    divider_style = {**th_style, "borderLeft": "3px solid #9ca3af"}
+    header_cells.append(html.Th("Q1", style=divider_style))
+    header_cells.append(html.Th("Q2", style=th_style))
+    header_cells.append(html.Th("Q3", style=th_style))
+    header_cells.append(html.Th("Q4", style=th_style))
+    header_cells.append(html.Th("FY", style={**th_style, "fontWeight": "900"}))
+    header_cells.append(html.Th("YTD", style=divider_style))
+    header_cells.append(html.Th("YTG", style=th_style))
+
+    thead = html.Thead(html.Tr(header_cells))
+    tbody_rows = []
+
+    # 1. Base Year Row: {base_year} GTS $
+    base_yr = data.get("base_year")
+    base_label = data.get("label_base") or (f"{base_yr} GTS $" if base_yr else "Base GTS $")
+    tbody_rows.append(html.Tr([
+        html.Td("", style={"backgroundColor": "#ffffff", "border": "1px solid #e5e7eb"}),
+        html.Td(base_label, style={
+            "fontWeight": "800", "fontSize": "13px", "padding": "6px 10px", "border": "1px solid #e5e7eb"
+        }),
+        *build_data_cells(data["gts_base"], data["totals_base"], max_pos, max_neg_mag, decimals=1)
+    ]))
+
+    # 2. Driver Rows (11 Drivers: Consumption BB * Price Index)
+    group_counts = {}
+    for grp, _, _ in DRIVER_ROW_DEFINITIONS:
+        group_counts[grp] = group_counts.get(grp, 0) + 1
+
+    seen_groups = set()
+    SUB_DRIVERS = {"Innovation", "Cannibalization", "Price", "Elasticity"}
+
+    for grp, driver_name, _ in DRIVER_ROW_DEFINITIONS:
+        cells = []
+        if grp not in seen_groups:
+            seen_groups.add(grp)
+            cells.append(html.Td(
+                grp, rowSpan=group_counts[grp],
+                style={
+                    "textAlign": "center", "verticalAlign": "middle",
+                    "backgroundColor": "#dff0ea", "color": "#065f46",
+                    "fontWeight": "800", "fontSize": "13px", "border": "1px solid #c4e4dc",
+                    "padding": "8px 6px"
+                }
+            ))
+
+        is_sub = driver_name in SUB_DRIVERS
+        cells.append(html.Td(driver_name, style={
+            "fontWeight": "500", "fontSize": "12px", "color": "#1f2937", "padding": "6px 14px",
+            "border": "1px solid #e5e7eb", "textAlign": "right" if is_sub else "left",
+            "fontStyle": "italic" if is_sub else "normal"
+        }))
+
+        d_vals = data["drivers"].get(driver_name, [None] * 12)
+        d_totals = data["driver_totals"].get(driver_name, {})
+        cells.extend(build_data_cells(d_vals, d_totals, max_pos, max_neg_mag, is_driver=True, decimals=1))
+        tbody_rows.append(html.Tr(cells))
+
+    # 3. Plan Year Row: {plan_year} GTS $
+    plan_yr = data.get("plan_year")
+    plan_label = data.get("label_plan") or data.get("label_gts") or (f"{plan_yr} GTS $" if plan_yr else "Plan GTS $")
+    tbody_rows.append(html.Tr([
+        html.Td("", style={"backgroundColor": "#ffffff", "border": "1px solid #e5e7eb"}),
+        html.Td(plan_label, style={
+            "fontWeight": "800", "fontSize": "13px", "padding": "6px 10px",
+            "border": "1px solid #e5e7eb", "backgroundColor": "#f1ebfb", "color": "#111827"
+        }),
+        *build_data_cells(data["gts_plan"], data.get("totals_plan") or data.get("totals_gts", {}), max_pos, max_neg_mag, bg_override="#faf6ff", decimals=1)
+    ]))
+
+    # 4. GTS YoY % Row
+    pct_label = data.get("label_pct", "GTS YoY %")
+    tbody_rows.append(html.Tr([
+        html.Td("", style={"backgroundColor": "#ffffff", "border": "1px solid #e5e7eb"}),
+        html.Td(pct_label, style={
+            "fontWeight": "800", "fontSize": "13px", "padding": "6px 10px",
+            "border": "1px solid #e5e7eb", "color": "#004d40"
+        }),
+        *build_data_cells(data["gts_yoy_pct"], data["totals_yoy"], max_pos, max_neg_mag, is_pct=True, decimals=1)
+    ]))
+
+    return html.Div([
+        html.Table([thead, html.Tbody(tbody_rows)], style={
+            "width": "100%", "borderCollapse": "collapse", "backgroundColor": "#ffffff",
+            "borderRadius": "8px", "boxShadow": "0 2px 8px rgba(0,0,0,0.04)"
+        })
+    ], style={"border": "1px solid #d1d5db", "borderRadius": "8px", "overflow": "hidden"})
