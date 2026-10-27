@@ -1,24 +1,20 @@
 """
-shipment_summary.py
-===================
-Authoritative Calculation Engine for Shipment Summary Dashboard (Matching Images 1 & 2):
-1. Drivers & Categories:
-   - Top Row: {plan_year} FACTORY POS (Computed via POS $ * model_price_index from PostgreSQL)
-   - Category 1: Inventory (Distribution, Innovation, Trade, Club, Retailer Inventory, Other)
-   - Category 2: IBP Overlays (Supply Constraints, Liquidations, Other)
-   - Bottom Rows: {plan_year} GTS and GTS YoY %
-2. Smart Blank vs $0.00 Handling (Using Direct Pivoted PostgreSQL Query):
-   - Active drivers with partial records: unentered months returned as 0.0000 -> displayed as $0.00 (Image 1)
-   - Drivers/models with no building blocks: query returns 0 rows -> kept completely blank (None) (Image 2)
-3. Dynamic Years: Automatically rolls with active plan_year and base_year using Kenvue 4-4-5 Fiscal Calendar.
-4. PostgreSQL Hierarchy Mapping:
-   - Queries public.shipment_hierarchy_mapping joined with public.master_models
-5. PostgreSQL Price Index:
-   - Queries public.model_price_index joined with public.master_models
-6. Snowflake GTS $ Integration:
-   - Queries PROD_CVD_DISC.NAIBP_ACCESS.VW_FACT_F360_SHIPMENTS
-7. PostgreSQL Live Shipment Building Blocks:
-   - Queries public.shipment_planning_rows, shipment_building_blocks, shipment_planning_values
+gts.py
+======
+Authoritative Calculation Engine and UI Presentation for GTS CoC (Change of Cycle) Dashboard:
+1. Dynamic Years: Automatically detects plan_year and base_year (e.g. 2026 & 2025, or 2027 & 2026).
+2. Historical Year Row: {base_year} GTS $ pulled directly from Snowflake VW_FACT_F360_SHIPMENTS (in $M).
+3. 11 Building Block Drivers (CoC Formula):
+     CoC Value[m] = (Current Cycle POS[m] - Previous Cycle POS[m]) * Price Index[m]
+     - Net Innovation = (Innovation CoC + Cannibalization CoC)
+     - Net Price = (Price CoC + Elasticity CoC)
+4. Current Year Row: {plan_year} GTS $ for each month is calculated as:
+     {plan_year} GTS CoC[m] = Sum of 11 Building Block CoC Values[m]
+5. GTS CoC % Row:
+     Percentage variance of the plan between cycles.
+6. NO Difference Row (as specified).
+7. Formatting: 1 decimal place (.1f) for all GTS $ currency values ($123.4M, -$5.6M), preventing -$0.0.
+8. 11-Tier Dynamic Heatmap Gradient with High Red (#FF6B6B).
 """
 
 import os
@@ -27,6 +23,7 @@ import math
 import datetime
 from typing import Optional, Dict, List, Tuple, Any, Union
 from dotenv import load_dotenv
+from dash import html
 
 load_dotenv()
 
@@ -71,7 +68,7 @@ def get_active_years() -> Tuple[int, int]:
 
 
 def normalize_text(val: Any) -> str:
-    """Normalizes strings consistently."""
+    """Normalizes text values consistently."""
     if val is None:
         return ""
     s = str(val).replace("\xa0", " ").strip().upper()
@@ -121,6 +118,7 @@ def get_snowflake_connection():
     import snowflake.connector
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.backends import default_backend
+
     config = {
         "user": os.getenv("SNOWFLAKE_USER", "SA-JX2-SNFK-CVD-RPT@KENVUE.COM"),
         "account": os.getenv("SNOWFLAKE_ACCOUNT", "BK40750.east-us-2.azure"),
@@ -132,6 +130,7 @@ def get_snowflake_connection():
     private_key_path = os.getenv("SNOWFLAKE_PRIVATE_KEY_PATH")
     private_key_pem = os.getenv("SNOWFLAKE_PRIVATE_KEY")
     passphrase = os.getenv("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE")
+
     if private_key_path or private_key_pem:
         try:
             if private_key_path and os.path.exists(private_key_path):
@@ -150,6 +149,7 @@ def get_snowflake_connection():
                 )
             else:
                 p_key = None
+
             if p_key:
                 pkb = p_key.private_bytes(
                     encoding=serialization.Encoding.DER,
@@ -163,26 +163,115 @@ def get_snowflake_connection():
                 config["password"] = os.getenv("SNOWFLAKE_PASSWORD")
     elif os.getenv("SNOWFLAKE_PASSWORD"):
         config["password"] = os.getenv("SNOWFLAKE_PASSWORD")
+
     return snowflake.connector.connect(**config)
 
 
-# ─── SHIPMENT DRIVER ROW DEFINITIONS (MATCHING IMAGE 3) ──────────────────────
+# ─── DRIVER ROW DEFINITIONS (MATCHING CONSUMPTION & GTS DASHBOARD) ───────────
 
-SHIPMENT_DRIVER_ROW_DEFINITIONS = [
+DRIVER_ROW_DEFINITIONS = [
     # (Category Group, Display Name, DB Match Key)
-    ("Inventory",    "Distribution",       "DISTRIBUTION"),
-    ("Inventory",    "Innovation",         "INNOVATION"),
-    ("Inventory",    "Trade",              "TRADE"),
-    ("Inventory",    "Club",               "CLUB"),
-    ("Inventory",    "Retailer Inventory", "RETAILER_INVENTORY"),
-    ("Inventory",    "Other",              "OTHER"),
-    ("IBP Overlays", "Supply Constraints", "SUPPLY_CONSTRAINTS"),
-    ("IBP Overlays", "Liquidations",       "LIQUIDATIONS"),
-    ("IBP Overlays", "Other",              "OVERLAYS_OTHER"),
+    ("External",     "Base Trend",          "BASE TREND"),
+    ("External",     "Season",              "SEASON"),
+    ("External",     "Competition",         "COMPETITION"),
+    ("Distribution", "Distribution",        "DISTRIBUTION"),
+    ("Innovation",   "Net Innovation",      "COMPOUND_NET_INNOVATION"),  # Innovation + Cannibalization
+    ("Innovation",   "Innovation",          "INNOVATION"),
+    ("Innovation",   "Cannibalization",     "CANNIBALIZATION"),
+    ("Innovation",   "Discontinuations",    "DISCONTINUATIONS"),
+    ("Innovation",   "Renovations",         "RENOVATION"),
+    ("Investment",   "Media",               "MEDIA"),
+    ("Investment",   "Trade",               "TRADE"),
+    ("Price",        "Net Price",           "COMPOUND_NET_PRICE"),       # Price + Elasticity
+    ("Price",        "Price",               "PRICE"),
+    ("Price",        "Elasticity",          "ELASTICITY"),
+    ("Other",        "Club",                "CLUB"),
+    ("Other",        "Other (Not Defined)", "OTHER"),
 ]
 
 
-# ─── 1. POSTGRESQL MODEL PRICE INDEX MULTIPLIERS ─────────────────────────────
+# ─── 1. POSTGRESQL HIERARCHY RULES ──────────────────────────────────────────
+
+def load_model_rules(models: Union[str, List[str]]) -> List[Dict[str, str]]:
+    """Loads product hierarchy rules (C1..C5, B1..B2) for selected model(s)."""
+    if isinstance(models, str):
+        model_list = [models.strip()]
+    else:
+        model_list = [str(m).strip() for m in models if m]
+
+    if not model_list:
+        return []
+
+    conn = get_postgres_connection()
+    conn.autocommit = True
+    cur = conn.cursor()
+
+    queries = [
+        """
+        SELECT shm.*
+        FROM public.shipment_hierarchy_mapping shm
+        INNER JOIN public.master_models mm ON shm.model_id = mm.model_id
+        WHERE mm.model_name = ANY(%s) AND (shm.is_active IS NULL OR shm.is_active = TRUE);
+        """,
+        """
+        SELECT chm.*
+        FROM public.consumption_hierarchy_mapping chm
+        INNER JOIN public.master_models mm ON chm.model_id = mm.model_id
+        WHERE mm.model_name = ANY(%s) AND (chm.is_active IS NULL OR chm.is_active = TRUE);
+        """
+    ]
+
+    rows = []
+    col_names = []
+    for q in queries:
+        try:
+            cur.execute(q, (model_list,))
+            res = cur.fetchall()
+            if res:
+                rows = res
+                col_names = [desc[0].lower() for desc in cur.description]
+                break
+        except Exception:
+            conn.rollback()
+
+    cur.close()
+    conn.close()
+
+    rules = []
+    for r in rows:
+        row_dict = dict(zip(col_names, r))
+        c1 = (row_dict.get("c1_business_segment") or row_dict.get("business_segment") or
+              row_dict.get("gbu_code") or row_dict.get("global_gmc_c1_business_segment_desc") or "")
+        c2 = (row_dict.get("c2_business_subsegment") or row_dict.get("business_subsegment") or
+              row_dict.get("global_gmc_c2_business_sub_segment_desc") or "")
+        c3 = (row_dict.get("c3_need_state") or row_dict.get("need_state") or
+              row_dict.get("squad_name") or row_dict.get("global_gmc_c3_need_state_desc") or "")
+        c4 = (row_dict.get("c4_category") or row_dict.get("category") or
+              row_dict.get("global_gmc_c4_category_desc") or "")
+        c5 = (row_dict.get("c5_subcategory") or row_dict.get("subcategory") or
+              row_dict.get("sub_category") or row_dict.get("global_gmc_c5_sub_category_desc") or "")
+        b1 = (row_dict.get("b1_brand") or row_dict.get("brand_name") or
+              row_dict.get("brand") or row_dict.get("global_gmc_b1_brand_desc") or "")
+        b2 = (row_dict.get("b2_subbrand") or row_dict.get("sub_brand_name") or
+              row_dict.get("sub_brand") or row_dict.get("subbrand") or
+              row_dict.get("global_gmc_b2_sub_brand_desc") or "")
+
+        rule = {
+            "C1_BUSINESS_SEGMENT": normalize_text(c1),
+            "C2_BUSINESS_SUBSEGMENT": normalize_text(c2),
+            "C3_NEED_STATE": normalize_text(c3),
+            "C4_CATEGORY": normalize_text(c4),
+            "C5_SUBCATEGORY": normalize_text(c5),
+            "B1_BRAND": normalize_text(b1),
+            "B2_SUBBRAND": normalize_text(b2),
+        }
+        if any(rule.values()):
+            rules.append(rule)
+
+    return rules
+
+
+# ─── 2. POSTGRESQL MODEL PRICE INDEX MULTIPLIERS ─────────────────────────────
 
 def load_price_index_from_postgres(
     models: Union[str, List[str]], plan_year: int
@@ -195,13 +284,17 @@ def load_price_index_from_postgres(
         model_list = [models.strip()]
     else:
         model_list = [str(m).strip() for m in models if m]
+
     if not model_list:
         return {m: 1.0 for m in range(1, 13)}
+
     monthly_indices: Dict[int, List[float]] = {m: [] for m in range(1, 13)}
+
     try:
         conn = get_postgres_connection()
         conn.autocommit = True
         cur = conn.cursor()
+
         queries = [
             """
             SELECT mpi.*
@@ -215,6 +308,7 @@ def load_price_index_from_postgres(
             WHERE (mpi.model_name = ANY(%s) OR mpi.model = ANY(%s));
             """
         ]
+
         rows = []
         col_names = []
         for q in queries:
@@ -228,10 +322,19 @@ def load_price_index_from_postgres(
                     break
             except Exception:
                 conn.rollback()
+
         cur.close()
         conn.close()
+
         for r in rows:
             row_dict = dict(zip(col_names, r))
+            row_yr = row_dict.get("year") or row_dict.get("plan_year") or row_dict.get("period_year")
+            if row_yr is not None:
+                try:
+                    if int(row_yr) != plan_year:
+                        continue
+                except (ValueError, TypeError):
+                    pass
             raw_month = (
                 row_dict.get("month_num") or row_dict.get("month") or
                 row_dict.get("period_month") or row_dict.get("mnth")
@@ -251,108 +354,30 @@ def load_price_index_from_postgres(
                     pass
     except Exception as e:
         print(f"[Price Index DB Notice]: {e}")
+
     final_indices = {}
     for m in range(1, 13):
         arr = monthly_indices[m]
         final_indices[m] = (sum(arr) / len(arr)) if arr else 1.0
+
     return final_indices
 
 
-# ─── 2. POSTGRESQL SHIPMENT HIERARCHY MAPPING ───────────────────────────────
-
-def load_shipment_model_rules(models: Union[str, List[str]]) -> List[Dict[str, str]]:
-    """
-    Queries public.shipment_hierarchy_mapping joined with public.master_models
-    to extract product hierarchy rules (C1..C5, B1..B2) for the selected model(s).
-    """
-    if isinstance(models, str):
-        model_list = [models.strip()]
-    else:
-        model_list = [str(m).strip() for m in models if m]
-    if not model_list:
-        return []
-    rows = []
-    col_names = []
-    try:
-        conn = get_postgres_connection()
-        conn.autocommit = True
-        cur = conn.cursor()
-        queries = [
-            """
-            SELECT shm.*
-            FROM public.shipment_hierarchy_mapping shm
-            INNER JOIN public.master_models mm ON shm.model_id = mm.model_id
-            WHERE mm.model_name = ANY(%s) AND (shm.is_active IS NULL OR shm.is_active = TRUE);
-            """,
-            """
-            SELECT shm.*
-            FROM public.shipment_hierarchy_mapping shm
-            WHERE (shm.model_name = ANY(%s) OR shm.model = ANY(%s))
-              AND (shm.is_active IS NULL OR shm.is_active = TRUE);
-            """
-        ]
-        for q in queries:
-            try:
-                params = (model_list,) if q.count("%s") == 1 else (model_list, model_list)
-                cur.execute(q, params)
-                res = cur.fetchall()
-                if res:
-                    rows = res
-                    col_names = [desc[0].lower() for desc in cur.description]
-                    break
-            except Exception:
-                conn.rollback()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        print(f"[Shipment Hierarchy Mapping Notice]: {e}")
-    rules = []
-    for r in rows:
-        row_dict = dict(zip(col_names, r))
-        c1 = (row_dict.get("c1_business_segment") or row_dict.get("business_segment") or
-              row_dict.get("gbu_code") or row_dict.get("global_gmc_c1_business_segment_desc") or "")
-        c2 = (row_dict.get("c2_business_subsegment") or row_dict.get("business_subsegment") or
-              row_dict.get("global_gmc_c2_business_sub_segment_desc") or "")
-        c3 = (row_dict.get("c3_need_state") or row_dict.get("need_state") or
-              row_dict.get("squad_name") or row_dict.get("global_gmc_c3_need_state_desc") or "")
-        c4 = (row_dict.get("c4_category") or row_dict.get("category") or
-              row_dict.get("global_gmc_c4_category_desc") or "")
-        c5 = (row_dict.get("c5_subcategory") or row_dict.get("subcategory") or
-              row_dict.get("sub_category") or row_dict.get("global_gmc_c5_sub_category_desc") or "")
-        b1 = (row_dict.get("b1_brand") or row_dict.get("brand_name") or
-              row_dict.get("brand") or row_dict.get("global_gmc_b1_brand_desc") or "")
-        b2 = (row_dict.get("b2_subbrand") or row_dict.get("sub_brand_name") or
-              row_dict.get("sub_brand") or row_dict.get("subbrand") or
-              row_dict.get("global_gmc_b2_sub_brand_desc") or "")
-        rule = {
-            "C1_BUSINESS_SEGMENT": normalize_text(c1),
-            "C2_BUSINESS_SUBSEGMENT": normalize_text(c2),
-            "C3_NEED_STATE": normalize_text(c3),
-            "C4_CATEGORY": normalize_text(c4),
-            "C5_SUBCATEGORY": normalize_text(c5),
-            "B1_BRAND": normalize_text(b1),
-            "B2_SUBBRAND": normalize_text(b2),
-        }
-        if any(rule.values()):
-            rules.append(rule)
-    return rules
-
-
-# ─── 3. SNOWFLAKE ACTUAL GTS $ DATA INGESTION ────────────────────────────────
+# ─── 3. SNOWFLAKE HISTORICAL GTS $ INGESTION ─────────────────────────────────
 
 def fetch_snowflake_monthly_gts(
-    rules: List[Dict[str, str]], base_year: int, plan_year: int
-) -> Tuple[List[Optional[float]], List[Optional[float]]]:
+    rules: List[Dict[str, str]], base_year: int, plan_year: Optional[int] = None
+) -> Union[List[Optional[float]], Tuple[List[Optional[float]], List[Optional[float]]]]:
     """
     Queries PROD_CVD_DISC.NAIBP_ACCESS.VW_FACT_F360_SHIPMENTS in Snowflake.
-    Returns:
-      gts_base: 12 months of base_year GTS $ in Millions ($M)
-      gts_plan_actual: 12 months of plan_year GTS $ in Millions ($M)
+    If plan_year is provided, returns (gts_base, gts_plan_actual).
+    Otherwise returns gts_base for backward compatibility.
     """
     gts_base = [None] * 12
     gts_plan_actual = [None] * 12
     if not rules:
-        return gts_base, gts_plan_actual
+        return (gts_base, gts_plan_actual) if plan_year is not None else gts_base
+
     row_conditions = []
     for r in rules:
         field_conds = []
@@ -363,19 +388,21 @@ def fetch_snowflake_monthly_gts(
                 field_conds.append(f"UPPER(TRIM(COALESCE({f}, ''))) = '{val_esc}'")
         if field_conds:
             row_conditions.append("(" + " AND ".join(field_conds) + ")")
+
     if not row_conditions:
-        return gts_base, gts_plan_actual
+        return (gts_base, gts_plan_actual) if plan_year is not None else gts_base
+
     where_clause = " OR\n        ".join(row_conditions)
+    year_filter = f"YEAR IN ({base_year}, {plan_year})" if plan_year is not None else f"YEAR = {base_year}"
     query = f"""
     SELECT
         YEAR,
         MONTHNUMBER,
-        SUM(GTS_AMT) AS GTS_AMT,
-        SUM(GTS_QTY) AS GTS_QTY
+        SUM(GTS_AMT) AS GTS_AMT
     FROM PROD_CVD_DISC.NAIBP_ACCESS.VW_FACT_F360_SHIPMENTS
     WHERE
         ({where_clause})
-        AND YEAR IN ({base_year}, {plan_year})
+        AND {year_filter}
     GROUP BY
         YEAR,
         MONTHNUMBER
@@ -383,6 +410,7 @@ def fetch_snowflake_monthly_gts(
         YEAR,
         MONTHNUMBER;
     """
+
     try:
         conn = get_snowflake_connection()
         cur = conn.cursor()
@@ -390,7 +418,8 @@ def fetch_snowflake_monthly_gts(
         rows = cur.fetchall()
         cur.close()
         conn.close()
-        for yr_val, mo_val, amt_val, _ in rows:
+
+        for yr_val, mo_val, amt_val in rows:
             yr = int(yr_val or 0)
             mo = int(mo_val or 0)
             if 1 <= mo <= 12:
@@ -398,164 +427,219 @@ def fetch_snowflake_monthly_gts(
                 val_m = float(amt_val or 0.0) / 1_000_000.0  # Dollars to Millions ($M)
                 if yr == base_year:
                     gts_base[m_idx] = (gts_base[m_idx] or 0.0) + val_m
-                elif yr == plan_year:
+                elif plan_year is not None and yr == plan_year:
                     gts_plan_actual[m_idx] = (gts_plan_actual[m_idx] or 0.0) + val_m
     except Exception as e:
-        print(f"[Snowflake Shipment Query Notice]: {e}")
-    return gts_base, gts_plan_actual
+        print(f"[Snowflake GTS Query Notice]: {e}")
+
+    return (gts_base, gts_plan_actual) if plan_year is not None else gts_base
 
 
-# ─── 4. POSTGRESQL LIVE SHIPMENT BUILDING BLOCKS (PIVOTED MONTHLY QUERY) ────
+# ─── 4. POSTGRESQL CURRENT & PRIOR CYCLE BUILDING BLOCKS (CoC FORMULA) ──────
 
-def _clean_token(s: Any) -> str:
-    """Normalizes string into uppercase alphanumeric token for fuzzy driver matching."""
-    if s is None:
-        return ""
-    return re.sub(r"[^A-Z0-9]", "", str(s).upper())
-
-
-def _matches_driver(db_name: str, grp: str, disp_name: str, match_key: str) -> bool:
-    """Matches a PostgreSQL building block name to a defined dashboard driver."""
-    c_db = _clean_token(db_name)
-    c_disp = _clean_token(disp_name)
-    c_key = _clean_token(match_key)
-    if not c_db:
-        return False
-    # Special handling for "Other" in Inventory vs IBP Overlays
-    if c_disp == "OTHER":
-        if "OVERLAY" in c_db or "IBP" in c_db:
-            return grp == "IBP Overlays"
-        if "INVENT" in c_db:
-            return grp == "Inventory"
-        return grp == "Inventory" if "OVERLAY" not in c_key else grp == "IBP Overlays"
-    # Specific driver root matching
-    if "LIQUIDAT" in c_key and "LIQUIDAT" in c_db:
-        return True
-    if "SUPPLY" in c_key and "SUPPLY" in c_db:
-        return True
-    if "RETAIL" in c_key and "RETAIL" in c_db:
-        return True
-    if "DISTRIB" in c_key and "DISTRIB" in c_db:
-        return True
-    if "INNOVAT" in c_key and "INNOVAT" in c_db:
-        return True
-    if "TRADE" in c_key and "TRADE" in c_db:
-        return True
-    if "CLUB" in c_key and "CLUB" in c_db:
-        return True
-    return (c_key in c_db) or (c_disp in c_db) or (c_db in c_key) or (c_db in c_disp)
-
-
-def load_live_shipment_building_blocks(
-    models: Union[str, List[str]], plan_year: int
-) -> Dict[Any, List[Optional[float]]]:
+def _fetch_cycle_building_blocks(
+    models: List[str], plan_year: int, is_prior: bool = False
+) -> Dict[str, Dict[int, float]]:
     """
-    Queries live shipment building blocks from PostgreSQL using the exact pivoted monthly query:
-    - If a model has building blocks: Returns entered and unentered months.
-    - If a model has NO building blocks: All driver rows remain completely blank (None).
+    Fetches raw monthly building block values from PostgreSQL:
+    - is_prior=False -> Current Cycle (snapshot_type='CURRENT' or active rows)
+    - is_prior=True  -> Previous Cycle (IBP-1 / prior snapshot)
+    """
+    monthly_data: Dict[str, Dict[int, float]] = {}
+    if not models:
+        return monthly_data
+
+    conn = get_postgres_connection()
+    conn.autocommit = True
+    cur = conn.cursor()
+
+    if not is_prior:
+        # Current Cycle: Try CURRENT snapshot first, fallback to active rows
+        sql = """
+        SELECT
+            cbb.name AS building_block,
+            EXTRACT(MONTH FROM cpv.period_month)::int AS month_num,
+            SUM(cpv.value_in_thousands) AS value_in_thousands
+        FROM public.consumption_planning_rows cpr
+        INNER JOIN public.consumption_building_blocks cbb
+            ON cpr.building_block_id = cbb.block_id
+        INNER JOIN public.consumption_planning_values cpv
+            ON cpr.row_id = cpv.row_id
+        INNER JOIN public.master_models mm
+            ON cpr.model_id = mm.model_id
+        WHERE
+            mm.model_name = ANY(%s)
+            AND cpr.is_deleted = FALSE
+            AND cbb.is_active = TRUE
+            AND mm.is_active = TRUE
+            AND EXTRACT(YEAR FROM cpv.period_month) = %s
+            AND (
+                cpr.snapshot_id IS NULL
+                OR cpr.snapshot_id = (
+                    SELECT cs.snapshot_id FROM public.consumption_snapshots cs
+                    JOIN public.planning_cycles pc ON cs.cycle_id = pc.cycle_id
+                    WHERE pc.planning_year_start = %s AND pc.snapshot_type = 'CURRENT'
+                    ORDER BY pc.cycle_month DESC LIMIT 1
+                )
+            )
+        GROUP BY cbb.name, EXTRACT(MONTH FROM cpv.period_month)
+        ORDER BY cbb.name, month_num;
+        """
+        params = (models, plan_year, plan_year)
+    else:
+        # Previous Cycle (IBP-1): Query prior snapshot from planning_cycles
+        sql = """
+        SELECT
+            cbb.name AS building_block,
+            EXTRACT(MONTH FROM cpv.period_month)::int AS month_num,
+            SUM(cpv.value_in_thousands) AS value_in_thousands
+        FROM public.consumption_planning_rows cpr
+        INNER JOIN public.consumption_building_blocks cbb
+            ON cpr.building_block_id = cbb.block_id
+        INNER JOIN public.consumption_planning_values cpv
+            ON cpr.row_id = cpv.row_id
+        INNER JOIN public.master_models mm
+            ON cpr.model_id = mm.model_id
+        WHERE
+            mm.model_name = ANY(%s)
+            AND cpr.is_deleted = FALSE
+            AND cbb.is_active = TRUE
+            AND mm.is_active = TRUE
+            AND EXTRACT(YEAR FROM cpv.period_month) = %s
+            AND cpr.snapshot_id = (
+                SELECT cs.snapshot_id FROM public.consumption_snapshots cs
+                JOIN public.planning_cycles pc ON cs.cycle_id = pc.cycle_id
+                WHERE pc.planning_year_start = %s
+                  AND (
+                      pc.snapshot_type IN ('PRIOR', 'PREVIOUS', 'IBP-1')
+                      OR pc.cycle_id < (
+                          SELECT cycle_id FROM public.planning_cycles
+                          WHERE planning_year_start = %s AND snapshot_type = 'CURRENT'
+                          ORDER BY cycle_month DESC LIMIT 1
+                      )
+                  )
+                ORDER BY pc.cycle_month DESC LIMIT 1
+            )
+        GROUP BY cbb.name, EXTRACT(MONTH FROM cpv.period_month)
+        ORDER BY cbb.name, month_num;
+        """
+        params = (models, plan_year, plan_year, plan_year)
+
+    try:
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+        if not rows:
+            # Fallback for uppercase models
+            upper_models = [m.upper() for m in models]
+            sql_fallback = sql.replace("mm.model_name = ANY(%s)", "UPPER(TRIM(mm.model_name)) = ANY(%s)")
+            params_fallback = (upper_models,) + params[1:]
+            cur.execute(sql_fallback, params_fallback)
+            rows = cur.fetchall()
+    except Exception as e:
+        print(f"[Cycle Query Notice ({'Prior' if is_prior else 'Current'})]: {e}")
+        rows = []
+    finally:
+        cur.close()
+        conn.close()
+
+    for bb_name, m_num, val_k in rows:
+        norm_name = normalize_text(bb_name)
+        if norm_name not in monthly_data:
+            monthly_data[norm_name] = {}
+        # Values stored in thousands -> convert to millions ($M)
+        val_m = float(val_k or 0.0) / 1000.0
+        monthly_data[norm_name][int(m_num)] = monthly_data[norm_name].get(int(m_num), 0.0) + val_m
+
+    return monthly_data
+
+
+def load_coc_building_blocks(
+    models: Union[str, List[str]], plan_year: int, price_indices: Dict[int, float]
+) -> Dict[str, List[Optional[float]]]:
+    """
+    Computes CoC Building Blocks using the exact specified formula:
+        CoC Value[m] = (Current Cycle POS[m] - Previous Cycle POS[m]) * Price Index[m]
     """
     if isinstance(models, str):
         model_list = [models.strip()]
     else:
         model_list = [str(m).strip() for m in models if m]
+
     if not model_list:
-        empty_res = {}
-        for grp, disp, _ in SHIPMENT_DRIVER_ROW_DEFINITIONS:
-            empty_res[disp] = [None] * 12
-            empty_res[(grp, disp)] = [None] * 12
-            empty_res[f"{grp}_{disp}"] = [None] * 12
-        return empty_res
-    rows = []
-    try:
-        conn = get_postgres_connection()
-        conn.autocommit = True
-        cur = conn.cursor()
-        sql = """
-        SELECT
-            sbb.name AS driver_building_block,
-            ROUND(SUM(CASE WHEN EXTRACT(MONTH FROM spv.period_month) = 1  THEN spv.value_in_thousands / 1000.0 ELSE 0 END)::numeric, 4) AS jan_m,
-            ROUND(SUM(CASE WHEN EXTRACT(MONTH FROM spv.period_month) = 2  THEN spv.value_in_thousands / 1000.0 ELSE 0 END)::numeric, 4) AS feb_m,
-            ROUND(SUM(CASE WHEN EXTRACT(MONTH FROM spv.period_month) = 3  THEN spv.value_in_thousands / 1000.0 ELSE 0 END)::numeric, 4) AS mar_m,
-            ROUND(SUM(CASE WHEN EXTRACT(MONTH FROM spv.period_month) = 4  THEN spv.value_in_thousands / 1000.0 ELSE 0 END)::numeric, 4) AS apr_m,
-            ROUND(SUM(CASE WHEN EXTRACT(MONTH FROM spv.period_month) = 5  THEN spv.value_in_thousands / 1000.0 ELSE 0 END)::numeric, 4) AS may_m,
-            ROUND(SUM(CASE WHEN EXTRACT(MONTH FROM spv.period_month) = 6  THEN spv.value_in_thousands / 1000.0 ELSE 0 END)::numeric, 4) AS jun_m,
-            ROUND(SUM(CASE WHEN EXTRACT(MONTH FROM spv.period_month) = 7  THEN spv.value_in_thousands / 1000.0 ELSE 0 END)::numeric, 4) AS jul_m,
-            ROUND(SUM(CASE WHEN EXTRACT(MONTH FROM spv.period_month) = 8  THEN spv.value_in_thousands / 1000.0 ELSE 0 END)::numeric, 4) AS aug_m,
-            ROUND(SUM(CASE WHEN EXTRACT(MONTH FROM spv.period_month) = 9  THEN spv.value_in_thousands / 1000.0 ELSE 0 END)::numeric, 4) AS sep_m,
-            ROUND(SUM(CASE WHEN EXTRACT(MONTH FROM spv.period_month) = 10 THEN spv.value_in_thousands / 1000.0 ELSE 0 END)::numeric, 4) AS oct_m,
-            ROUND(SUM(CASE WHEN EXTRACT(MONTH FROM spv.period_month) = 11 THEN spv.value_in_thousands / 1000.0 ELSE 0 END)::numeric, 4) AS nov_m,
-            ROUND(SUM(CASE WHEN EXTRACT(MONTH FROM spv.period_month) = 12 THEN spv.value_in_thousands / 1000.0 ELSE 0 END)::numeric, 4) AS dec_m,
-            ROUND(SUM(spv.value_in_thousands / 1000.0)::numeric, 4) AS full_year_total_m
-        FROM public.shipment_planning_rows spr
-        INNER JOIN public.shipment_building_blocks sbb
-            ON spr.building_block_id = sbb.block_id
-        INNER JOIN public.shipment_planning_values spv
-            ON spr.row_id = spv.row_id
-        INNER JOIN public.master_models mm
-            ON spr.model_id = mm.model_id
-        WHERE
-            mm.model_name = ANY(%s)
-            AND spr.is_deleted = FALSE
-            AND sbb.is_active = TRUE
-            AND mm.is_active = TRUE
-            AND EXTRACT(YEAR FROM spv.period_month) = %s
-        GROUP BY
-            sbb.name
-        ORDER BY
-            sbb.name ASC;
-        """
-        cur.execute(sql, (model_list, plan_year))
-        rows = cur.fetchall()
-        if not rows and model_list:
-            sql_fallback = sql.replace("mm.model_name = ANY(%s)", "UPPER(TRIM(mm.model_name)) = ANY(%s)")
-            upper_models = [m.strip().upper() for m in model_list]
-            cur.execute(sql_fallback, (upper_models, plan_year))
-            rows = cur.fetchall()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        print(f"[Shipment Building Block Notice]: {e}")
-    if not rows:
-        empty_res = {}
-        for grp, disp, _ in SHIPMENT_DRIVER_ROW_DEFINITIONS:
-            empty_res[disp] = [None] * 12
-            empty_res[(grp, disp)] = [None] * 12
-            empty_res[f"{grp}_{disp}"] = [None] * 12
-        return empty_res
-    driver_data: Dict[Any, List[Optional[float]]] = {}
-    for grp, disp_name, match_key in SHIPMENT_DRIVER_ROW_DEFINITIONS:
-        matched = False
-        monthly_accum = [0.0] * 12
-        for r in rows:
-            db_bb_name = str(r[0] or "")
-            if _matches_driver(db_bb_name, grp, disp_name, match_key):
-                matched = True
-                for m_idx in range(12):
-                    val = float(r[m_idx + 1] or 0.0)
-                    monthly_accum[m_idx] += val
-        if matched:
-            final_vals = [round(v, 4) for v in monthly_accum]
-        else:
-            final_vals = [None] * 12
-        driver_data[disp_name] = final_vals
-        driver_data[(grp, disp_name)] = final_vals
-        driver_data[f"{grp}_{disp_name}"] = final_vals
+        return {disp: [None] * 12 for _, disp, _ in DRIVER_ROW_DEFINITIONS}
+
+    # Fetch Current Cycle (CM) and Previous Cycle (IBP-1) POS data
+    current_raw = _fetch_cycle_building_blocks(model_list, plan_year, is_prior=False)
+    prior_raw = _fetch_cycle_building_blocks(model_list, plan_year, is_prior=True)
+
+    def _get_driver_coc(match_key: str) -> List[Optional[float]]:
+        target = normalize_text(match_key)
+        # Find matching keys in current and prior dictionaries
+        curr_dict = {}
+        for k, v in current_raw.items():
+            if target in k or k in target:
+                curr_dict = v
+                break
+
+        prior_dict = {}
+        for k, v in prior_raw.items():
+            if target in k or k in target:
+                prior_dict = v
+                break
+
+        res = [None] * 12
+        has_any = False
+        for m in range(1, 13):
+            curr_val = curr_dict.get(m, 0.0)
+            prior_val = prior_dict.get(m, 0.0)
+            if m in curr_dict or m in prior_dict:
+                # Formula: (Current - Prior) * Price Index
+                pi_mult = price_indices.get(m, 1.0)
+                coc_val = (curr_val - prior_val) * pi_mult
+                res[m - 1] = round(coc_val, 4)
+                has_any = True
+
+        return res if has_any else [0.0] * 12
+
+    driver_data: Dict[str, List[Optional[float]]] = {}
+    for _, disp_name, match_key in DRIVER_ROW_DEFINITIONS:
+        if match_key.startswith("COMPOUND_"):
+            continue
+        driver_data[disp_name] = _get_driver_coc(match_key)
+
+    # Net Innovation = Innovation CoC + Cannibalization CoC
+    net_inno = [None] * 12
+    for i in range(12):
+        iv = driver_data.get("Innovation", [None] * 12)[i]
+        cv = driver_data.get("Cannibalization", [None] * 12)[i]
+        if iv is not None or cv is not None:
+            net_inno[i] = round((iv or 0.0) + (cv or 0.0), 4)
+    driver_data["Net Innovation"] = net_inno
+
+    # Net Price = Price CoC + Elasticity CoC
+    net_price = [None] * 12
+    for i in range(12):
+        pv = driver_data.get("Price", [None] * 12)[i]
+        ev = driver_data.get("Elasticity", [None] * 12)[i]
+        if pv is not None or ev is not None:
+            net_price[i] = round((pv or 0.0) + (ev or 0.0), 4)
+    driver_data["Net Price"] = net_price
+
     return driver_data
 
 
-# ─── 5. AGGREGATIONS & MATRIX ENGINE ────────────────────────────────────────
+# ─── 5. AGGREGATIONS & GTS YoY MATRIX ENGINE ─────────────────────────────────
 
 def calc_totals(monthly_vals: List[Optional[float]], cutoff_month: int = 0) -> Dict[str, Optional[float]]:
-    """
-    Calculates Q1..Q4, FY, YTD, and YTG totals.
-    If all 12 months are None (blank driver), returns None for all totals so that the row stays completely blank.
-    """
+    """Calculates Q1..Q4, FY, YTD, and YTG totals dynamically."""
     has_data = any(v is not None for v in monthly_vals)
     if not has_data:
         return {col: None for col in ["Q1", "Q2", "Q3", "Q4", "FY", "YTD", "YTG"]}
+
     def _sum_range(st, en):
         arr = [v for v in monthly_vals[st:en] if v is not None and not (isinstance(v, float) and math.isnan(v))]
         return round(sum(arr), 4) if arr else 0.0
+
     return {
         "Q1": _sum_range(0, 3),
         "Q2": _sum_range(3, 6),
@@ -567,29 +651,28 @@ def calc_totals(monthly_vals: List[Optional[float]], cutoff_month: int = 0) -> D
     }
 
 
-def compute_shipment_summary_matrix(models: Union[str, List[str]]) -> Dict[str, Any]:
+def compute_gts_summary_matrix(models: Union[str, List[str]]) -> Dict[str, Any]:
     """
-    Computes complete Shipment Summary matrix:
-    1. Loads Price Index from PostgreSQL table public.model_price_index
-    2. Computes Factory POS $ = POS Plan $ * Price Index
-    3. Populates GTS actuals from Snowflake VW_FACT_F360_SHIPMENTS
-    4. Projects future months as Factory POS + Sum(Shipment Building Blocks)
-    5. Calculates GTS YoY % against base_year GTS
+    Computes complete GTS YoY Summary Matrix:
+    1. Historical Row: {base_year} GTS $ from Snowflake VW_FACT_F360_SHIPMENTS
+    2. Factory POS $ integration from consumption_summary.py * price_index
+    3. Building Blocks: Sourced dynamically for plan_year
+    4. Current Row: {plan_year} GTS $:
+         - Actual GTS shipments for completed months
+         - Forecast (Baseline + Building Blocks) for remaining months
+    5. GTS YoY % Row: ((Plan GTS - Base GTS) / Base GTS) * 100
+    6. NO Difference row
     """
     base_year, plan_year = get_active_years()
+    rules = load_model_rules(models)
 
-    # 1. Hierarchy rules from PostgreSQL shipment_hierarchy_mapping
-    rules = load_shipment_model_rules(models)
-
-    # 2. Snowflake GTS $ actuals for base_year and plan_year
+    # 1. Base Year and Plan Year GTS actuals from Snowflake
     gts_base, gts_plan_actual = fetch_snowflake_monthly_gts(rules, base_year, plan_year)
 
-    # 3. Live shipment building blocks from PostgreSQL (Exact pivoted query)
-    drivers = load_live_shipment_building_blocks(models, plan_year)
-
-    # 4. Compute Factory POS $ = POS Plan $ * Price Index (from public.model_price_index)
+    # 2. Price Index multipliers from PostgreSQL
     price_indices = load_price_index_from_postgres(models, plan_year)
 
+    # 3. Consumption Summary & Factory POS Integration
     pos_plan = [0.0] * 12
     cons_cutoff = 0
     cons_data = {}
@@ -600,7 +683,7 @@ def compute_shipment_summary_matrix(models: Union[str, List[str]]) -> Dict[str, 
         pos_plan = [float(v or 0.0) for v in pos_plan_raw]
         cons_cutoff = int(cons_data.get("cutoff_month") or 0)
     except Exception as e:
-        print(f"[Factory POS Engine Notice]: {e}")
+        print(f"[Consumption Summary / Factory POS Integration Notice]: {e}")
 
     factory_pos = [0.0] * 12
     for i in range(12):
@@ -609,24 +692,32 @@ def compute_shipment_summary_matrix(models: Union[str, List[str]]) -> Dict[str, 
         idx_mult = price_indices.get(month_num, 1.0)
         factory_pos[i] = round(pos_val * idx_mult, 2)
 
-    # 5. Sum all shipment building blocks for each month
-    total_shipment_bb = [0.0] * 12
-    for grp, disp_name, _ in SHIPMENT_DRIVER_ROW_DEFINITIONS:
-        d_vals = drivers.get((grp, disp_name)) or drivers.get(disp_name, [None] * 12)
+    # 4. Building Blocks
+    drivers = load_coc_building_blocks(models, plan_year, price_indices)
+
+    individual_driver_names = [
+        "Base Trend", "Season", "Competition", "Distribution", "Innovation",
+        "Cannibalization", "Discontinuations", "Renovations", "Media", "Trade",
+        "Price", "Elasticity", "Club", "Other (Not Defined)"
+    ]
+
+    total_monthly_bb = [0.0] * 12
+    has_bb_for_month = [False] * 12
+    for d_name in individual_driver_names:
+        d_vals = drivers.get(d_name, [None] * 12)
         for i in range(12):
             if d_vals[i] is not None:
-                total_shipment_bb[i] += d_vals[i]
+                total_monthly_bb[i] += d_vals[i]
+                has_bb_for_month[i] = True
 
-    # 6. Dynamically detect cutoff month from Snowflake plan_year GTS actuals
-    # A month with actual GTS (positive, zero, or negative) is recognized using `is not None`
+    # 5. Dynamically detect cutoff month from Snowflake plan_year GTS actuals
+    # Completed months with positive, zero, or negative actuals are recognized using `is not None`
     detected_gts_cutoff = 0
     for idx, v in enumerate(gts_plan_actual):
         if v is not None:
             detected_gts_cutoff = idx + 1
 
     # Safe dynamic fallback:
-    # If GTS actuals exist in Snowflake, use detected_gts_cutoff.
-    # Otherwise, inherit Consumption Summary's cutoff if available; else safely default to 0 (all forecast).
     if detected_gts_cutoff > 0:
         cutoff_month = detected_gts_cutoff
     elif cons_cutoff > 0:
@@ -634,67 +725,307 @@ def compute_shipment_summary_matrix(models: Union[str, List[str]]) -> Dict[str, 
     else:
         cutoff_month = 0
 
-    # 7. Plan Year GTS Row Population:
-    # Actuals for months <= cutoff_month (0-indexed i < cutoff_month) where gts_plan_actual is not None;
-    # Preserves valid zero and negative actuals. Forecast (Factory POS + Building Blocks) for future/incomplete months.
+    # 6. Current Year GTS Row Population:
+    # Actual GTS shipments for completed months (i < cutoff_month where gts_plan_actual is not None);
+    # Preserves valid zero and negative actuals.
+    # Forecast (Baseline + Building Blocks) for remaining/incomplete months.
     gts_plan = [0.0] * 12
     for i in range(12):
         if i < cutoff_month and gts_plan_actual[i] is not None:
             gts_plan[i] = round(gts_plan_actual[i], 2)
         else:
-            fp = factory_pos[i] or 0.0
-            bb = total_shipment_bb[i] or 0.0
-            gts_plan[i] = round(fp + bb, 2)
+            baseline = gts_base[i] if gts_base[i] is not None else factory_pos[i]
+            bb = total_monthly_bb[i] if has_bb_for_month[i] else 0.0
+            gts_plan[i] = round((baseline or 0.0) + bb, 2)
 
-    # 8. GTS YoY % Calculation
+    # 7. GTS YoY % Calculation against Base GTS
     gts_yoy_pct = [0.0] * 12
     for i in range(12):
-        b_val = gts_base[i]
-        p_val = gts_plan[i]
-        if b_val and b_val > 0 and p_val is not None:
-            gts_yoy_pct[i] = ((p_val - b_val) / b_val) * 100.0
+        v_base = gts_base[i]
+        v_plan = gts_plan[i]
+        if v_base and v_base > 0 and v_plan is not None:
+            gts_yoy_pct[i] = ((v_plan - v_base) / v_base) * 100.0
         else:
             gts_yoy_pct[i] = 0.0
 
-    # 9. Totals across quarters, FY, YTD, YTG
-    totals_factory_pos = calc_totals(factory_pos, cutoff_month)
-    totals_gts = calc_totals(gts_plan, cutoff_month)
+    # 8. Totals calculation
     totals_base = calc_totals(gts_base, cutoff_month)
+    totals_plan = calc_totals(gts_plan, cutoff_month)
+    totals_factory_pos = calc_totals(factory_pos, cutoff_month)
 
     totals_yoy = {}
-    for col in ["Q1", "Q2", "Q3", "Q4", "FY", "YTD", "YTG"]:
-        b_tot = totals_base.get(col, 0.0)
-        p_tot = totals_gts.get(col, 0.0)
-        if b_tot and b_tot > 0 and p_tot is not None:
-            totals_yoy[col] = ((p_tot - b_tot) / b_tot) * 100.0
+    for col_name in ["Q1", "Q2", "Q3", "Q4", "FY", "YTD", "YTG"]:
+        b_val = totals_base.get(col_name)
+        p_val = totals_plan.get(col_name)
+        if b_val and b_val > 0 and p_val is not None:
+            totals_yoy[col_name] = ((p_val - b_val) / b_val) * 100.0
         else:
-            totals_yoy[col] = 0.0
+            totals_yoy[col_name] = 0.0
 
     driver_totals = {}
-    for grp, disp_name, _ in SHIPMENT_DRIVER_ROW_DEFINITIONS:
-        vals = drivers.get((grp, disp_name)) or drivers.get(disp_name, [None] * 12)
-        tot = calc_totals(vals, cutoff_month)
-        driver_totals[disp_name] = tot
-        driver_totals[(grp, disp_name)] = tot
-        driver_totals[f"{grp}_{disp_name}"] = tot
+    for _, disp_name, _ in DRIVER_ROW_DEFINITIONS:
+        m_vals = drivers.get(disp_name, [None] * 12)
+        driver_totals[disp_name] = calc_totals(m_vals, cutoff_month)
 
     return {
         "base_year": base_year,
         "plan_year": plan_year,
         "cutoff_month": cutoff_month,
-        "label_base": str(base_year),
-        "label_plan": str(plan_year),
-        "label_factory_pos": f"{plan_year} FACTORY POS",
-        "label_gts": f"{plan_year} GTS",
+        "label_base": f"{base_year} GTS $",
+        "label_plan": f"{plan_year} GTS $",
+        "label_gts": f"{plan_year} GTS $",
+        "label_pct": "GTS YoY %",
         "models": models,
+        "gts_base": gts_base,
+        "totals_base": totals_base,
+        "gts_plan_actual": gts_plan_actual,
+        "gts_plan": gts_plan,
+        "totals_plan": totals_plan,
+        "totals_gts": totals_plan,
         "factory_pos": factory_pos,
         "totals_factory_pos": totals_factory_pos,
         "drivers": drivers,
         "driver_totals": driver_totals,
-        "gts_plan": gts_plan,
-        "totals_gts": totals_gts,
-        "gts_base": gts_base,
-        "totals_base": totals_base,
         "gts_yoy_pct": gts_yoy_pct,
         "totals_yoy": totals_yoy,
     }
+
+
+# ─── 6. DYNAMIC HEATMAP & FORMATTING HELPERS (1 DECIMAL PLACE) ───────────────
+
+def get_driver_heatmap_style(val: float, max_pos: float, max_neg_mag: float):
+    """11-Tier Dynamic Heatmap Gradient with High Red (#FF6B6B)."""
+    if val is None or (isinstance(val, float) and math.isnan(val)):
+        return "#ffffff", "#111827", "500"
+    v = float(val)
+    if abs(v) <= 0.004:
+        return "#ffffff", "#374151", "500"
+
+    if v > 0:
+        ratio = (v / max_pos) if max_pos > 0 else 0
+        if ratio >= 0.75:
+            return "#00897b", "#ffffff", "700"
+        elif ratio >= 0.50:
+            return "#26a69a", "#ffffff", "600"
+        elif ratio >= 0.25:
+            return "#4db6ac", "#004d40", "600"
+        elif ratio >= 0.10:
+            return "#80cbc4", "#004d40", "600"
+        else:
+            return "#c8ece6", "#004d40", "500"
+    else:
+        ratio = (abs(v) / max_neg_mag) if max_neg_mag > 0 else 0
+        if ratio >= 0.75:
+            return "#FF6B6B", "#ffffff", "700"   # Tier 5: High Red (#FF6B6B)
+        elif ratio >= 0.50:
+            return "#ef6c6a", "#ffffff", "700"
+        elif ratio >= 0.25:
+            return "#f8a5a3", "#7f0000", "600"
+        elif ratio >= 0.10:
+            return "#ffcdd2", "#7f0000", "600"
+        else:
+            return "#ffebee", "#7f0000", "500"
+
+
+def fmt_currency(val, is_driver: bool = False, decimals: int = 1) -> str:
+    """Formats GTS currency values to 1 decimal place (.1f). Prevents -$0.0."""
+    if val is None or (isinstance(val, float) and math.isnan(val)):
+        return ""
+    v = float(val)
+    if round(abs(v), decimals) == 0:
+        return "$0.0" if decimals == 1 else "$0.00"
+    if is_driver:
+        if v < 0:
+            return f"-${abs(v):,.{decimals}f}"
+        return f"${v:,.{decimals}f}"
+    return f"${v:,.{decimals}f}"
+
+
+def fmt_pct(val, decimals: int = 1) -> str:
+    """Formats percentage values to 1 decimal place. Prevents -0.0%."""
+    if val is None or (isinstance(val, float) and math.isnan(val)):
+        return ""
+    v = float(val)
+    if round(abs(v), decimals) == 0:
+        return f"{0.0:.{decimals}f}%"
+    return f"{v:.{decimals}f}%"
+
+
+def build_data_cells(m_vals, totals, max_pos, max_neg_mag, is_driver=False, is_pct=False, bg_override=None, decimals=1):
+    """Builds monthly, quarterly, and full-year table cells with 1 decimal formatting."""
+    cells = []
+    for val in m_vals:
+        txt = fmt_pct(val, decimals=decimals) if is_pct else fmt_currency(val, is_driver=is_driver, decimals=decimals)
+        if bg_override:
+            bg_col = bg_override
+            txt_col = "#111827"
+            font_wt = "700"
+        elif is_driver:
+            bg_col, txt_col, font_wt = get_driver_heatmap_style(val, max_pos, max_neg_mag)
+        elif is_pct:
+            bg_col = "#ffffff"
+            txt_col = "#004d40" if (val is not None and val >= 0) else "#7f0000"
+            font_wt = "700"
+        else:
+            bg_col = "#ffffff"
+            txt_col = "#111827"
+            font_wt = "700"
+
+        cells.append(html.Td(txt, style={
+            "padding": "6px 8px", "textAlign": "right", "fontSize": "12px",
+            "backgroundColor": bg_col, "color": txt_col, "fontWeight": font_wt,
+            "border": "1px solid #e5e7eb"
+        }))
+
+    for col_name in ["Q1", "Q2", "Q3", "Q4", "FY", "YTD", "YTG"]:
+        val = totals.get(col_name)
+        txt = fmt_pct(val, decimals=decimals) if is_pct else fmt_currency(val, is_driver=is_driver, decimals=decimals)
+
+        if bg_override:
+            bg_col = bg_override
+            txt_col = "#111827"
+            font_wt = "700"
+        elif is_driver:
+            bg_col, txt_col, font_wt = get_driver_heatmap_style(val, max_pos, max_neg_mag)
+        elif is_pct:
+            bg_col = "#f9fafb"
+            txt_col = "#004d40" if (val is not None and val >= 0) else "#7f0000"
+            font_wt = "700"
+        else:
+            bg_col = "#f9fafb"
+            txt_col = "#111827"
+            font_wt = "800"
+
+        b_left = "3px solid #9ca3af" if col_name in ["Q1", "YTD"] else "1px solid #e5e7eb"
+
+        cells.append(html.Td(txt, style={
+            "padding": "6px 8px", "textAlign": "right", "fontSize": "12px",
+            "backgroundColor": bg_col, "color": txt_col, "fontWeight": font_wt,
+            "border": "1px solid #e5e7eb", "borderLeft": b_left
+        }))
+
+    return cells
+
+
+# ─── 7. GTS CoC TABLE RENDERER (NO DIFFERENCE ROW, 1 DECIMAL PLACE) ─────────
+
+def render_gts_table(data: dict) -> html.Div:
+    """
+    Renders GTS CoC Summary Matrix:
+    1. {base_year} GTS $ (from Snowflake)
+    2. 11 Building Block Drivers: (Current - Previous) * Price Index
+    3. {plan_year} GTS $ (Sum of all CoC Building Blocks)
+    4. GTS CoC %
+    (NO Difference row, all currency in .1f decimal precision)
+    """
+    max_pos, max_neg_mag = 0.001, 0.001
+    for d_name, m_vals in data["drivers"].items():
+        for v in m_vals:
+            if v is not None and not (isinstance(v, float) and math.isnan(v)):
+                if v > max_pos:
+                    max_pos = v
+                elif v < 0 and abs(v) > max_neg_mag:
+                    max_neg_mag = abs(v)
+
+    th_style = {
+        "backgroundColor": "#d7ece8", "color": "#1f2937", "fontWeight": "800",
+        "fontSize": "13px", "padding": "8px 10px", "border": "1px solid #d1d5db",
+        "textAlign": "center", "whiteSpace": "nowrap"
+    }
+
+    header_cells = [
+        html.Th("", style={**th_style, "minWidth": "110px", "borderRight": "none"}),
+        html.Th("Driver", style={**th_style, "minWidth": "160px", "textAlign": "left"}),
+    ]
+
+    for m in MONTHS:
+        header_cells.append(html.Th(m, style=th_style))
+
+    divider_style = {**th_style, "borderLeft": "3px solid #9ca3af"}
+    header_cells.append(html.Th("Q1", style=divider_style))
+    header_cells.append(html.Th("Q2", style=th_style))
+    header_cells.append(html.Th("Q3", style=th_style))
+    header_cells.append(html.Th("Q4", style=th_style))
+    header_cells.append(html.Th("FY", style={**th_style, "fontWeight": "900"}))
+    header_cells.append(html.Th("YTD", style=divider_style))
+    header_cells.append(html.Th("YTG", style=th_style))
+
+    thead = html.Thead(html.Tr(header_cells))
+    tbody_rows = []
+
+    # 1. Base Year Row: {base_year} GTS $
+    base_yr = data.get("base_year")
+    base_label = data.get("label_base") or (f"{base_yr} GTS $" if base_yr else "Base GTS $")
+    tbody_rows.append(html.Tr([
+        html.Td("", style={"backgroundColor": "#ffffff", "border": "1px solid #e5e7eb"}),
+        html.Td(base_label, style={
+            "fontWeight": "800", "fontSize": "13px", "padding": "6px 10px", "border": "1px solid #e5e7eb"
+        }),
+        *build_data_cells(data["gts_base"], data["totals_base"], max_pos, max_neg_mag, decimals=1)
+    ]))
+
+    # 2. Driver Rows (11 Drivers: (Current - Previous) * Price Index)
+    group_counts = {}
+    for grp, _, _ in DRIVER_ROW_DEFINITIONS:
+        group_counts[grp] = group_counts.get(grp, 0) + 1
+
+    seen_groups = set()
+    SUB_DRIVERS = {"Innovation", "Cannibalization", "Price", "Elasticity"}
+
+    for grp, driver_name, _ in DRIVER_ROW_DEFINITIONS:
+        cells = []
+        if grp not in seen_groups:
+            seen_groups.add(grp)
+            cells.append(html.Td(
+                grp, rowSpan=group_counts[grp],
+                style={
+                    "textAlign": "center", "verticalAlign": "middle",
+                    "backgroundColor": "#dff0ea", "color": "#065f46",
+                    "fontWeight": "800", "fontSize": "13px", "border": "1px solid #c4e4dc",
+                    "padding": "8px 6px"
+                }
+            ))
+
+        is_sub = driver_name in SUB_DRIVERS
+        cells.append(html.Td(driver_name, style={
+            "fontWeight": "500", "fontSize": "12px", "color": "#1f2937", "padding": "6px 14px",
+            "border": "1px solid #e5e7eb", "textAlign": "right" if is_sub else "left",
+            "fontStyle": "italic" if is_sub else "normal"
+        }))
+
+        d_vals = data["drivers"].get(driver_name, [None] * 12)
+        d_totals = data["driver_totals"].get(driver_name, {})
+        cells.extend(build_data_cells(d_vals, d_totals, max_pos, max_neg_mag, is_driver=True, decimals=1))
+        tbody_rows.append(html.Tr(cells))
+
+    # 3. Plan Year Row: {plan_year} GTS $
+    plan_yr = data.get("plan_year")
+    plan_label = data.get("label_plan") or data.get("label_gts") or (f"{plan_yr} GTS $" if plan_yr else "Plan GTS $")
+    tbody_rows.append(html.Tr([
+        html.Td("", style={"backgroundColor": "#ffffff", "border": "1px solid #e5e7eb"}),
+        html.Td(plan_label, style={
+            "fontWeight": "800", "fontSize": "13px", "padding": "6px 10px",
+            "border": "1px solid #e5e7eb", "backgroundColor": "#f1ebfb", "color": "#111827"
+        }),
+        *build_data_cells(data["gts_plan"], data.get("totals_plan") or data.get("totals_gts", {}), max_pos, max_neg_mag, bg_override="#faf6ff", decimals=1)
+    ]))
+
+    # 4. GTS YoY % Row
+    pct_label = data.get("label_pct", "GTS YoY %")
+    tbody_rows.append(html.Tr([
+        html.Td("", style={"backgroundColor": "#ffffff", "border": "1px solid #e5e7eb"}),
+        html.Td(pct_label, style={
+            "fontWeight": "800", "fontSize": "13px", "padding": "6px 10px",
+            "border": "1px solid #e5e7eb", "color": "#004d40"
+        }),
+        *build_data_cells(data["gts_yoy_pct"], data["totals_yoy"], max_pos, max_neg_mag, is_pct=True, decimals=1)
+    ]))
+
+    # (NO Difference row)
+
+    return html.Div([
+        html.Table([thead, html.Tbody(tbody_rows)], style={
+            "width": "100%", "borderCollapse": "collapse", "backgroundColor": "#ffffff",
+            "borderRadius": "8px", "boxShadow": "0 2px 8px rgba(0,0,0,0.04)"
+        })
+    ], style={"border": "1px solid #d1d5db", "borderRadius": "8px", "overflow": "hidden"})
