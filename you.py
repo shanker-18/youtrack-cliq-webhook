@@ -99,8 +99,9 @@ def normalize_text(val: Any) -> str:
     if val is None:
         return ""
     s = str(val).replace("\xa0", " ").strip().upper()
-    s = re.sub(r"\s+", " ", s)
-    return s
+    if s in ["NAN", "NONE", "NULL", "EMPTY", "N/A", "<NA>"]:
+        return ""
+    return re.sub(r"\s+", " ", s)
 
 
 def parse_month_num(val: Any) -> Optional[int]:
@@ -133,159 +134,235 @@ def get_postgres_connection():
         port=int(os.getenv("IBP_DB_PORT", "5432")),
         dbname=os.getenv("IBP_DB_NAME", "na_ibp_db"),
         user=os.getenv("IBP_DB_USER", "postgres"),
-        password=os.getenv("IBP_DB_PASSWORD", "postgres")
+        password=os.getenv("IBP_DB_PASSWORD", "postgres"),
+        sslmode=os.getenv("IBP_DB_SSLMODE", "prefer"),
+        connect_timeout=5,
     )
 
 
 def get_snowflake_connection():
-    """Connects to Snowflake for historical GTS."""
+    """Connects to Snowflake using RSA Private Key or password credentials."""
     import snowflake.connector
-    return snowflake.connector.connect(
-        account=os.getenv("SNOWFLAKE_ACCOUNT", ""),
-        user=os.getenv("SNOWFLAKE_USER", ""),
-        password=os.getenv("SNOWFLAKE_PASSWORD", ""),
-        warehouse=os.getenv("SNOWFLAKE_WAREHOUSE", "COMPUTE_WH"),
-        database=os.getenv("SNOWFLAKE_DATABASE", "NA_IBP_DB"),
-        schema=os.getenv("SNOWFLAKE_SCHEMA", "PUBLIC"),
-        role=os.getenv("SNOWFLAKE_ROLE", "ACCOUNTADMIN")
-    )
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.backends import default_backend
+
+    config = {
+        "user": os.getenv("SNOWFLAKE_USER", "SA-JX2-SNFK-CVD-RPT@KENVUE.COM"),
+        "account": os.getenv("SNOWFLAKE_ACCOUNT", "BK40750.east-us-2.azure"),
+        "warehouse": os.getenv("SNOWFLAKE_WAREHOUSE", "PROD_ENVIRONMENT_USAGE_XSMALL1_WH"),
+        "database": os.getenv("SNOWFLAKE_DATABASE", "PROD_CVD_DISC"),
+        "schema": os.getenv("SNOWFLAKE_SCHEMA", "NAIBP_ACCESS"),
+        "role": os.getenv("SNOWFLAKE_ROLE", "PROD_SA_JX2_SNFK_CVD_RPT_ER"),
+    }
+    private_key_path = os.getenv("SNOWFLAKE_PRIVATE_KEY_PATH")
+    private_key_pem = os.getenv("SNOWFLAKE_PRIVATE_KEY")
+    passphrase = os.getenv("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE")
+
+    if private_key_path or private_key_pem:
+        try:
+            if private_key_path and os.path.exists(private_key_path):
+                with open(private_key_path, "rb") as k_file:
+                    p_key = serialization.load_pem_private_key(
+                        k_file.read(),
+                        password=passphrase.encode() if passphrase else None,
+                        backend=default_backend()
+                    )
+            elif private_key_pem:
+                pem_clean = private_key_pem.strip('"\'').replace("\\n", "\n")
+                p_key = serialization.load_pem_private_key(
+                    pem_clean.encode(),
+                    password=passphrase.encode() if passphrase else None,
+                    backend=default_backend()
+                )
+            else:
+                p_key = None
+
+            if p_key:
+                pkb = p_key.private_bytes(
+                    encoding=serialization.Encoding.DER,
+                    format=serialization.PrivateFormat.PKCS8,
+                    encryption_algorithm=serialization.NoEncryption()
+                )
+                config["private_key"] = pkb
+        except Exception as e:
+            print(f"[Snowflake Key Notice]: {e}")
+            if os.getenv("SNOWFLAKE_PASSWORD"):
+                config["password"] = os.getenv("SNOWFLAKE_PASSWORD")
+    elif os.getenv("SNOWFLAKE_PASSWORD"):
+        config["password"] = os.getenv("SNOWFLAKE_PASSWORD")
+
+    return snowflake.connector.connect(**config)
 
 
-# ─── 1. GTS CoC DRIVER DEFINITIONS & DISPLAY ORDER ───────────────────────────
-# Format: (Category, Driver Display Name, [Aliases for DB Matching])
+# ─── DRIVER ROW DEFINITIONS MATCHING THE OFFICIAL IMAGE ──────────────────────
 GTS_COC_DRIVER_DEFINITIONS = [
-    ("External", "Base Trend", ["BASE TREND", "BASE_TREND", "BASETREND", "BASE"]),
-    ("External", "Season", ["SEASON", "SEASONALITY", "SEASONAL"]),
-    ("External", "Competition", ["COMPETITION", "COMP"]),
-    ("Distribution", "Distribution", ["DISTRIBUTION", "DIST", "TDP"]),
-    ("Innovation", "Net Innovation", ["NET INNOVATION", "NET_INNOVATION"]),
-    ("Innovation", "Innovation", ["INNOVATION", "INNO", "NEW PRODUCT"]),
-    ("Innovation", "Cannibalization", ["CANNIBALIZATION", "CANNIBAL"]),
-    ("Innovation", "Discontinuations", ["DISCONTINUATIONS", "DISCONTINUATION", "DISCO", "DISCONTINUED"]),
-    ("Innovation", "Renovation", ["RENOVATION", "RENO", "RENOVATIONS"]),
-    ("Investment", "Media", ["MEDIA", "ADVERTISING", "A&P"]),
-    ("Investment", "Trade", ["TRADE", "PROMO", "PROMOTIONS"]),
-    ("Price", "Net Price", ["NET PRICE", "NET_PRICE"]),
-    ("Price", "Price", ["PRICE", "PRICE INCREASE", "PRICING"]),
-    ("Price", "Elasticity", ["ELASTICITY", "PRICE ELASTICITY"]),
-    ("Other", "Club", ["CLUB", "CLUB EXPANSION"]),
-    ("Other", "Other (Not Defined)", ["OTHER", "OTHER (NOT DEFINED)", "NOT DEFINED", "UNALLOCATED"]),
-    ("Other", "Inventory", ["INVENTORY", "INV", "STOCK"]),
+    # (Category Group, Display Name, DB Match Key)
+    ("External",     "Base Trend",          "BASE TREND"),
+    ("External",     "Season",              "SEASON"),
+    ("External",     "Competition",         "COMPETITION"),
+    ("Distribution", "Distribution",        "DISTRIBUTION"),
+    ("Innovation",   "Net Innovation",      "COMPOUND_NET_INNOVATION"),  # Innovation + Cannibalization
+    ("Innovation",   "Innovation",          "INNOVATION"),
+    ("Innovation",   "Cannibalization",     "CANNIBALIZATION"),
+    ("Innovation",   "Discontinuations",    "DISCONTINUATIONS"),
+    ("Innovation",   "Renovation",          "RENOVATION"),
+    ("Investment",   "Media",               "MEDIA"),
+    ("Investment",   "Trade",               "TRADE"),
+    ("Price",        "Net Price",           "COMPOUND_NET_PRICE"),       # Price + Elasticity
+    ("Price",        "Price",               "PRICE"),
+    ("Price",        "Elasticity",          "ELASTICITY"),
+    ("Other",        "Club",                "CLUB"),
+    ("Other",        "Other (Not Defined)", "OTHER"),
+    ("Other",        "Inventory",           "INVENTORY"),
 ]
 
 SUB_DRIVERS = {"Innovation", "Cannibalization", "Price", "Elasticity"}
 
 
-# ─── 2. HIERARCHY RULES & EXCEL INTEGRATION ──────────────────────────────────
+# ─── 1. POSTGRESQL HIERARCHY RULES ──────────────────────────────────────────
 
 def load_model_rules(models: Union[str, List[str]]) -> List[Dict[str, str]]:
-    """Loads filtering rules for model(s) from Excel."""
+    """Loads product hierarchy rules (C1..C5, B1..B2) for selected model(s)."""
     if isinstance(models, str):
-        models = [models]
-    model_set = {normalize_text(m) for m in models}
+        model_list = [models.strip()]
+    else:
+        model_list = [str(m).strip() for m in models if m]
 
-    excel_paths = [
-        os.path.join(os.getcwd(), "Model Mapping File - Circana POS.xlsx"),
-        os.path.join(os.getcwd(), "Model Mapping.xlsx"),
-        os.path.join(os.getcwd(), "Book1.xlsx")
+    if not model_list:
+        return []
+
+    conn = get_postgres_connection()
+    conn.autocommit = True
+    cur = conn.cursor()
+
+    queries = [
+        """
+        SELECT shm.*
+        FROM public.shipment_hierarchy_mapping shm
+        INNER JOIN public.master_models mm ON shm.model_id = mm.model_id
+        WHERE mm.model_name = ANY(%s) AND (shm.is_active IS NULL OR shm.is_active = TRUE);
+        """,
+        """
+        SELECT chm.*
+        FROM public.consumption_hierarchy_mapping chm
+        INNER JOIN public.master_models mm ON chm.model_id = mm.model_id
+        WHERE mm.model_name = ANY(%s) AND (chm.is_active IS NULL OR chm.is_active = TRUE);
+        """
     ]
-    path = next((p for p in excel_paths if os.path.exists(p)), None)
-    if not path:
-        return [{"B1_BRAND": m} for m in models]
 
-    import openpyxl
-    wb = openpyxl.load_workbook(path, data_only=True)
-    sheet = wb.active
-    rows = list(sheet.iter_rows(values_only=True))
-    if not rows:
-        return [{"B1_BRAND": m} for m in models]
+    rows = []
+    col_names = []
+    for q in queries:
+        try:
+            cur.execute(q, (model_list,))
+            res = cur.fetchall()
+            if res:
+                rows = res
+                col_names = [desc[0].lower() for desc in cur.description]
+                break
+        except Exception:
+            conn.rollback()
 
-    headers = [normalize_text(h) for h in rows[0]]
-    matched_rules = []
+    cur.close()
+    conn.close()
 
-    for r in rows[1:]:
-        r_dict = {headers[i]: r[i] for i in range(min(len(headers), len(r)))}
-        model_name = normalize_text(r_dict.get("MODEL") or r_dict.get("MODEL NAME"))
-        if model_name in model_set:
-            rule = {}
-            for col in ["B1_BRAND", "B2_NEED_STATE", "B3_SEGMENT", "B4_SUB_SEGMENT", "B5_FORM"]:
-                val = r_dict.get(col)
-                if val:
-                    rule[col] = str(val).strip()
-            if rule:
-                matched_rules.append(rule)
+    rules = []
+    for r in rows:
+        row_dict = dict(zip(col_names, r))
+        c1 = (row_dict.get("c1_business_segment") or row_dict.get("business_segment") or
+              row_dict.get("gbu_code") or row_dict.get("global_gmc_c1_business_segment_desc") or "")
+        c2 = (row_dict.get("c2_business_subsegment") or row_dict.get("business_subsegment") or
+              row_dict.get("global_gmc_c2_business_sub_segment_desc") or "")
+        c3 = (row_dict.get("c3_need_state") or row_dict.get("need_state") or
+              row_dict.get("squad_name") or row_dict.get("global_gmc_c3_need_state_desc") or "")
+        c4 = (row_dict.get("c4_category") or row_dict.get("category") or
+              row_dict.get("global_gmc_c4_category_desc") or "")
+        c5 = (row_dict.get("c5_subcategory") or row_dict.get("subcategory") or
+              row_dict.get("sub_category") or row_dict.get("global_gmc_c5_sub_category_desc") or "")
+        b1 = (row_dict.get("b1_brand") or row_dict.get("brand_name") or
+              row_dict.get("brand") or row_dict.get("global_gmc_b1_brand_desc") or "")
+        b2 = (row_dict.get("b2_subbrand") or row_dict.get("sub_brand_name") or
+              row_dict.get("sub_brand") or row_dict.get("subbrand") or
+              row_dict.get("global_gmc_b2_sub_brand_desc") or "")
 
-    return matched_rules or [{"B1_BRAND": m} for m in models]
+        rule = {
+            "C1_BUSINESS_SEGMENT": normalize_text(c1),
+            "C2_BUSINESS_SUBSEGMENT": normalize_text(c2),
+            "C3_NEED_STATE": normalize_text(c3),
+            "C4_CATEGORY": normalize_text(c4),
+            "C5_SUBCATEGORY": normalize_text(c5),
+            "B1_BRAND": normalize_text(b1),
+            "B2_SUBBRAND": normalize_text(b2),
+        }
+        if any(rule.values()):
+            rules.append(rule)
+
+    return rules
 
 
-def load_price_factor_from_postgres(models: Union[str, List[str]], plan_year: int) -> Dict[int, float]:
+# ─── 2. POSTGRESQL MODEL PRICE FACTOR / PRICE INDEX MULTIPLIERS ─────────────
+
+def load_price_factor_from_postgres(
+    models: Union[str, List[str]], plan_year: int
+) -> Dict[int, float]:
     """
-    Loads monthly Price Factors from public.consumption_price_factor (or price_index).
-    Returns dict mapping month (1..12) -> float (default 1.0).
+    Queries public.model_price_index in PostgreSQL for selected model(s).
+    Returns mapping: month_num (1..12) -> multiplier (float).
     """
     if isinstance(models, str):
-        models = [models]
-    model_set = {normalize_text(m) for m in models}
+        model_list = [models.strip()]
+    else:
+        model_list = [str(m).strip() for m in models if m]
+
+    if not model_list:
+        return {m: 1.0 for m in range(1, 13)}
+
+    models_std = model_list
+    models_upper = [m.upper() for m in model_list]
+    models_clean = [m.replace("'", "") for m in models_upper]
+    all_search_models = list(set(models_std + models_upper + models_clean))
+
     monthly_indices: Dict[int, List[float]] = {m: [] for m in range(1, 13)}
 
     try:
         conn = get_postgres_connection()
+        conn.autocommit = True
         cur = conn.cursor()
 
-        cur.execute("""
-            SELECT table_name 
-            FROM information_schema.tables 
-            WHERE table_schema = 'public' 
-              AND (table_name LIKE '%price%factor%' OR table_name LIKE '%price%index%');
-        """)
-        found_tables = [r[0] for r in cur.fetchall()]
+        queries = [
+            """
+            SELECT mpi.*
+            FROM public.model_price_index mpi
+            INNER JOIN public.master_models mm ON mpi.model_id = mm.model_id
+            WHERE mm.model_name = ANY(%s) OR UPPER(TRIM(mm.model_name)) = ANY(%s);
+            """,
+            """
+            SELECT mpi.*
+            FROM public.model_price_index mpi
+            WHERE (mpi.model_name = ANY(%s) OR UPPER(TRIM(mpi.model_name)) = ANY(%s));
+            """
+        ]
 
-        table_candidates = ["consumption_price_factor", "price_index", "price_factors"] + found_tables
-        target_table = None
-        for t in table_candidates:
-            if t in found_tables:
-                target_table = t
-                break
+        rows = []
+        col_names = []
+        for q in queries:
+            try:
+                cur.execute(q, (all_search_models, all_search_models))
+                res = cur.fetchall()
+                if res:
+                    rows = res
+                    col_names = [desc[0].lower() for desc in cur.description]
+                    break
+            except Exception:
+                conn.rollback()
 
-        if not target_table:
-            cur.close()
-            conn.close()
-            return {m: 1.0 for m in range(1, 13)}
-
-        cur.execute(f"SELECT * FROM public.{target_table} LIMIT 1;")
-        col_names = [desc[0].lower() for desc in cur.description]
-
-        query = f"SELECT * FROM public.{target_table}"
-        where_clauses = []
-        params = []
-
-        if "planning_year" in col_names:
-            where_clauses.append("planning_year = %s")
-            params.append(plan_year)
-        elif "year" in col_names:
-            where_clauses.append("year = %s")
-            params.append(plan_year)
-
-        if where_clauses:
-            query += " WHERE " + " AND ".join(where_clauses)
-
-        cur.execute(query, tuple(params))
-        rows = cur.fetchall()
         cur.close()
         conn.close()
 
-        for row in rows:
-            row_dict = {col_names[i]: row[i] for i in range(len(col_names))}
-            row_model = normalize_text(
-                row_dict.get("model") or row_dict.get("model_name") or
-                row_dict.get("brand") or row_dict.get("need_state")
-            )
-            if model_set and row_model and row_model not in model_set:
-                continue
-
+        for r in rows:
+            row_dict = dict(zip(col_names, r))
             raw_month = (
-                row_dict.get("month") or row_dict.get("month_num") or
-                row_dict.get("cycle_month") or row_dict.get("planning_month") or
+                row_dict.get("month_num") or row_dict.get("month") or
                 row_dict.get("period_month") or row_dict.get("mnth")
             )
             m_num = parse_month_num(raw_month)
@@ -301,53 +378,57 @@ def load_price_factor_from_postgres(models: Union[str, List[str]], plan_year: in
                         monthly_indices[m_num].append(val)
                 except (ValueError, TypeError):
                     pass
-
     except Exception as e:
-        print(f"[PostgreSQL Price Factor Notice]: {e}")
+        print(f"[Price Factor DB Notice]: {e}")
 
-    result = {}
+    final_factors = {}
     for m in range(1, 13):
-        if monthly_indices[m]:
-            result[m] = sum(monthly_indices[m]) / len(monthly_indices[m])
-        else:
-            result[m] = 1.0
+        arr = monthly_indices[m]
+        final_factors[m] = (sum(arr) / len(arr)) if arr else 1.0
 
-    return result
+    return final_factors
 
 
-# ─── 3. HISTORICAL GTS SHIPMENTS FROM SNOWFLAKE ──────────────────────────────
+# ─── 3. SNOWFLAKE HISTORICAL GTS $ INGESTION ─────────────────────────────────
 
-def fetch_snowflake_monthly_gts(rules: List[Dict[str, str]], base_year: int) -> List[Optional[float]]:
+def fetch_snowflake_monthly_gts(
+    rules: List[Dict[str, str]], base_year: int
+) -> List[Optional[float]]:
     """
-    Fetches actual GTS Shipments ($M) for base_year from Snowflake.
-    Table: NA_IBP_DB.PUBLIC.ANALYTICS_ACTUALS_LINE_ITEM
-    Column: GROSS_TRADE_SALES_AMT
+    Queries PROD_CVD_DISC.NAIBP_ACCESS.VW_FACT_F360_SHIPMENTS in Snowflake.
+    Returns 12 months of base_year GTS $ in Millions ($M).
     """
-    gts_base: List[Optional[float]] = [None] * 12
+    gts_base = [None] * 12
     if not rules:
         return gts_base
 
-    clauses = []
+    row_conditions = []
     for r in rules:
-        conds = []
-        for k, v in r.items():
-            conds.append(f"{k} = '{v.replace(\"'\", \"''\")}'")
-        if conds:
-            clauses.append("(" + " AND ".join(conds) + ")")
+        field_conds = []
+        for f in ["C1_BUSINESS_SEGMENT", "C2_BUSINESS_SUBSEGMENT", "C3_NEED_STATE", "C4_CATEGORY", "C5_SUBCATEGORY", "B1_BRAND", "B2_SUBBRAND"]:
+            val = r.get(f, "").strip()
+            if val and val not in ["NAN", "NONE", "NULL", "EMPTY", "N/A", "<NA>"]:
+                val_esc = val.replace("'", "''")
+                field_conds.append(f"UPPER(TRIM(COALESCE({f}, ''))) = '{val_esc}'")
+        if field_conds:
+            row_conditions.append("(" + " AND ".join(field_conds) + ")")
 
-    if not clauses:
+    if not row_conditions:
         return gts_base
 
-    rule_filter = " OR ".join(clauses)
+    where_clause = " OR\n        ".join(row_conditions)
     query = f"""
-        SELECT 
-            KV_MTH_NBR,
-            SUM(GROSS_TRADE_SALES_AMT) AS GTS_AMT
-        FROM NA_IBP_DB.PUBLIC.ANALYTICS_ACTUALS_LINE_ITEM
-        WHERE KV_YEAR = {base_year}
-          AND ({rule_filter})
-        GROUP BY KV_MTH_NBR
-        ORDER BY KV_MTH_NBR;
+    SELECT
+        MONTHNUMBER,
+        SUM(GTS_AMT) AS GTS_AMT
+    FROM PROD_CVD_DISC.NAIBP_ACCESS.VW_FACT_F360_SHIPMENTS
+    WHERE
+        ({where_clause})
+        AND YEAR = {base_year}
+    GROUP BY
+        MONTHNUMBER
+    ORDER BY
+        MONTHNUMBER;
     """
 
     try:
@@ -527,289 +608,228 @@ def _fetch_cycle_building_blocks(
 ) -> Dict[str, Dict[int, float]]:
     """
     Safely fetches raw monthly building block values (in Thousands) from PostgreSQL:
-    - If is_prior=False: looks up CURRENT cycle snapshots
-    - If is_prior=True:  looks up PRIOR cycle snapshots
-    Returns: dict mapping driver_name -> {month_num (1..12): float_val}
+    - Uses named parameters to prevent any positional type mismatch.
+    - Matches models case-insensitively.
+    - Handles Current vs Prior snapshot logic transparently.
     """
+    monthly_data: Dict[str, Dict[int, float]] = {}
+    if not models:
+        return monthly_data
+
+    models_std = [str(m).strip() for m in models if m]
+    models_upper = [m.upper().strip() for m in models_std]
+    models_clean = [m.replace("'", "") for m in models_upper]
+
     snap_info = get_cycle_snapshot_ids(plan_year)
-    target_cs_id = snap_info.prior_cs_id if is_prior else snap_info.curr_cs_id
-    target_ss_id = snap_info.prior_ss_id if is_prior else snap_info.curr_ss_id
+    curr_cs_id = snap_info[0] if len(snap_info) > 0 else None
+    prior_cs_id = snap_info[1] if len(snap_info) > 1 else None
+    curr_ss_id = snap_info[2] if len(snap_info) > 2 else None
+    prior_ss_id = snap_info[3] if len(snap_info) > 3 else None
 
-    result: Dict[str, Dict[int, float]] = {}
+    # If asking for prior cycle but no prior snapshot exists in DB, return empty (0.0)
+    if is_prior and prior_cs_id is None and prior_ss_id is None:
+        return monthly_data
 
-    def _match_driver(raw_name: str) -> Optional[str]:
-        n = normalize_text(raw_name)
-        for _, disp_name, aliases in GTS_COC_DRIVER_DEFINITIONS:
-            if n == normalize_text(disp_name) or any(n == normalize_text(a) for a in aliases):
-                return disp_name
-        return None
+    # Build snapshot filter conditions
+    if not is_prior:
+        cpr_snap_filter = f"AND (cpr.snapshot_id = {curr_cs_id} OR cpr.snapshot_id IS NULL)" if curr_cs_id else ""
+        spr_snap_filter = f"AND (spr.snapshot_id = {curr_ss_id} OR spr.snapshot_id IS NULL)" if curr_ss_id else ""
+    else:
+        cpr_snap_filter = f"AND cpr.snapshot_id = {prior_cs_id}" if prior_cs_id else "AND 1=0"
+        spr_snap_filter = f"AND spr.snapshot_id = {prior_ss_id}" if prior_ss_id else "AND 1=0"
 
+    sql = f"""
+    -- Consumption Building Blocks
+    SELECT
+        cbb.name AS building_block,
+        EXTRACT(MONTH FROM cpv.period_month)::int AS month_num,
+        SUM(cpv.value_in_thousands) AS value_in_thousands
+    FROM public.consumption_planning_rows cpr
+    INNER JOIN public.consumption_building_blocks cbb
+        ON cpr.building_block_id = cbb.block_id
+    INNER JOIN public.consumption_planning_values cpv
+        ON cpr.row_id = cpv.row_id
+    INNER JOIN public.master_models mm
+        ON cpr.model_id = mm.model_id
+    WHERE
+        (
+            mm.model_name = ANY(%(models_std)s)
+            OR UPPER(TRIM(mm.model_name)) = ANY(%(models_upper)s)
+            OR REPLACE(UPPER(TRIM(mm.model_name)), '''', '') = ANY(%(models_clean)s)
+        )
+        AND cpr.is_deleted = FALSE
+        AND cbb.is_active = TRUE
+        AND mm.is_active = TRUE
+        AND EXTRACT(YEAR FROM cpv.period_month) = %(plan_year)s
+        {cpr_snap_filter}
+    GROUP BY cbb.name, month_num
+
+    UNION ALL
+
+    -- Shipment Building Blocks (e.g. Retailer Inventory / Inventory)
+    SELECT
+        sbb.name AS building_block,
+        EXTRACT(MONTH FROM spv.period_month)::int AS month_num,
+        SUM(spv.value_in_thousands) AS value_in_thousands
+    FROM public.shipment_planning_rows spr
+    INNER JOIN public.shipment_building_blocks sbb
+        ON spr.building_block_id = sbb.block_id
+    INNER JOIN public.shipment_planning_values spv
+        ON spr.row_id = spv.row_id
+    INNER JOIN public.master_models mm
+        ON spr.model_id = mm.model_id
+    WHERE
+        (
+            mm.model_name = ANY(%(models_std)s)
+            OR UPPER(TRIM(mm.model_name)) = ANY(%(models_upper)s)
+            OR REPLACE(UPPER(TRIM(mm.model_name)), '''', '') = ANY(%(models_clean)s)
+        )
+        AND spr.is_deleted = FALSE
+        AND sbb.is_active = TRUE
+        AND mm.is_active = TRUE
+        AND EXTRACT(YEAR FROM spv.period_month) = %(plan_year)s
+        {spr_snap_filter}
+    GROUP BY sbb.name, month_num;
+    """
+
+    params = {
+        "models_std": models_std,
+        "models_upper": models_upper,
+        "models_clean": models_clean,
+        "plan_year": plan_year
+    }
+
+    rows = []
     try:
         conn = get_postgres_connection()
+        conn.autocommit = True
         cur = conn.cursor()
-
-        # 1. Fetch from consumption_line_items
-        if target_cs_id:
-            query = """
-                SELECT 
-                    bb.building_block_name,
-                    cli.period_month,
-                    SUM(cli.value) AS total_val
-                FROM public.consumption_line_items cli
-                JOIN public.building_blocks bb ON cli.building_block_id = bb.building_block_id
-                JOIN public.consumption_hierarchy_mapping chm ON cli.hierarchy_id = chm.hierarchy_id
-                WHERE cli.snapshot_id = %s
-                  AND (cli.planning_year = %s OR cli.planning_year IS NULL)
-            """
-            params = [target_cs_id, plan_year]
-            if models:
-                query += " AND UPPER(chm.need_state) = ANY(%s)"
-                params.append([m.upper() for m in models])
-            query += " GROUP BY bb.building_block_name, cli.period_month;"
-
-            cur.execute(query, tuple(params))
-            for bb_name, p_month, val in cur.fetchall():
-                d_name = _match_driver(bb_name)
-                m_num = parse_month_num(p_month)
-                if d_name and m_num and 1 <= m_num <= 12 and val is not None:
-                    result.setdefault(d_name, {})
-                    result[d_name][m_num] = result[d_name].get(m_num, 0.0) + float(val)
-
-        # 2. Fetch from shipment_line_items
-        if target_ss_id:
-            query = """
-                SELECT 
-                    bb.building_block_name,
-                    sli.period_month,
-                    SUM(sli.value) AS total_val
-                FROM public.shipment_line_items sli
-                JOIN public.building_blocks bb ON sli.building_block_id = bb.building_block_id
-                JOIN public.shipment_hierarchy_mapping shm ON sli.hierarchy_id = shm.hierarchy_id
-                WHERE sli.snapshot_id = %s
-                  AND (sli.planning_year = %s OR sli.planning_year IS NULL)
-            """
-            params = [target_ss_id, plan_year]
-            if models:
-                query += " AND UPPER(shm.need_state) = ANY(%s)"
-                params.append([m.upper() for m in models])
-            query += " GROUP BY bb.building_block_name, sli.period_month;"
-
-            cur.execute(query, tuple(params))
-            for bb_name, p_month, val in cur.fetchall():
-                d_name = _match_driver(bb_name)
-                m_num = parse_month_num(p_month)
-                if d_name and m_num and 1 <= m_num <= 12 and val is not None:
-                    result.setdefault(d_name, {})
-                    result[d_name][m_num] = result[d_name].get(m_num, 0.0) + float(val)
-
-        # Fallback if no snapshots found in DB
-        if not target_cs_id and not target_ss_id:
-            query = """
-                SELECT 
-                    bb.building_block_name,
-                    COALESCE(cli.period_month, 1),
-                    SUM(cli.value) AS total_val
-                FROM public.consumption_line_items cli
-                JOIN public.building_blocks bb ON cli.building_block_id = bb.building_block_id
-                JOIN public.consumption_hierarchy_mapping chm ON cli.hierarchy_id = chm.hierarchy_id
-                WHERE (cli.planning_year = %s OR cli.planning_year IS NULL)
-            """
-            params = [plan_year]
-            if models:
-                query += " AND UPPER(chm.need_state) = ANY(%s)"
-                params.append([m.upper() for m in models])
-            query += " GROUP BY bb.building_block_name, cli.period_month;"
-            cur.execute(query, tuple(params))
-            for bb_name, p_month, val in cur.fetchall():
-                d_name = _match_driver(bb_name)
-                m_num = parse_month_num(p_month)
-                if d_name and m_num and 1 <= m_num <= 12 and val is not None:
-                    result.setdefault(d_name, {})
-                    result[d_name][m_num] = result[d_name].get(m_num, 0.0) + float(val)
-
+        cur.execute(sql, params)
+        rows = cur.fetchall()
         cur.close()
         conn.close()
     except Exception as e:
-        print(f"[Cycle Building Blocks Fetch Notice]: {e}")
+        print(f"[Cycle Query Notice ({'Prior' if is_prior else 'Current'})]: {e}")
+        rows = []
 
-    return result
+    for bb_name, m_num, val_k in rows:
+        norm_name = normalize_text(bb_name)
+        if norm_name not in monthly_data:
+            monthly_data[norm_name] = {}
+        # Convert thousands ($K) to millions ($M)
+        val_m = float(val_k or 0.0) / 1000.0
+        monthly_data[norm_name][int(m_num)] = monthly_data[norm_name].get(int(m_num), 0.0) + val_m
+
+    return monthly_data
+
+
+# ─── 5. COMPUTE BUILDING BLOCKS CoC: (Current - Previous) * Price Factor ─────
+
+def _matches_driver_name(db_bb_name: str, match_key: str) -> bool:
+    """Robust pattern matching between PostgreSQL block name and logical driver."""
+    norm = normalize_text(db_bb_name)
+    if match_key == "INNOVATION":
+        return "INNOVATION" in norm and "NET" not in norm and "CANNIBAL" not in norm
+    if match_key == "CANNIBALIZATION":
+        return "CANNIBAL" in norm
+    if match_key == "PRICE":
+        return "PRICE" in norm and "NET" not in norm and "ELAST" not in norm
+    if match_key == "ELASTICITY":
+        return "ELAST" in norm
+    if match_key == "INVENTORY":
+        return "INVENTORY" in norm or "RETAILER" in norm
+    if match_key == "OTHER":
+        return "OTHER" in norm and "OVERLAY" not in norm
+    if match_key == "RENOVATION":
+        return "RENOVAT" in norm
+    if match_key == "DISCONTINUATIONS":
+        return "DISCONTINU" in norm
+    if match_key == "BASE TREND":
+        return "BASE" in norm and "TREND" in norm
+    if match_key == "SEASON":
+        return "SEASON" in norm
+    if match_key == "COMPETITION":
+        return "COMPET" in norm
+    if match_key == "DISTRIBUTION":
+        return "DISTRIBUT" in norm
+    if match_key == "MEDIA":
+        return "MEDIA" in norm
+    if match_key == "TRADE":
+        return "TRADE" in norm
+    if match_key == "CLUB":
+        return "CLUB" in norm
+    return match_key in norm
 
 
 def load_coc_building_blocks(
     models: Union[str, List[str]], plan_year: int, price_factors: Dict[int, float]
 ) -> Dict[str, List[Optional[float]]]:
     """
-    Computes Change of Cycle (CoC) Building Blocks in Millions ($M):
-        CoC[m] = (Current Cycle Value[m] - Previous Cycle Value[m]) * Price Factor[m]
-    Compound drivers:
-        Net Innovation = Innovation + Cannibalization
-        Net Price = Price + Elasticity
+    Computes CoC Building Blocks using the exact specified formula:
+        CoC Value[m] = (Current Cycle POS[m] - Previous Cycle POS[m]) * Price Factor[m]
     """
     if isinstance(models, str):
-        models = [models]
+        model_list = [models.strip()]
+    else:
+        model_list = [str(m).strip() for m in models if m]
 
-    curr_bb = _fetch_cycle_building_blocks(models, plan_year, is_prior=False)
-    prior_bb = _fetch_cycle_building_blocks(models, plan_year, is_prior=True)
+    if not model_list:
+        return {disp: [None] * 12 for _, disp, _ in GTS_COC_DRIVER_DEFINITIONS}
 
-    coc_drivers: Dict[str, List[Optional[float]]] = {}
+    current_raw = _fetch_cycle_building_blocks(model_list, plan_year, is_prior=False)
+    prior_raw = _fetch_cycle_building_blocks(model_list, plan_year, is_prior=True)
 
-    for _, disp_name, _ in GTS_COC_DRIVER_DEFINITIONS:
-        monthly_coc = [None] * 12
+    def _get_driver_coc(match_key: str) -> List[Optional[float]]:
+        curr_dict: Dict[int, float] = {}
+        for k, v in current_raw.items():
+            if _matches_driver_name(k, match_key):
+                for m, val in v.items():
+                    curr_dict[m] = curr_dict.get(m, 0.0) + val
+
+        prior_dict: Dict[int, float] = {}
+        for k, v in prior_raw.items():
+            if _matches_driver_name(k, match_key):
+                for m, val in v.items():
+                    prior_dict[m] = prior_dict.get(m, 0.0) + val
+
+        res = [None] * 12
+        has_any = False
         for m in range(1, 13):
-            m_idx = m - 1
-            has_curr = disp_name in curr_bb and m in curr_bb[disp_name]
-            has_prior = disp_name in prior_bb and m in prior_bb[disp_name]
-
-            if has_curr or has_prior:
-                c_val = curr_bb.get(disp_name, {}).get(m, 0.0)
-                p_val = prior_bb.get(disp_name, {}).get(m, 0.0)
-                diff = c_val - p_val
+            curr_val = curr_dict.get(m, 0.0)
+            prior_val = prior_dict.get(m, 0.0)
+            if m in curr_dict or m in prior_dict:
                 pf = price_factors.get(m, 1.0)
-                coc_val_m = (diff * pf) / 1000.0  # Convert thousands to Millions
-                monthly_coc[m_idx] = round(coc_val_m, 4)
-            else:
-                monthly_coc[m_idx] = None
+                coc_val = (curr_val - prior_val) * pf
+                res[m - 1] = round(coc_val, 4)
+                has_any = True
 
-        coc_drivers[disp_name] = monthly_coc
+        return res if has_any else [None] * 12
 
-    # Compound Driver: Net Innovation = Innovation + Cannibalization
-    inno_vals = coc_drivers.get("Innovation", [None] * 12)
-    cann_vals = coc_drivers.get("Cannibalization", [None] * 12)
+    driver_data: Dict[str, List[Optional[float]]] = {}
+    for _, disp_name, match_key in GTS_COC_DRIVER_DEFINITIONS:
+        if match_key.startswith("COMPOUND_"):
+            continue
+        driver_data[disp_name] = _get_driver_coc(match_key)
+
+    # Net Innovation = Innovation CoC + Cannibalization CoC
     net_inno = [None] * 12
     for i in range(12):
-        iv = inno_vals[i]
-        cv = cann_vals[i]
+        iv = driver_data.get("Innovation", [None] * 12)[i]
+        cv = driver_data.get("Cannibalization", [None] * 12)[i]
         if iv is not None or cv is not None:
             net_inno[i] = round((iv or 0.0) + (cv or 0.0), 4)
-    coc_drivers["Net Innovation"] = net_inno
+    driver_data["Net Innovation"] = net_inno
 
-    # Compound Driver: Net Price = Price + Elasticity
-    price_vals = coc_drivers.get("Price", [None] * 12)
-    elas_vals = coc_drivers.get("Elasticity", [None] * 12)
+    # Net Price = Price CoC + Elasticity CoC
     net_price = [None] * 12
     for i in range(12):
-        pv = price_vals[i]
-        ev = elas_vals[i]
+        pv = driver_data.get("Price", [None] * 12)[i]
+        ev = driver_data.get("Elasticity", [None] * 12)[i]
         if pv is not None or ev is not None:
             net_price[i] = round((pv or 0.0) + (ev or 0.0), 4)
-    coc_drivers["Net Price"] = net_price
+    driver_data["Net Price"] = net_price
 
-    return coc_drivers
-
-
-# ─── 5. NUMBER FORMATTING & DYNAMIC COLOR GRADIENT ───────────────────────────
-
-def fmt_coc_number(val: Optional[float], decimals: int = 1) -> str:
-    """
-    Strict presentation formatting:
-    - Positives: 0.1, 3.5, 10.9
-    - Negatives: (0.1), (3.2), (0.6), (6.9) (financial parentheses notation)
-    - Zeroes / Nulls: - (dash)
-    """
-    if val is None or (isinstance(val, float) and math.isnan(val)):
-        return "-"
-    rounded = round(val, decimals)
-    if abs(rounded) < (0.5 / (10 ** decimals)):
-        return "-"
-    if rounded < 0:
-        pos_str = f"{abs(rounded):.{decimals}f}"
-        return f"({pos_str})"
-    return f"{rounded:.{decimals}f}"
-
-
-def get_driver_heatmap_style(val: Optional[float], max_pos: float, max_neg_mag: float) -> Tuple[str, str, str]:
-    """
-    Calculates dynamic conditional formatting heat-map colors:
-    - Negatives: soft coral red gradient
-    - Positives: mint green gradient
-    - Dash / Zero: pure white background
-    """
-    if val is None or (isinstance(val, float) and math.isnan(val)):
-        return "#ffffff", "#111827", "400"
-
-    v = round(val, 4)
-    if abs(v) < 0.00005:
-        return "#ffffff", "#111827", "400"
-
-    if v < 0:
-        ratio = min(1.0, abs(v) / max(0.01, max_neg_mag))
-        if ratio > 0.66:
-            return "#fca5a5", "#7f1d1d", "700"  # Strong red
-        elif ratio > 0.33:
-            return "#fecaca", "#991b1b", "600"  # Medium red
-        else:
-            return "#fee2e2", "#b91c1c", "500"  # Light red
-
-    ratio = min(1.0, v / max(0.01, max_pos))
-    if ratio > 0.66:
-        return "#86efac", "#14532d", "700"  # Strong green
-    elif ratio > 0.33:
-        return "#bbf7d0", "#166534", "600"  # Medium green
-    else:
-        return "#dcfce7", "#15803d", "500"  # Light green
-
-
-def build_data_cells(
-    monthly_vals: List[Optional[float]],
-    totals: Dict[str, Optional[float]],
-    max_pos: float,
-    max_neg_mag: float,
-    bg_override: Optional[str] = None,
-    text_override: Optional[str] = None,
-    is_driver: bool = False,
-    decimals: int = 1
-) -> List[html.Td]:
-    """Generates standard HTML data cells for Jan..Dec and Q1..Q4, FY, YTD, YTG."""
-    cells = []
-
-    # Months: Jan..Dec
-    for i in range(12):
-        val = monthly_vals[i] if i < len(monthly_vals) else None
-        txt = fmt_coc_number(val, decimals=decimals)
-
-        if bg_override:
-            bg_col = bg_override
-            txt_col = text_override or "#ffffff"
-            font_wt = "700"
-        elif is_driver and txt != "":
-            bg_col, txt_col, font_wt = get_driver_heatmap_style(val, max_pos, max_neg_mag)
-        else:
-            bg_col = "#ffffff"
-            txt_col = "#111827"
-            font_wt = "500"
-
-        cells.append(html.Td(txt, style={
-            "padding": "4px 6px", "textAlign": "right", "fontSize": "11px",
-            "backgroundColor": bg_col, "color": txt_col, "fontWeight": font_wt,
-            "border": "1px solid #d1d5db", "minWidth": "38px"
-        }))
-
-    # Summary Columns: Q1, Q2, Q3, Q4, FY, YTD, YTG
-    for col_name in ["Q1", "Q2", "Q3", "Q4", "FY", "YTD", "YTG"]:
-        val = totals.get(col_name)
-        col_decimals = 2 if col_name == "FY" and is_driver is False and val is not None and abs(val) > 10 else decimals
-        txt = fmt_coc_number(val, decimals=col_decimals)
-
-        if bg_override:
-            bg_col = bg_override
-            txt_col = text_override or "#ffffff"
-            font_wt = "700"
-        elif is_driver and txt != "":
-            bg_col, txt_col, font_wt = get_driver_heatmap_style(val, max_pos, max_neg_mag)
-        else:
-            bg_col = "#fbfbfb"
-            txt_col = "#111827"
-            font_wt = "700"
-
-        b_left = "4px solid #ffffff" if col_name in ["Q1", "YTD"] else "1px solid #d1d5db"
-
-        cells.append(html.Td(txt, style={
-            "padding": "4px 6px", "textAlign": "right", "fontSize": "11px",
-            "backgroundColor": bg_col, "color": txt_col, "fontWeight": font_wt,
-            "border": "1px solid #d1d5db", "borderLeft": b_left, "minWidth": "42px"
-        }))
-
-    return cells
+    return driver_data
 
 
 # ─── 6. AGGREGATIONS & GTS CoC MATRIX ENGINE ─────────────────────────────────
@@ -910,7 +930,6 @@ def compute_gtscoc_summary_matrix(models: Union[str, List[str]]) -> Dict[str, An
         "label_base": str(base_year),
         "label_plan": str(plan_year),
         "cutoff_month": cutoff_month,
-        "current_month": current_retail_month,
         "models": models,
         "gts_base": gts_base,
         "totals_base": totals_base,
@@ -918,15 +937,124 @@ def compute_gtscoc_summary_matrix(models: Union[str, List[str]]) -> Dict[str, An
         "totals_plan": totals_plan,
         "drivers": drivers,
         "driver_totals": driver_totals,
-        "price_factors": price_factors,
     }
 
 
-# ─── 7. TABLE RENDERER MATCHING THE OFFICIAL VISUAL SPEC ─────────────────────
+# ─── 7. DYNAMIC HEATMAP & NUMBER FORMATTING HELPERS ──────────────────────────
+
+def get_driver_heatmap_style(val: Optional[float], max_pos: float, max_neg_mag: float):
+    """
+    Excel-style 3-color conditional formatting matching the uploaded image:
+    - Negatives: Soft Pink (#F9DCE1) -> Salmon (#FCAEA8) -> High Red (#F8696B / #FF6B6B)
+    - Positives: Soft Mint (#EAF7EE) -> Light Green (#C3E5CE) -> Rich Green (#63BE7B)
+    - Zero / None / Dash: White (#ffffff)
+    """
+    if val is None or (isinstance(val, float) and math.isnan(val)):
+        return "#ffffff", "#111827", "500"
+    v = float(val)
+    if abs(v) < 0.0001:
+        return "#ffffff", "#111827", "500"
+
+    if v > 0:
+        ratio = (v / max_pos) if max_pos > 0 else 0
+        if ratio >= 0.70:
+            return "#63BE7B", "#ffffff", "700"  # Tier 4: Rich Green
+        elif ratio >= 0.40:
+            return "#98D2A5", "#111827", "600"  # Tier 3: Medium Green
+        elif ratio >= 0.15:
+            return "#C3E5CE", "#111827", "500"  # Tier 2: Light Green
+        else:
+            return "#EAF7EE", "#111827", "500"  # Tier 1: Soft Mint
+    else:
+        ratio = (abs(v) / max_neg_mag) if max_neg_mag > 0 else 0
+        if ratio >= 0.70:
+            return "#F8696B", "#ffffff", "700"  # Tier 4: High Red (#F8696B)
+        elif ratio >= 0.40:
+            return "#FCAEA8", "#111827", "600"  # Tier 3: Salmon Pink
+        elif ratio >= 0.15:
+            return "#F9DCE1", "#111827", "500"  # Tier 2: Soft Pink
+        else:
+            return "#FFF1F2", "#111827", "500"  # Tier 1: Pale Blush
+
+
+def fmt_coc_number(val: Optional[float], decimals: int = 1) -> str:
+    """
+    Formats numbers matching the image:
+    - Null / 0.0 -> '' (empty string)
+    - Positive -> '0.1', '3.5', '11.5'
+    - Negative -> '(0.1)', '(3.2)', '(6.9)'
+    - Small negative rounding to 0.0 -> '(0.0)'
+    - Small positive rounding to 0.0 -> '0.0'
+    """
+    if val is None or (isinstance(val, float) and math.isnan(val)):
+        return ""
+    v = float(val)
+    if abs(v) < 0.000001:
+        return ""
+
+    rounded_val = round(abs(v), decimals)
+    if v < 0:
+        return f"({rounded_val:.{decimals}f})"
+    else:
+        return f"{rounded_val:.{decimals}f}"
+
+
+def build_data_cells(m_vals, totals, max_pos, max_neg_mag, is_driver=False, bg_override=None, text_override=None, decimals=1):
+    """Builds monthly, quarterly, and full-year table cells with exact image styling."""
+    cells = []
+    # 12 Months
+    for val in m_vals:
+        txt = fmt_coc_number(val, decimals=decimals)
+        if bg_override:
+            bg_col = bg_override
+            txt_col = text_override or "#ffffff"
+            font_wt = "700"
+        elif is_driver and txt != "":
+            bg_col, txt_col, font_wt = get_driver_heatmap_style(val, max_pos, max_neg_mag)
+        else:
+            bg_col = "#ffffff"
+            txt_col = "#111827"
+            font_wt = "500"
+
+        cells.append(html.Td(txt, style={
+            "padding": "4px 6px", "textAlign": "right", "fontSize": "11px",
+            "backgroundColor": bg_col, "color": txt_col, "fontWeight": font_wt,
+            "border": "1px solid #d1d5db", "minWidth": "38px"
+        }))
+
+    # Summary Columns: Q1, Q2, Q3, Q4, FY, YTD, YTG
+    for col_name in ["Q1", "Q2", "Q3", "Q4", "FY", "YTD", "YTG"]:
+        val = totals.get(col_name)
+        col_decimals = 2 if col_name == "FY" and is_driver is False and val is not None and abs(val) > 10 else decimals
+        txt = fmt_coc_number(val, decimals=col_decimals)
+
+        if bg_override:
+            bg_col = bg_override
+            txt_col = text_override or "#ffffff"
+            font_wt = "700"
+        elif is_driver and txt != "":
+            bg_col, txt_col, font_wt = get_driver_heatmap_style(val, max_pos, max_neg_mag)
+        else:
+            bg_col = "#fbfbfb"
+            txt_col = "#111827"
+            font_wt = "700"
+
+        b_left = "4px solid #ffffff" if col_name in ["Q1", "YTD"] else "1px solid #d1d5db"
+
+        cells.append(html.Td(txt, style={
+            "padding": "4px 6px", "textAlign": "right", "fontSize": "11px",
+            "backgroundColor": bg_col, "color": txt_col, "fontWeight": font_wt,
+            "border": "1px solid #d1d5db", "borderLeft": b_left, "minWidth": "42px"
+        }))
+
+    return cells
+
+
+# ─── 8. GTS CoC TABLE RENDERER MATCHING THE IMAGE ────────────────────────────
 
 def render_gtscoc_table(data: dict) -> html.Div:
     """
-    Renders GTS CoC Summary Matrix matching visual specification:
+    Renders GTS CoC Summary Matrix with pixel-perfect match to the user's image:
     - Grey Header row (#808080)
     - Top Row: {base_year} (Grey #808080 with dashes -)
     - 13 Building Block Rows across 6 Categories
