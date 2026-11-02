@@ -514,7 +514,16 @@ def get_building_block_total_for_period(
     )
 
 
-SHIPMENT_ALLOWED_BUILDING_BLOCKS = ["Innovation", "Trade", "Club", "Retailer Inventory"]
+SHIPMENT_ALLOWED_BUILDING_BLOCKS = [
+    "Distribution",
+    "Innovation",
+    "Trade",
+    "Club",
+    "Retailer Inventory",
+    "Supply Constraints",
+    "Liquidations",
+    "Other",
+]
 
 
 def map_shipment_bb_name(raw_name: str) -> Optional[str]:
@@ -522,17 +531,23 @@ def map_shipment_bb_name(raw_name: str) -> Optional[str]:
     if not raw_name:
         return None
     norm = normalize_text(raw_name)
-    if "INNOVATION" in norm:
-        res = "Innovation"
-    elif "TRADE" in norm:
-        res = "Trade"
-    elif "CLUB" in norm:
-        res = "Club"
-    elif "INVENTORY" in norm or "RETAILER" in norm:
-        res = "Retailer Inventory"
-    else:
-        res = None
-    return res
+    if "DISTRIBUT" in norm:
+        return "Distribution"
+    if "INNOVAT" in norm:
+        return "Innovation"
+    if "TRADE" in norm:
+        return "Trade"
+    if "CLUB" in norm:
+        return "Club"
+    if "INVENT" in norm or "RETAIL" in norm:
+        return "Retailer Inventory"
+    if "SUPPLY" in norm:
+        return "Supply Constraints"
+    if "LIQUIDAT" in norm:
+        return "Liquidations"
+    if "OTHER" in norm or "OVERLAY" in norm or "IBP" in norm:
+        return "Other"
+    return str(raw_name).strip() if norm else None
 
 
 def _matches_shipment_bb_row(r: Dict[str, Any], norm_targets: Set[str], year: int, month_nbr: int) -> bool:
