@@ -39,6 +39,20 @@ MONTH_NAME_MAP = {
     "OCT": 10, "OCTOBER": 10, "NOV": 11, "NOVEMBER": 11, "DEC": 12, "DECEMBER": 12
 }
 
+
+def _normalize_models(models: Any) -> list[str]:
+    """Safely normalizes input model(s) to a clean list of non-empty strings."""
+    if not models:
+        return []
+    if isinstance(models, str):
+        s = models.strip()
+        return [s] if s else []
+    try:
+        return [str(m).strip() for m in models if m and str(m).strip()]
+    except (TypeError, ValueError):
+        return []
+
+
 # ─── Constant Definitions ─────────────────────────────────────────────────────
 
 MATCH_KEY_BASE_TREND = "BASE TREND"
@@ -107,19 +121,34 @@ GTS_COC_DRIVER_DEFINITIONS = [
 # ─── 1. Fiscal Planning Calendar & Cycle Service ──────────────────────────────
 
 def get_active_years() -> tuple[int, int]:
-    """Discovers base_year (Prior Year) and plan_year (Current Planning Year)."""
-    env_base = os.getenv("IBP_BASE_YEAR")
-    env_plan = os.getenv("IBP_PLAN_YEAR")
-    if env_base and env_plan:
+    """
+    Dynamically determines (base_year, plan_year) using Kenvue 4-4-5 Fiscal Calendar.
+    - If IBP_PLAN_YEAR is set in environment, uses that override.
+    - Otherwise, derives active plan_year safely from KenvueCalendar.get_date_info.
+    base_year is always plan_year - 1.
+    """
+    env_year = os.getenv("IBP_PLAN_YEAR")
+    if env_year and env_year.isdigit():
+        plan_year = int(env_year)
+    else:
+        target_date = datetime.date.today() + datetime.timedelta(days=1)
+        plan_year = target_date.year
         try:
-            return int(env_base), int(env_plan)
-        except ValueError:
-            pass
+            today_info = KenvueCalendar.get_date_info(target_date)
+            if isinstance(today_info, dict):
+                plan_year = int(today_info.get("fiscal_year") or today_info.get("kv_year") or target_date.year)
+            elif hasattr(today_info, "fiscal_year"):
+                plan_year = int(today_info.fiscal_year)
+            elif hasattr(today_info, "kv_year"):
+                plan_year = int(today_info.kv_year)
+        except Exception:
+            try:
+                today_info = KenvueCalendar.get_date_info(target_date.strftime("%Y-%m-%d"))
+                if isinstance(today_info, dict):
+                    plan_year = int(today_info.get("fiscal_year") or today_info.get("kv_year") or target_date.year)
+            except Exception:
+                pass
 
-    target_date = datetime.date.today() + datetime.timedelta(days=1)
-    date_str = target_date.strftime("%Y-%m-%d")
-    date_info = KenvueCalendar.get_date_info(date_str)
-    plan_year = int(date_info.get("fiscal_year", target_date.year))
     base_year = plan_year - 1
     return base_year, plan_year
 
@@ -176,11 +205,7 @@ def load_squads_and_models() -> dict[str, list[str]]:
 
 def load_consumption_model_rules(models: str | list[str]) -> list[dict[str, str]]:
     """Loads Snowflake Consumption mapping rules for specified model(s)."""
-    if isinstance(models, str):
-        model_list = [models.strip()]
-    else:
-        model_list = [str(m).strip() for m in models if m]
-
+    model_list = _normalize_models(models)
     if not model_list:
         return []
 
@@ -211,11 +236,7 @@ def load_consumption_model_rules(models: str | list[str]) -> list[dict[str, str]
 
 def load_shipment_model_rules(models: str | list[str]) -> list[dict[str, str]]:
     """Loads Snowflake Shipment mapping rules for specified model(s)."""
-    if isinstance(models, str):
-        model_list = [models.strip()]
-    else:
-        model_list = [str(m).strip() for m in models if m]
-
+    model_list = _normalize_models(models)
     if not model_list:
         return []
 
@@ -298,11 +319,7 @@ def load_price_index_from_postgres(
     if plan_year is None:
         _, plan_year = get_active_years()
 
-    if isinstance(models, str):
-        model_list = [models.strip()]
-    else:
-        model_list = [str(m).strip() for m in models if m]
-
+    model_list = _normalize_models(models)
     has_filter = len(model_list) > 0
     sql = _build_price_index_query(has_filter)
     params = (plan_year, model_list, plan_year, model_list) if has_filter else (plan_year, plan_year)
@@ -369,11 +386,7 @@ def load_live_consumption_building_blocks(
     Loads Consumption Building Blocks aggregated across one or multiple models for plan_year.
     Returns: Display Name -> [12 monthly values in Millions ($M)]
     """
-    if isinstance(models, str):
-        model_list = [models.strip()]
-    else:
-        model_list = [str(m).strip() for m in models if m]
-
+    model_list = _normalize_models(models)
     if not model_list:
         return {disp: [None] * 12 for _, disp, _ in CONSUMPTION_DRIVER_ROW_DEFINITIONS}
 
@@ -481,11 +494,7 @@ def load_live_shipment_building_blocks(
     models: str | list[str], plan_year: int
 ) -> dict[Any, list[Optional[float]]]:
     """Queries live shipment building blocks from PostgreSQL using pivoted monthly query."""
-    if isinstance(models, str):
-        model_list = [models.strip()]
-    else:
-        model_list = [str(m).strip() for m in models if m]
-
+    model_list = _normalize_models(models)
     if not model_list:
         empty_res = {}
         for grp, disp, _ in SHIPMENT_DRIVER_ROW_DEFINITIONS:
@@ -661,8 +670,10 @@ def get_cycle_snapshot_ids(plan_year: int) -> CycleSnapshotInfo:
                 try:
                     target_date = datetime.date.today() + datetime.timedelta(days=1)
                     dt_info = KenvueCalendar.get_date_info(target_date.strftime("%Y-%m-%d"))
-                    if dt_info and "fiscal_month" in dt_info:
+                    if isinstance(dt_info, dict) and "fiscal_month" in dt_info:
                         active_cycle_month = int(dt_info["fiscal_month"])
+                    elif hasattr(dt_info, "fiscal_month"):
+                        active_cycle_month = int(dt_info.fiscal_month)
                 except Exception:
                     pass
     except Exception as e:
@@ -693,10 +704,10 @@ def _fetch_cycle_building_blocks(
 ) -> dict[str, dict[int, float]]:
     """Safely fetches raw monthly building block values (in Thousands) from PostgreSQL."""
     monthly_data: dict[str, dict[int, float]] = {}
-    if not models:
+    model_list = _normalize_models(models)
+    if not model_list:
         return monthly_data
 
-    model_list = [str(m).strip() for m in models if m]
     snap_info = get_cycle_snapshot_ids(plan_year)
 
     if is_prior and snap_info.prior_cs_id is None and snap_info.prior_ss_id is None:
@@ -843,11 +854,7 @@ def load_coc_building_blocks(
     Computes CoC Building Blocks:
         CoC Value[m] = (Current Cycle POS[m] - Previous Cycle POS[m]) * Price Factor[m]
     """
-    if isinstance(models, str):
-        model_list = [models.strip()]
-    else:
-        model_list = [str(m).strip() for m in models if m]
-
+    model_list = _normalize_models(models)
     if not model_list:
         return {disp: [None] * 12 for _, disp, _ in GTS_COC_DRIVER_DEFINITIONS}
 
@@ -972,8 +979,8 @@ def _detect_pos_cutoff_month(plan_year: int, pos_plan_actual: list[Optional[floa
     target_date = datetime.date.today() + datetime.timedelta(days=1)
     date_str = target_date.strftime("%Y-%m-%d")
     date_info = KenvueCalendar.get_date_info(date_str)
-    cur_year = int(date_info.get("fiscal_year", target_date.year))
-    cur_month = int(date_info.get("fiscal_month", target_date.month))
+    cur_year = int(date_info.get("fiscal_year", target_date.year) if isinstance(date_info, dict) else getattr(date_info, "fiscal_year", target_date.year))
+    cur_month = int(date_info.get("fiscal_month", target_date.month) if isinstance(date_info, dict) else getattr(date_info, "fiscal_month", target_date.month))
 
     cutoff = 0
     if plan_year == cur_year:
