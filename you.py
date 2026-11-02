@@ -54,28 +54,11 @@ INDIVIDUAL_DRIVER_NAMES = [
 ]
 
 
-def _normalize_models(models: Any) -> list[str]:
-    """Safely normalizes input model(s) to a clean list of non-empty strings."""
-    if not models:
-        return []
-    if isinstance(models, str):
-        s = models.strip()
-        return [s] if s else []
-    try:
-        return [str(m).strip() for m in models if m and str(m).strip()]
-    except (TypeError, ValueError):
-        return []
-
-
 # ─── Helper: Quarter & Period Aggregations ────────────────────────────────────
 
 def calc_totals(
     monthly_vals: List[Optional[float]], cutoff_month: int = 0
 ) -> Dict[str, Optional[float]]:
-    """
-    Calculates Q1..Q4, FY, YTD, and YTG totals dynamically.
-    If all 12 months are None, returns None for all totals to keep blank driver rows blank.
-    """
     has_data = any(v is not None and not (isinstance(v, float) and math.isnan(v)) for v in monthly_vals)
     if not has_data:
         return dict.fromkeys(["Q1", "Q2", "Q3", "Q4", "FY", "YTD", "YTG"], None)
@@ -98,28 +81,27 @@ def calc_totals(
     }
 
 
-def _sum_two_monthly_series(series_a: list, series_b: list) -> list[Optional[float]]:
-    """Sums two 12-month building block series with null coalescing."""
-    res: list[Optional[float]] = [None] * 12
-    for i in range(12):
-        if series_a[i] is not None or series_b[i] is not None:
-            res[i] = (series_a[i] or 0.0) + (series_b[i] or 0.0)
-    return res
+# ─── Calculation Helpers ─────────────────────────────────────────────────────
 
-
-def _ensure_compound_drivers(drivers: dict):
-    """Ensure compound drivers Net Innovation and Net Price are populated."""
+def _ensure_compound_drivers(drivers: dict) -> None:
+    """Computes compound Net Innovation and Net Price rows if not present."""
     if DRIVER_NET_INNOVATION not in drivers:
-        drivers[DRIVER_NET_INNOVATION] = _sum_two_monthly_series(
-            drivers.get("Innovation", [None] * 12),
-            drivers.get("Cannibalization", [None] * 12),
-        )
+        inno = drivers.get("Innovation", [None] * 12)
+        cann = drivers.get("Cannibalization", [None] * 12)
+        res = [None] * 12
+        for i in range(12):
+            if inno[i] is not None or cann[i] is not None:
+                res[i] = (inno[i] or 0.0) + (cann[i] or 0.0)
+        drivers[DRIVER_NET_INNOVATION] = res
 
     if DRIVER_NET_PRICE not in drivers:
-        drivers[DRIVER_NET_PRICE] = _sum_two_monthly_series(
-            drivers.get("Price", [None] * 12),
-            drivers.get("Elasticity", [None] * 12),
-        )
+        price = drivers.get("Price", [None] * 12)
+        elast = drivers.get("Elasticity", [None] * 12)
+        res = [None] * 12
+        for i in range(12):
+            if price[i] is not None or elast[i] is not None:
+                res[i] = (price[i] or 0.0) + (elast[i] or 0.0)
+        drivers[DRIVER_NET_PRICE] = res
 
 
 def _sum_monthly_building_blocks(drivers: dict, driver_names: list) -> tuple[list, list]:
@@ -192,6 +174,8 @@ def _calc_yoy_pct_series(
         v_p = plan_vals[i]
         if v_b is not None and v_p is not None and v_b != 0:
             yoy_pct[i] = ((v_p - v_b) / abs(v_b)) * 100.0
+        else:
+            yoy_pct[i] = None
     return yoy_pct
 
 
@@ -282,31 +266,28 @@ def _resolve_coc_cutoff_month(active_cycle_month: Optional[int]) -> int:
         return active_cycle_month
     try:
         from services.kv_calendar import KenvueCalendar
-        target_date = datetime.date.today() + datetime.timedelta(days=1)
-        dt_info = KenvueCalendar.get_date_info(target_date.strftime("%Y-%m-%d"))
-        if dt_info and "fiscal_month" in dt_info:
-            return int(dt_info["fiscal_month"])
+        target_date = datetime.date.today() + datetime.timedelta(days=1) if datetime.date.today().weekday() == 6 else datetime.date.today()
+        info = KenvueCalendar.get_date_info(target_date)
+        return int(info.get("fiscal_month") or info.get("kv_month_num") or 1)
     except Exception:
-        pass
-    return 0
+        return datetime.date.today().month
 
 
 # ─── 1. Consumption Summary Calculation Engine ───────────────────────────────
 
-def compute_consumption_summary_matrix(models: str | list[str]) -> Dict[str, Any]:
+def compute_consumption_summary_matrix(models: Union[str, List[str]]) -> Dict[str, Any]:
     """
     Computes complete Consumption Summary Matrix:
     1. Base Year POS $ from Snowflake
     2. Live PostgreSQL Building Blocks aggregated across selected models
-    3. Plan Year POS $:
-       - Months <= cutoff_month: Snowflake Actual POS $
-       - Months > cutoff_month: Base Year POS + Building Blocks
-    4. YoY % = ((Plan POS - Base POS) / abs(Base POS)) * 100
-    5. Difference = Snowflake Actuals - (Base Year POS + Building Blocks) [Closed months only]
+    3. Plan Year POS $ (Actuals up to cutoff; Base + BB beyond)
+    4. YoY % Growth
+    5. Closed-Month Variance ("Difference")
     """
     base_year, plan_year = get_active_years()
     rules = load_consumption_model_rules(models)
     pos_base, pos_plan_actual = fetch_snowflake_monthly_pos(rules, base_year, plan_year)
+
     drivers = load_live_consumption_building_blocks(models, plan_year)
 
     _ensure_compound_drivers(drivers)
@@ -332,36 +313,38 @@ def compute_consumption_summary_matrix(models: str | list[str]) -> Dict[str, Any
     return {
         "base_year": base_year,
         "plan_year": plan_year,
+        "label_base": f"{base_year} POS $",
+        "label_plan": f"{plan_year} POS $",
         "cutoff_month": cutoff_month,
-        "label_base": str(base_year),
-        "label_plan": str(plan_year),
         "models": models,
         "pos_base": pos_base,
         "totals_base": totals_base,
-        "pos_plan": pos_plan,
-        "totals_plan": totals_plan,
         "drivers": drivers,
         "driver_totals": driver_totals,
+        "pos_plan": pos_plan,
+        "totals_plan": totals_plan,
         "yoy_pct": yoy_pct,
         "totals_yoy": totals_yoy,
         "difference": diff_val,
         "totals_diff": totals_diff,
+        "pos_plan_actual": pos_plan_actual,
+        "bb_calculated_pos": bb_calculated_pos,
     }
 
 
-def _resolve_consumption_payload(
+# ─── Shipment Summary Helpers ────────────────────────────────────────────────
+
+def _resolve_consumption_context(
     models: str | list[str], cons_data: Optional[Dict[str, Any]]
-) -> tuple[dict[str, Any], list[float], int]:
-    """Resolves consumption data dictionary, parsed POS plan list, and cutoff month."""
+) -> tuple[Dict[str, Any], list, int]:
+    """Ensures consumption matrix data is available for downstream shipment calculations."""
     if not cons_data:
         try:
             cons_data = compute_consumption_summary_matrix(models)
         except Exception as e:
-            logger.warning("Notice computing consumption data for summary matrix: %s", e)
+            logger.warning("Could not compute consumption matrix context: %s", e)
             cons_data = {}
-
-    pos_plan_raw = cons_data.get("pos_plan", [0.0] * 12) if cons_data else [0.0] * 12
-    pos_plan = [float(v or 0.0) for v in pos_plan_raw]
+    pos_plan = cons_data.get("pos_plan", [0.0] * 12) if cons_data else [0.0] * 12
     cons_cutoff = int(cons_data.get("cutoff_month") or 0) if cons_data else 0
     return cons_data, pos_plan, cons_cutoff
 
@@ -465,20 +448,20 @@ def compute_shipment_summary_matrix(
     """
     Computes complete Shipment Summary Matrix:
     1. Factory POS = POS Plan $ (from consumption) * Price Index (from PostgreSQL)
-    2. Live shipment building blocks: Category 1 (Inventory) & Category 2 (IBP Overlays)
-    3. Snowflake GTS actuals for Base Year and Plan Year
-    4. Plan Year GTS Row:
-       - Months <= cutoff_month: Snowflake Actual GTS $
-       - Months > cutoff_month: Factory POS + Sum of Shipment Building Blocks
-    5. GTS YoY % against Base Year GTS
+    2. Category 1: Inventory Drivers (Distribution, Innovation, Trade, Club, Retailer Inv, Other)
+    3. Category 2: IBP Overlays (Supply Constraints, Liquidations, Other)
+    4. Plan Year GTS $ (Actuals up to cutoff; Factory POS + BB beyond)
+    5. GTS YoY %
     """
     base_year, plan_year = get_active_years()
     rules = load_shipment_model_rules(models)
     gts_base, gts_plan_actual = fetch_snowflake_monthly_gts(rules, base_year, plan_year)
-    drivers = load_live_shipment_building_blocks(models, plan_year)
-    price_indices = load_price_index_from_postgres(models)
 
-    cons_data, pos_plan, cons_cutoff = _resolve_consumption_payload(models, cons_data)
+    cons_data, pos_plan, cons_cutoff = _resolve_consumption_context(models, cons_data)
+
+    price_indices = load_price_index_from_postgres(models)
+    drivers = load_live_shipment_building_blocks(models, plan_year)
+
     factory_pos = _compute_factory_pos(pos_plan, price_indices)
     total_shipment_bb = _sum_shipment_building_blocks(drivers)
 
@@ -496,8 +479,7 @@ def compute_shipment_summary_matrix(
         "base_year": base_year,
         "plan_year": plan_year,
         "cutoff_month": cutoff_month,
-        "label_base": str(base_year),
-        "label_plan": str(plan_year),
+        "label_base": f"{base_year} GTS",
         "label_factory_pos": f"{plan_year} FACTORY POS",
         "label_gts": f"{plan_year} GTS",
         "models": models,
@@ -511,10 +493,11 @@ def compute_shipment_summary_matrix(
         "totals_base": totals_base,
         "gts_yoy_pct": gts_yoy_pct,
         "totals_yoy": totals_yoy,
+        "gts_plan_actual": gts_plan_actual,
     }
 
 
-# ─── 3. GTS YoY Summary Calculation Engine ───────────────────────────────────
+# ─── 3. GTS YoY Summary Calculation Engine ────────────────────────────────────
 
 def compute_gts_summary_matrix(
     models: str | list[str], cons_data: Optional[Dict[str, Any]] = None
@@ -522,20 +505,17 @@ def compute_gts_summary_matrix(
     """
     Computes complete GTS YoY Summary Matrix:
     1. Historical Base Year GTS $ from Snowflake
-    2. Factory POS $ = Consumption POS * Price Index
-    3. 11 Building Blocks = Consumption Building Blocks * Price Index
-    4. Plan Year GTS Row:
-       - Months <= cutoff_month: Snowflake Actual GTS $
-       - Months > cutoff_month: Baseline (Base GTS or Factory POS) + Sum(Building Blocks)
-    5. GTS YoY % against Base Year GTS
-    6. NO Difference Row
+    2. All 14 Consumption Building Blocks scaled by Monthly Price Index
+    3. Plan Year GTS $ (Actuals up to cutoff; Baseline + BB beyond)
+    4. GTS YoY %
     """
     base_year, plan_year = get_active_years()
     rules = load_shipment_model_rules(models)
     gts_base, gts_plan_actual = fetch_snowflake_monthly_gts(rules, base_year, plan_year)
-    price_indices = load_price_index_from_postgres(models)
 
-    cons_data, pos_plan, cons_cutoff = _resolve_consumption_payload(models, cons_data)
+    cons_data, pos_plan, cons_cutoff = _resolve_consumption_context(models, cons_data)
+
+    price_indices = load_price_index_from_postgres(models)
     factory_pos = _compute_factory_pos(pos_plan, price_indices)
 
     raw_cons_drivers = cons_data.get("drivers", {}) if cons_data else load_live_consumption_building_blocks(models, plan_year)
@@ -565,15 +545,11 @@ def compute_gts_summary_matrix(
         "cutoff_month": cutoff_month,
         "label_base": f"{base_year} GTS $",
         "label_plan": f"{plan_year} GTS $",
-        "label_gts": f"{plan_year} GTS $",
-        "label_pct": "GTS YoY %",
         "models": models,
         "gts_base": gts_base,
         "totals_base": totals_base,
-        "gts_plan_actual": gts_plan_actual,
         "gts_plan": gts_plan,
         "totals_plan": totals_plan,
-        "totals_gts": totals_plan,
         "factory_pos": factory_pos,
         "totals_factory_pos": totals_factory_pos,
         "drivers": drivers,
@@ -602,6 +578,7 @@ def compute_gtscoc_summary_matrix(models: str | list[str]) -> Dict[str, Any]:
     price_factors = load_price_index_from_postgres(models)
     drivers = load_coc_building_blocks(models, plan_year, price_factors)
 
+    # Any active driver with data fills remaining months with 0.0
     for d_name, d_vals in list(drivers.items()):
         if any(v is not None and not (isinstance(v, float) and math.isnan(v)) for v in d_vals):
             drivers[d_name] = [0.0 if (v is None or (isinstance(v, float) and math.isnan(v))) else v for v in d_vals]
