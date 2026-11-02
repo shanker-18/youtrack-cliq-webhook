@@ -367,7 +367,6 @@ def load_live_consumption_building_blocks(
 ) -> dict[str, list[Optional[float]]]:
     """
     Loads Consumption Building Blocks aggregated across one or multiple models for plan_year.
-    Filters by the active cycle snapshot so numbers match the Planning Workspace exactly.
     Returns: Display Name -> [12 monthly values in Millions ($M)]
     """
     if isinstance(models, str):
@@ -378,10 +377,7 @@ def load_live_consumption_building_blocks(
     if not model_list:
         return {disp: [None] * 12 for _, disp, _ in CONSUMPTION_DRIVER_ROW_DEFINITIONS}
 
-    snap_info = get_cycle_snapshot_ids(plan_year)
-    snap_filter = f"AND (cpr.snapshot_id = {snap_info.curr_cs_id} OR cpr.snapshot_id IS NULL)" if snap_info.curr_cs_id else ""
-
-    sql = f"""
+    sql = """
     SELECT
         cbb.name AS building_block,
         EXTRACT(MONTH FROM cpv.period_month)::int AS month_num,
@@ -399,7 +395,6 @@ def load_live_consumption_building_blocks(
         AND cbb.is_active = TRUE
         AND mm.is_active = TRUE
         AND EXTRACT(YEAR FROM cpv.period_month) = %s
-        {snap_filter}
     GROUP BY cbb.name, month_num
     ORDER BY cbb.name, month_num;
     """
@@ -499,10 +494,7 @@ def load_live_shipment_building_blocks(
             empty_res[f"{grp}_{disp}"] = [None] * 12
         return empty_res
 
-    snap_info = get_cycle_snapshot_ids(plan_year)
-    snap_filter = f"AND (spr.snapshot_id = {snap_info.curr_ss_id} OR spr.snapshot_id IS NULL)" if snap_info.curr_ss_id else ""
-
-    sql = f"""
+    sql = """
     SELECT
         sbb.name AS driver_building_block,
         ROUND(SUM(CASE WHEN EXTRACT(MONTH FROM spv.period_month) = 1  THEN spv.value_in_thousands / 1000.0 ELSE 0 END)::numeric, 4) AS jan_m,
@@ -530,7 +522,6 @@ def load_live_shipment_building_blocks(
         AND sbb.is_active = TRUE
         AND mm.is_active = TRUE
         AND EXTRACT(YEAR FROM spv.period_month) = %s
-        {snap_filter}
     GROUP BY
         sbb.name
     ORDER BY
@@ -596,8 +587,18 @@ def _query_cycle_snapshot(
     row = cur.fetchone()
     if not row:
         return None, None
-    snap_id = row.get("snapshot_id") if isinstance(row, dict) else row["snapshot_id"]
-    c_mo = row.get("cycle_month") if isinstance(row, dict) else None
+    snap_id = None
+    c_mo = None
+    if isinstance(row, dict):
+        snap_id = row.get("snapshot_id")
+        c_mo = row.get("cycle_month")
+    else:
+        try:
+            snap_id = row["snapshot_id"]
+            c_mo = row["cycle_month"]
+        except (TypeError, KeyError, IndexError):
+            snap_id = row[0] if len(row) > 0 else None
+            c_mo = row[1] if len(row) > 1 else None
     m_num = parse_month_num(c_mo) if c_mo else None
     return snap_id, m_num if (m_num and 1 <= m_num <= 12) else None
 
@@ -624,8 +625,9 @@ def _query_fallback_cycle_month(cur, plan_year: int) -> Optional[int]:
         LIMIT 1;
     """, (plan_year,))
     row = cur.fetchone()
-    if row and isinstance(row, dict) and row.get("cycle_month"):
-        m_num = parse_month_num(row["cycle_month"])
+    if row:
+        val = row.get("cycle_month") if isinstance(row, dict) else row[0]
+        m_num = parse_month_num(val)
         if m_num and 1 <= m_num <= 12:
             return m_num
     return None
