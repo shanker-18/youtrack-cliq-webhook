@@ -114,21 +114,20 @@ def _parse_month_token(token: str) -> str:
 
 
 def _normalize_string_month(s: str) -> str:
-    s_norm = normalize_text(s)
-    if not s_norm:
+    s_clean = s.strip().upper()
+    if not s_clean or s_clean in ("NAN", "NONE", "NULL", "N/A"):
         return ""
-    if s_norm in MONTH_NAME_MAP:
-        return MONTH_NAME_MAP[s_norm]
-    parts = re.split(r"[\s\-_/]+", s_norm)
-    for p in parts:
-        res = _parse_month_token(p)
-        if res:
-            return res
-    return ""
+    if s_clean.isdigit():
+        return _normalize_numeric_month(s_clean)
+    return _parse_month_token(s_clean)
 
 
 def normalize_month_3letter(val: Any) -> str:
-    """Converts month representation (e.g. 1, '01', 'Jan', 'January', '2026-01-01') into 'JAN'..'DEC'."""
+    """Normalizes any month representation into standard 3-letter uppercase ('JAN'..'DEC')."""
+    if val is None:
+        return ""
+    if isinstance(val, (date, datetime)):
+        return MONTH_NUMBER_TO_3LETTER.get(val.month, "")
     if isinstance(val, (int, float)):
         return _normalize_numeric_month(val)
     return _normalize_string_month(str(val))
@@ -140,139 +139,160 @@ def get_kv_month_ranges(start_year: int = 2021, end_year: int = 2027) -> List[di
     """Generates Kenvue Fiscal Month date ranges dynamically using KenvueCalendar."""
     ranges = []
     for yr in range(start_year, end_year + 1):
-        for m_num in range(1, 13):
-            info = KenvueCalendar.get_month_info(yr, m_num)
+        for m in range(1, 13):
+            c_start, c_end = KenvueCalendar.get_cycle_bounds(yr, m)
             ranges.append({
-                "KV_YEAR": yr,
-                "MONTH_NUMBER": m_num,
-                "MONTH": MONTH_NAMES[m_num - 1].upper(),
-                "START_DATE": info.start_date,
-                "END_DATE": info.end_date,
-                "NUM_WEEKS": info.num_weeks,
-                "QUARTER": info.quarter,
+                "year": yr,
+                "y_str": str(yr),
+                "m_nbr": m,
+                "kv_month": f"{yr}-{m:02d}",
+                "start": c_start.isoformat(),
+                "end": c_end.isoformat(),
             })
     return ranges
 
 
-def map_date_to_kv_calendar(dt: date | datetime | str) -> Optional[Tuple[int, int, str]]:
-    """Maps a date to (kv_year, kv_month_number, month_abbr)."""
-    if dt is None:
-        return None
-    try:
-        if isinstance(dt, str):
-            dt_clean = dt.strip().split(" ")[0].split("T")[0]
-            if "-" in dt_clean:
-                d_obj = datetime.strptime(dt_clean, "%Y-%m-%d").date()
-            elif "/" in dt_clean:
-                d_obj = datetime.strptime(dt_clean, "%m/%d/%Y").date()
-            else:
-                return None
-        elif isinstance(dt, datetime):
-            d_obj = dt.date()
-        elif isinstance(dt, date):
-            d_obj = dt
-        else:
-            return None
-        info = KenvueCalendar.get_date_info(d_obj)
-        return info.kv_year, info.kv_month_num, info.kv_month_abbr.upper()
-    except Exception as err:
-        logger.debug("Error mapping date %s to KV Calendar: %s", dt, err)
+def map_date_to_kv_calendar(d_val: Any) -> Optional[dict]:
+    """Maps date value to Kenvue Fiscal Calendar properties using KenvueCalendar."""
+    if not d_val:
         return None
 
-
-def _update_latest_year(yr: int, latest_year: Optional[int]) -> int:
-    return max(yr, latest_year) if latest_year is not None else yr
-
-
-def _record_row_calendar_week(r: dict, weeks_by_m: dict, target_y: int, distinct_dates: set) -> None:
-    dt_val = r.get("WEEK_DATE") or r.get("WEEK_START_DATE") or r.get("DATE") or r.get("PERIOD_DATE")
-    if not dt_val:
-        return
-    res = map_date_to_kv_calendar(dt_val)
-    if not res:
-        return
-    yr, m_num, _ = res
-    if yr == target_y:
-        distinct_dates.add(str(dt_val)[:10])
-        weeks_by_m[m_num].add(str(dt_val)[:10])
-
-
-def _record_row_completed_month(r: dict, weeks_by_m: dict, target_y: int) -> None:
-    m_raw = r.get("MONTHNUMBER") or r.get("MONTH_NUMBER") or r.get("MONTH")
-    if not m_raw:
-        return
-    m_3 = normalize_month_3letter(m_raw)
-    if not (m_3 and m_3 in MONTHS):
-        return
-    m_num = MONTHS.index(m_3) + 1
-    info = KenvueCalendar.get_month_info(target_y, m_num)
-    for w in range(info.num_weeks):
-        weeks_by_m[m_num].add(f"synth_wk_{w}")
-
-
-def _collect_weeks_by_month(rows: List[dict], target_y: int) -> Tuple[Dict[int, Set[str]], Set[str]]:
-    weeks_by_m = {m: set() for m in range(1, 13)}
-    distinct_dates = set()
-    for r in rows:
-        y_raw = r.get("YEAR") or r.get("FISCAL_YEAR")
+    dt_obj = None
+    if isinstance(d_val, (date, datetime)):
+        dt_obj = d_val if isinstance(d_val, date) else d_val.date()
+    else:
+        d_clean = str(d_val).strip()[:10]
         try:
-            r_yr = int(y_raw) if y_raw is not None else None
+            dt_obj = date.fromisoformat(d_clean)
         except (ValueError, TypeError):
-            r_yr = None
+            for fmt in ["%d-%b-%y", "%d-%b-%Y", "%m/%d/%Y", "%Y/%m/%d"]:
+                try:
+                    dt_obj = datetime.strptime(d_clean, fmt).date()
+                    break
+                except (ValueError, TypeError):
+                    pass
 
-        if r_yr == target_y:
-            _record_row_calendar_week(r, weeks_by_m, target_y, distinct_dates)
-            if not distinct_dates:
-                _record_row_completed_month(r, weeks_by_m, target_y)
-    return weeks_by_m, distinct_dates
+    if not dt_obj:
+        return None
+
+    info = KenvueCalendar.get_date_info(dt_obj)
+    m_idx = info.kv_month_num - 1
+    m_name = MONTHS[m_idx]
+    y_str = str(info.kv_year)
+
+    return {
+        "m_idx": m_idx,
+        "m_nbr": info.kv_month_num,
+        "m_name": m_name,
+        "y_str": y_str,
+        "quarter": f"Q{info.kv_quarter}",
+        "kv_wk_id": f"{y_str}{info.kv_week_num:02d}",
+        "kv_mo_id": f"{y_str}{info.kv_month_num:02d}",
+        "kv_week_beginning": dt_obj.isoformat(),
+    }
+
+
+def _update_latest_year(current_yr: Optional[str], candidate_yr: str) -> str:
+    if not current_yr or candidate_yr > current_yr:
+        return candidate_yr
+    return current_yr
+
+
+def _record_row_calendar_week(
+    r: Dict[str, Any], avail_weeks_by_month: dict, latest_yr: Optional[str]
+) -> Optional[str]:
+    d_str = str(r.get("GLOBAL_DATE_SHORT_DESC") or "").strip()
+    kv_info = map_date_to_kv_calendar(d_str) if d_str else None
+    if kv_info:
+        y_s = kv_info["y_str"]
+        m_n = kv_info["m_nbr"]
+        avail_weeks_by_month.setdefault((y_s, m_n), set()).add(d_str or kv_info["kv_wk_id"])
+        return _update_latest_year(latest_yr, y_s)
+
+    kv_m_str = str(r.get("KV_MONTH") or "").strip()
+    if "-" in kv_m_str:
+        parts = kv_m_str.split("-")
+        y_s = parts[0]
+        m_n = int(parts[1])
+        avail_weeks_by_month.setdefault((y_s, m_n), set()).add(d_str or kv_m_str)
+        return _update_latest_year(latest_yr, y_s)
+
+    return latest_yr
+
+
+def _record_row_completed_month(
+    r: Dict[str, Any], avail_weeks_by_month: dict, latest_yr: Optional[str]
+) -> Optional[str]:
+    if r.get("is_complete") is not True:
+        return latest_yr
+    kv_m = str(r.get("KV_MONTH") or "")
+    y_s = str(r.get("YEAR") or (kv_m.split("-", maxsplit=1)[0] if "-" in kv_m else ""))
+    m_n = int(r.get("MONTHNUMBER") or (kv_m.split("-", maxsplit=1)[1] if "-" in kv_m else 0))
+    if y_s and m_n:
+        avail_weeks_by_month.setdefault((y_s, m_n), set()).update({f"wk_{i}" for i in range(1, 6)})
+        return _update_latest_year(latest_yr, y_s)
+    return latest_yr
+
+
+def _collect_weeks_by_month(rows: List[Dict[str, Any]]) -> Tuple[dict, Optional[str]]:
+    avail_weeks_by_month: dict = {}
+    latest_yr_found: Optional[str] = None
+
+    for r in rows:
+        latest_yr_found = _record_row_calendar_week(r, avail_weeks_by_month, latest_yr_found)
+        latest_yr_found = _record_row_completed_month(r, avail_weeks_by_month, latest_yr_found)
+
+    return avail_weeks_by_month, latest_yr_found
 
 
 def _evaluate_month_completeness_details(
-    target_y: int, weeks_by_m: Dict[int, Set[str]], has_explicit_dates: bool
-) -> Tuple[Dict[int, dict], int]:
+    avail_weeks_by_month: dict, target_yr: str, target_yr_int: int
+) -> Tuple[dict, int]:
     month_details = {}
-    latest_comp = 0
-    for m in range(1, 13):
-        info = KenvueCalendar.get_month_info(target_y, m)
-        exp_w = info.num_weeks
-        act_w = len(weeks_by_m[m])
-        is_comp = (act_w >= exp_w) if has_explicit_dates else (act_w > 0)
-        if is_comp:
-            latest_comp = m
-        month_details[m] = {
-            "expected_weeks": exp_w,
-            "actual_weeks_found": act_w,
+    latest_complete_m_nbr = 0
+
+    for m_n in range(1, 13):
+        req_wks = KenvueCalendar.get_month_week_count(target_yr_int, m_n)
+        avail_set = avail_weeks_by_month.get((target_yr, m_n), set())
+        avail_wks = len(avail_set)
+        is_comp = (avail_wks >= req_wks) if req_wks > 0 else False
+
+        month_details[m_n] = {
+            "required_wks": req_wks,
+            "available_wks": avail_wks,
             "is_complete": is_comp,
-            "distinct_week_dates": sorted(list(weeks_by_m[m])),
         }
-    return month_details, latest_comp
+        if is_comp and m_n == latest_complete_m_nbr + 1:
+            latest_complete_m_nbr = m_n
+
+    if latest_complete_m_nbr == 0:
+        for m_n in range(1, 13):
+            if month_details[m_n]["is_complete"]:
+                latest_complete_m_nbr = max(latest_complete_m_nbr, m_n)
+
+    return month_details, latest_complete_m_nbr
 
 
 def get_kv_month_completeness_status(
-    rows_consumption: List[dict],
-    target_year: Optional[str | int] = None
-) -> dict:
+    rows_consumption: List[Dict[str, Any]], target_year: Optional[str | int] = None
+) -> Dict[str, Any]:
     """Dynamically determines the latest complete Kenvue month based on 4-4-5 calendar week counts."""
-    latest_y = None
-    for r in rows_consumption:
-        y_val = r.get("YEAR") or r.get("FISCAL_YEAR")
-        try:
-            if y_val:
-                latest_y = _update_latest_year(int(y_val), latest_y)
-        except (ValueError, TypeError):
-            pass
+    avail_weeks_by_month, latest_yr_found = _collect_weeks_by_month(rows_consumption)
 
-    target_y = int(target_year) if target_year else (latest_y or 2026)
-    weeks_by_m, distinct_dates = _collect_weeks_by_month(rows_consumption, target_y)
-    month_details, latest_comp = _evaluate_month_completeness_details(target_y, weeks_by_m, bool(distinct_dates))
+    target_yr = str(target_year) if target_year else (latest_yr_found or "2026")
+    target_yr_int = int(target_yr)
 
-    ytd_s = slice(0, latest_comp)
-    ytg_s = slice(latest_comp, 12)
+    month_details, latest_complete_m_nbr = _evaluate_month_completeness_details(
+        avail_weeks_by_month, target_yr, target_yr_int
+    )
+
+    ytd_s = slice(0, latest_complete_m_nbr)
+    ytg_s = slice(latest_complete_m_nbr, 12)
 
     return {
-        "target_year": target_y,
-        "latest_complete_m_nbr": latest_comp,
-        "latest_complete_m_name": MONTH_NUMBER_TO_3LETTER.get(latest_comp),
+        "target_year": target_yr,
+        "latest_complete_m_nbr": latest_complete_m_nbr,
+        "latest_complete_m_name": MONTH_NUMBER_TO_3LETTER.get(latest_complete_m_nbr),
         "ytd_slice": ytd_s,
         "ytg_slice": ytg_s,
         "month_details": month_details,
@@ -288,6 +308,7 @@ def _find_price_index_headers(rows: list) -> Tuple[Optional[int], Optional[int],
         if any("MODEL" in s for s in row_str) and any("INDEX" in s or "PRICE" in s or "FACTOR" in s for s in row_str):
             hdr_idx = idx
             break
+
     hdr_row = [normalize_text(c) for c in rows[hdr_idx]]
     m_col, mo_col, idx_col = None, None, None
     for c_i, name in enumerate(hdr_row):
@@ -297,6 +318,7 @@ def _find_price_index_headers(rows: list) -> Tuple[Optional[int], Optional[int],
             mo_col = c_i
         elif "INDEX" in name or "PRICE" in name or "FACTOR" in name:
             idx_col = c_i
+
     return m_col, mo_col, idx_col, hdr_idx
 
 
@@ -322,11 +344,14 @@ def _load_price_index_from_excel(path: str) -> dict:
     ws = wb.active
     rows = list(ws.iter_rows(values_only=True))
     wb.close()
+
     if not rows:
         return {}
+
     m_col, mo_col, idx_col, h_idx = _find_price_index_headers(rows)
     if m_col is None or mo_col is None or idx_col is None:
         return {}
+
     return _parse_price_index_sheet_rows(rows, m_col, mo_col, idx_col, h_idx)
 
 
@@ -545,25 +570,36 @@ def get_shipment_building_block_total_for_period(
 
 
 def _extract_row_year_and_month_idx(r: Dict[str, Any]) -> Tuple[Optional[str], Optional[int]]:
+    kv_m_str = str(r.get("KV_MONTH") or "").strip()
+    if kv_m_str and "-" in kv_m_str:
+        parts = kv_m_str.split("-")
+        return parts[0], int(parts[1]) - 1
+
+    d_str = str(r.get("GLOBAL_DATE_SHORT_DESC") or "").strip()
+    kv_info = map_date_to_kv_calendar(d_str)
+    if kv_info:
+        return kv_info["y_str"], kv_info["m_idx"]
+
     yr = str(r.get("YEAR") or 0)
     m_raw = r.get("MONTHNUMBER") or r.get("MONTH_NUMBER") or r.get("MONTH")
     m_3 = normalize_month_3letter(m_raw)
-    if not (yr.isdigit() and int(yr) >= 2022 and m_3 in MONTHS):
-        return None, None
-    return yr, MONTHS.index(m_3)
+    if yr.isdigit() and int(yr) >= 2022 and m_3 in MONTHS:
+        return yr, MONTHS.index(m_3)
+
+    return None, None
 
 
 def _accumulate_pos_maps(
     r: Dict[str, Any],
     pos_val_map: Dict[Tuple[str, int], float],
-    pos_u_map: Dict[Tuple[str, int], float]
+    pos_u_map: Dict[Tuple[str, int], float],
 ) -> None:
-    yr, m_idx = _extract_row_year_and_month_idx(r)
-    if not yr or m_idx is None:
+    y_str, m_idx = _extract_row_year_and_month_idx(r)
+    if not y_str or m_idx is None:
         return
-    pv = r.get("POS_AMT") or r.get("POS_DOLLARS")
+    pv = r.get("POS_AMT") or r.get("POS_DOLLARS") or r.get("POS_VALUE")
     pu = r.get("POS_QTY") or r.get("POS_UNITS")
-    key = (yr, m_idx)
+    key = (y_str, m_idx)
     if pv is not None:
         pos_val_map[key] = (pos_val_map.get(key) or 0.0) + float(pv)
     if pu is not None:
@@ -572,7 +608,7 @@ def _accumulate_pos_maps(
 
 def _build_factory_pos_map(
     pos_val_map: Dict[Tuple[str, int], float],
-    model_name: str | list[str]
+    model_name: str | list[str],
 ) -> Dict[Tuple[str, int], float]:
     factory_pos_map = {}
     for (y_str, m_idx), pv_val in pos_val_map.items():
@@ -583,7 +619,7 @@ def _build_factory_pos_map(
 
 def extract_consumption_maps(
     rows_cons: List[Dict[str, Any]],
-    model_name: str | list[str]
+    model_name: str | list[str],
 ) -> Tuple[Dict[Tuple[str, int], float], Dict[Tuple[str, int], float], Dict[Tuple[str, int], float]]:
     """Extracts factory_pos_map, pos_val_map, pos_u_map from Snowflake consumption rows."""
     if not rows_cons:
@@ -619,17 +655,17 @@ def calc_share(sub_val: Optional[float], total_val: Optional[float]) -> Optional
 def _accumulate_year_consumption_metrics(
     r: Dict[str, Any], data_by_year: Dict[str, Dict[str, List[Optional[float]]]]
 ) -> None:
-    yr, m_idx = _extract_row_year_and_month_idx(r)
-    if not yr or m_idx is None:
+    y_str, m_idx = _extract_row_year_and_month_idx(r)
+    if not y_str or m_idx is None:
         return
-    if yr not in data_by_year:
-        data_by_year[yr] = {"pos_val": [None] * 12, "factory_pos": [None] * 12, "pos_u": [None] * 12}
-    amt = r.get("POS_AMT") or r.get("POS_DOLLARS")
+    if y_str not in data_by_year:
+        data_by_year[y_str] = {"pos_val": [None] * 12, "factory_pos": [None] * 12, "pos_u": [None] * 12}
+    amt = r.get("POS_AMT") or r.get("POS_DOLLARS") or r.get("POS_VALUE")
     qty = r.get("POS_QTY") or r.get("POS_UNITS")
     if amt is not None:
-        data_by_year[yr]["pos_val"][m_idx] = (data_by_year[yr]["pos_val"][m_idx] or 0.0) + float(amt)
+        data_by_year[y_str]["pos_val"][m_idx] = (data_by_year[y_str]["pos_val"][m_idx] or 0.0) + float(amt)
     if qty is not None:
-        data_by_year[yr]["pos_u"][m_idx] = (data_by_year[yr]["pos_u"][m_idx] or 0.0) + float(qty)
+        data_by_year[y_str]["pos_u"][m_idx] = (data_by_year[y_str]["pos_u"][m_idx] or 0.0) + float(qty)
 
 
 def _aggregate_consumption_sf_rows(rows_sf: List[Dict[str, Any]]) -> Dict[str, Dict[str, List[Optional[float]]]]:
