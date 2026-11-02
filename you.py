@@ -1,6 +1,6 @@
 # pylint: disable=too-many-return-statements,too-many-nested-blocks,global-statement,too-many-lines
 """
-NA IBP Planning Application - Validation Calculations Engine
+NA IBP Planning Application — Validation Calculations Engine
 ============================================================
 Authoritative calculation engine for both Consumption and Shipment validation:
 - Uses services.kv_calendar.KenvueCalendar for pure 4-4-5 fiscal math (zero Excel dump dependency)
@@ -98,18 +98,23 @@ def normalize_text(val: Any) -> str:
 
 def _normalize_numeric_month(val: Any) -> str:
     try:
-        m_int = int(float(val))
-        return MONTH_NUMBER_TO_3LETTER.get(m_int, "")
-    except (ValueError, TypeError):
-        return ""
+        n = int(val)
+        if 1 <= n <= 12:
+            return MONTH_NUMBER_TO_3LETTER[n]
+    except (ValueError, TypeError, OverflowError):
+        pass
+    return ""
 
 
-def _parse_month_token(token: str) -> str:
-    if token.isdigit():
-        return MONTH_NUMBER_TO_3LETTER.get(int(token), "")
-    for k, v in MONTH_NAME_MAP.items():
-        if k in token:
-            return v
+def _parse_month_token(s: str) -> str:
+    for t in re.findall(r"[A-Z0-9]+", s):
+        if t in MONTH_NAME_MAP:
+            return MONTH_NAME_MAP[t]
+    m_iso = re.search(r"(\d{4})[-/](\d{1,2})", s)
+    if m_iso:
+        mo = int(m_iso.group(2))
+        if 1 <= mo <= 12:
+            return MONTH_NUMBER_TO_3LETTER[mo]
     return ""
 
 
@@ -126,14 +131,52 @@ def normalize_month_3letter(val: Any) -> str:
     """Normalizes any month representation into standard 3-letter uppercase ('JAN'..'DEC')."""
     if val is None:
         return ""
-    if isinstance(val, (date, datetime)):
-        return MONTH_NUMBER_TO_3LETTER.get(val.month, "")
     if isinstance(val, (int, float)):
-        return _normalize_numeric_month(val)
+        res = _normalize_numeric_month(val)
+        if res:
+            return res
+    if isinstance(val, (datetime, date)):
+        return MONTH_NUMBER_TO_3LETTER.get(val.month, "")
     return _normalize_string_month(str(val))
 
 
-# --- 1. Kenvue Calendar 4-4-5 Fiscal Ranges via services.kv_calendar ---------
+# ─── 1. Pure 4-4-5 Fiscal Calendar Calculations ──────────────────────────────
+
+def get_fiscal_year_weeks(year: int) -> int:
+    """Returns total fiscal weeks in year (53 in 2021, 52 for other standard years)."""
+    return KenvueCalendar.get_fiscal_year_weeks(year)
+
+
+def get_kv_cycle_bounds(year: int, month_nbr: int) -> Tuple[date, date]:
+    """Pure calendar mathematical calculation of cycle start and end dates."""
+    return KenvueCalendar.get_cycle_bounds(year, month_nbr)
+
+
+def map_date_to_kv_calendar(date_str: str) -> Optional[dict]:
+    """Maps date to KV fiscal month metadata dynamically."""
+    if not date_str:
+        return None
+    try:
+        clean_d = date.fromisoformat(str(date_str).strip()[:10])
+    except (ValueError, TypeError):
+        return None
+
+    c_info = KenvueCalendar.find_cycle_for_date(clean_d)
+    if not c_info:
+        return None
+
+    yr, mo, c_start, c_end = c_info
+    return {
+        "year": yr,
+        "y_str": str(yr),
+        "month_nbr": mo,
+        "m_idx": mo - 1,
+        "month_abbr": MONTHS[mo - 1],
+        "cycle_start": c_start.isoformat(),
+        "cycle_end": c_end.isoformat(),
+        "is_complete": clean_d >= c_end,
+    }
+
 
 def get_kv_month_ranges(start_year: int = 2021, end_year: int = 2027) -> List[dict]:
     """Generates Kenvue Fiscal Month date ranges dynamically using KenvueCalendar."""
@@ -152,238 +195,236 @@ def get_kv_month_ranges(start_year: int = 2021, end_year: int = 2027) -> List[di
     return ranges
 
 
-def map_date_to_kv_calendar(d_val: Any) -> Optional[dict]:
-    """Maps date value to Kenvue Fiscal Calendar properties using KenvueCalendar."""
-    if not d_val:
-        return None
+def get_kv_month_completeness_status(as_of_date: Optional[date] = None) -> Dict[str, Any]:
+    """Dynamically calculates month completeness and YTD/YTG slices."""
+    cur_date = as_of_date or date.today()
+    c_info = KenvueCalendar.find_cycle_for_date(cur_date)
+    if not c_info:
+        c_info = (cur_date.year, cur_date.month, cur_date, cur_date)
+    c_yr, c_mo, _, c_end = c_info
 
-    dt_obj = None
-    if isinstance(d_val, (date, datetime)):
-        dt_obj = d_val if isinstance(d_val, date) else d_val.date()
-    else:
-        d_clean = str(d_val).strip()[:10]
-        try:
-            dt_obj = date.fromisoformat(d_clean)
-        except (ValueError, TypeError):
-            for fmt in ["%d-%b-%y", "%d-%b-%Y", "%m/%d/%Y", "%Y/%m/%d"]:
-                try:
-                    dt_obj = datetime.strptime(d_clean, fmt).date()
-                    break
-                except (ValueError, TypeError):
-                    pass
-
-    if not dt_obj:
-        return None
-
-    info = KenvueCalendar.get_date_info(dt_obj)
-    m_idx = info.kv_month_num - 1
-    m_name = MONTHS[m_idx]
-    y_str = str(info.kv_year)
+    latest_complete_m_nbr = c_mo if cur_date >= c_end else c_mo - 1
+    if latest_complete_m_nbr < 0:
+        latest_complete_m_nbr = 0
+    if latest_complete_m_nbr > 12:
+        latest_complete_m_nbr = 12
 
     return {
-        "m_idx": m_idx,
-        "m_nbr": info.kv_month_num,
-        "m_name": m_name,
-        "y_str": y_str,
-        "quarter": f"Q{info.kv_quarter}",
-        "kv_wk_id": f"{y_str}{info.kv_week_num:02d}",
-        "kv_mo_id": f"{y_str}{info.kv_month_num:02d}",
-        "kv_week_beginning": dt_obj.isoformat(),
-    }
-
-
-def _update_latest_year(current_yr: Optional[str], candidate_yr: str) -> str:
-    if not current_yr or candidate_yr > current_yr:
-        return candidate_yr
-    return current_yr
-
-
-def _record_row_calendar_week(
-    r: Dict[str, Any], avail_weeks_by_month: dict, latest_yr: Optional[str]
-) -> Optional[str]:
-    d_str = str(r.get("GLOBAL_DATE_SHORT_DESC") or "").strip()
-    kv_info = map_date_to_kv_calendar(d_str) if d_str else None
-    if kv_info:
-        y_s = kv_info["y_str"]
-        m_n = kv_info["m_nbr"]
-        avail_weeks_by_month.setdefault((y_s, m_n), set()).add(d_str or kv_info["kv_wk_id"])
-        return _update_latest_year(latest_yr, y_s)
-
-    kv_m_str = str(r.get("KV_MONTH") or "").strip()
-    if "-" in kv_m_str:
-        parts = kv_m_str.split("-")
-        y_s = parts[0]
-        m_n = int(parts[1])
-        avail_weeks_by_month.setdefault((y_s, m_n), set()).add(d_str or kv_m_str)
-        return _update_latest_year(latest_yr, y_s)
-
-    return latest_yr
-
-
-def _record_row_completed_month(
-    r: Dict[str, Any], avail_weeks_by_month: dict, latest_yr: Optional[str]
-) -> Optional[str]:
-    if r.get("is_complete") is not True:
-        return latest_yr
-    kv_m = str(r.get("KV_MONTH") or "")
-    y_s = str(r.get("YEAR") or (kv_m.split("-", maxsplit=1)[0] if "-" in kv_m else ""))
-    m_n = int(r.get("MONTHNUMBER") or (kv_m.split("-", maxsplit=1)[1] if "-" in kv_m else 0))
-    if y_s and m_n:
-        avail_weeks_by_month.setdefault((y_s, m_n), set()).update({f"wk_{i}" for i in range(1, 6)})
-        return _update_latest_year(latest_yr, y_s)
-    return latest_yr
-
-
-def _collect_weeks_by_month(rows: List[Dict[str, Any]]) -> Tuple[dict, Optional[str]]:
-    avail_weeks_by_month: dict = {}
-    latest_yr_found: Optional[str] = None
-
-    for r in rows:
-        latest_yr_found = _record_row_calendar_week(r, avail_weeks_by_month, latest_yr_found)
-        latest_yr_found = _record_row_completed_month(r, avail_weeks_by_month, latest_yr_found)
-
-    return avail_weeks_by_month, latest_yr_found
-
-
-def _evaluate_month_completeness_details(
-    avail_weeks_by_month: dict, target_yr: str, target_yr_int: int
-) -> Tuple[dict, int]:
-    month_details = {}
-    latest_complete_m_nbr = 0
-
-    for m_n in range(1, 13):
-        req_wks = KenvueCalendar.get_month_week_count(target_yr_int, m_n)
-        avail_set = avail_weeks_by_month.get((target_yr, m_n), set())
-        avail_wks = len(avail_set)
-        is_comp = (avail_wks >= req_wks) if req_wks > 0 else False
-
-        month_details[m_n] = {
-            "required_wks": req_wks,
-            "available_wks": avail_wks,
-            "is_complete": is_comp,
-        }
-        if is_comp and m_n == latest_complete_m_nbr + 1:
-            latest_complete_m_nbr = m_n
-
-    if latest_complete_m_nbr == 0:
-        for m_n in range(1, 13):
-            if month_details[m_n]["is_complete"]:
-                latest_complete_m_nbr = max(latest_complete_m_nbr, m_n)
-
-    return month_details, latest_complete_m_nbr
-
-
-def get_kv_month_completeness_status(
-    rows_consumption: List[Dict[str, Any]], target_year: Optional[str | int] = None
-) -> Dict[str, Any]:
-    """Dynamically determines the latest complete Kenvue month based on 4-4-5 calendar week counts."""
-    avail_weeks_by_month, latest_yr_found = _collect_weeks_by_month(rows_consumption)
-
-    target_yr = str(target_year) if target_year else (latest_yr_found or "2026")
-    target_yr_int = int(target_yr)
-
-    month_details, latest_complete_m_nbr = _evaluate_month_completeness_details(
-        avail_weeks_by_month, target_yr, target_yr_int
-    )
-
-    ytd_s = slice(0, latest_complete_m_nbr)
-    ytg_s = slice(latest_complete_m_nbr, 12)
-
-    return {
-        "target_year": target_yr,
+        "cycle_year": c_yr,
+        "cycle_month_nbr": c_mo,
         "latest_complete_m_nbr": latest_complete_m_nbr,
-        "latest_complete_m_name": MONTH_NUMBER_TO_3LETTER.get(latest_complete_m_nbr),
-        "ytd_slice": ytd_s,
-        "ytg_slice": ytg_s,
-        "month_details": month_details,
+        "ytd_slice": [0, latest_complete_m_nbr],
+        "ytg_slice": [latest_complete_m_nbr, 12],
     }
 
 
-# --- 2. Price Index Reference & Factory POS Calculations ---------------------
+# ─── 2. Price Index Engine ───────────────────────────────────────────────────
 
-def _find_price_index_headers(rows: list) -> Tuple[Optional[int], Optional[int], Optional[int], int]:
-    hdr_idx = 0
-    for idx, r in enumerate(rows[:5]):
-        row_str = [normalize_text(c) for c in r if c is not None]
-        if any("MODEL" in s for s in row_str) and any("INDEX" in s or "PRICE" in s or "FACTOR" in s for s in row_str):
-            hdr_idx = idx
-            break
+def _get_hardcoded_fallback_price_index() -> Dict[Tuple[str, str], float]:
+    """Hardcoded fallback dictionary for Price Index."""
+    tylenol_vals = [0.77, 0.76, 0.76, 0.76, 0.76, 0.77, 0.76, 0.80, 0.80, 0.75, 0.77, 0.76]
+    res: Dict[Tuple[str, str], float] = {}
+    for i, m in enumerate(MONTHS):
+        res[(m, "CHILDREN'S TYLENOL")] = tylenol_vals[i]
+        res[(m, "AVEENO BABY")] = 1.0
+        res[(m, "ADULT SUDAFED")] = 1.0
+        res[(m, "LISTERINE")] = 1.0
+        res[(m, "NEOSPORIN")] = 1.0
+        res[(m, "MOTRIN")] = 1.0
+        res[(m, "BENADRYL")] = 1.0
+        res[(m, "TYLENOL")] = 1.0
+        res[(m, "AVEENO")] = 1.0
+        res[(m, "NEUTROGENA")] = 1.0
+        res[(m, "JOHNSON'S")] = 1.0
+        res[(m, "PEPCID")] = 1.0
+        res[(m, "IMODIUM")] = 1.0
+        res[(m, "BAND-AID")] = 1.0
+        res[(m, "OGX")] = 1.0
+        res[(m, "MAUI MOISTURE")] = 1.0
+        res[(m, "CLEAN & CLEAR")] = 1.0
+        res[(m, "LUBRIDERM")] = 1.0
+        res[(m, "DESITIN")] = 1.0
+        res[(m, "ROGAINE")] = 1.0
+        res[(m, "NICORETTE")] = 1.0
+        res[(m, "NIZORAL")] = 1.0
+    return res
 
-    hdr_row = [normalize_text(c) for c in rows[hdr_idx]]
-    m_col, mo_col, idx_col = None, None, None
-    for c_i, name in enumerate(hdr_row):
-        if "MODEL" in name:
-            m_col = c_i
-        elif "MONTH" in name or "PERIOD" in name:
-            mo_col = c_i
-        elif "INDEX" in name or "PRICE" in name or "FACTOR" in name:
-            idx_col = c_i
 
-    return m_col, mo_col, idx_col, hdr_idx
+def _read_excel_rows(ws: Any) -> Tuple[List[str], List[List[Any]]]:
+    all_rows = list(ws.iter_rows(values_only=True))
+    if not all_rows:
+        return [], []
+    headers = [str(cell).strip() if cell is not None else "" for cell in all_rows[0]]
+    data_rows = [list(r) for r in all_rows[1:] if any(c is not None for c in r)]
+    return headers, data_rows
 
 
-def _parse_price_index_sheet_rows(rows: list, m_col: int, mo_col: int, idx_col: int, start_idx: int) -> dict:
-    price_map = {}
-    for r in rows[start_idx + 1:]:
-        if len(r) <= max(m_col, mo_col, idx_col):
+def _find_col_index(headers: List[str], candidates: List[str]) -> Optional[int]:
+    norm_headers = [normalize_text(h) for h in headers]
+    for c in candidates:
+        norm_c = normalize_text(c)
+        for idx, nh in enumerate(norm_headers):
+            if norm_c == nh or norm_c in nh:
+                return idx
+    return None
+
+
+def _detect_format_a_columns(headers: List[str]) -> Optional[Tuple[int, int, int]]:
+    m_idx = _find_col_index(headers, ["MODEL", "MODEL_NAME", "BRAND", "PRODUCT"])
+    mo_idx = _find_col_index(headers, ["MONTH", "PERIOD", "KV_MONTH", "FISCAL_MONTH"])
+    pi_idx = _find_col_index(headers, ["PRICE_INDEX", "PRICE INDEX", "INDEX", "FACTOR"])
+    if m_idx is not None and mo_idx is not None and pi_idx is not None:
+        return m_idx, mo_idx, pi_idx
+    return None
+
+
+def _parse_format_a(
+    data_rows: List[List[Any]],
+    m_idx: int,
+    mo_idx: int,
+    pi_idx: int
+) -> Dict[Tuple[str, str], float]:
+    result = {}
+    for row in data_rows:
+        if len(row) <= max(m_idx, mo_idx, pi_idx):
             continue
-        m_val = normalize_text(r[m_col])
-        mo_val = normalize_month_3letter(r[mo_col])
-        val = r[idx_col]
-        if m_val and mo_val:
+        model = normalize_text(row[m_idx])
+        month_3l = normalize_month_3letter(row[mo_idx])
+        raw_pi = row[pi_idx]
+        if not model or not month_3l:
+            continue
+        try:
+            val = float(raw_pi)
+            if not (math.isnan(val) or math.isinf(val)):
+                result[(month_3l, model)] = val
+        except (ValueError, TypeError):
+            continue
+    return result
+
+
+def _detect_format_b_columns(headers: List[str]) -> Optional[Tuple[int, Dict[str, int]]]:
+    m_idx = _find_col_index(headers, ["MODEL", "MODEL_NAME", "BRAND", "PRODUCT"])
+    if m_idx is None:
+        return None
+
+    month_cols: Dict[str, int] = {}
+    for idx, h in enumerate(headers):
+        m_3l = normalize_month_3letter(h)
+        if m_3l and m_3l in MONTHS and m_3l not in month_cols:
+            month_cols[m_3l] = idx
+
+    if len(month_cols) >= 6:
+        return m_idx, month_cols
+    return None
+
+
+def _parse_format_b(
+    data_rows: List[List[Any]],
+    m_idx: int,
+    month_cols: Dict[str, int]
+) -> Dict[Tuple[str, str], float]:
+    result = {}
+    for row in data_rows:
+        if len(row) <= m_idx:
+            continue
+        model = normalize_text(row[m_idx])
+        if not model:
+            continue
+        for m_3l, c_idx in month_cols.items():
+            if len(row) <= c_idx:
+                continue
+            raw_val = row[c_idx]
             try:
-                price_map[(mo_val, m_val)] = float(val) if val is not None else 1.0
+                val = float(raw_val)
+                if not (math.isnan(val) or math.isinf(val)):
+                    result[(m_3l, model)] = val
             except (ValueError, TypeError):
                 continue
-    return price_map
+    return result
 
 
-def _load_price_index_from_excel(path: str) -> dict:
-    import openpyxl  # pylint: disable=import-outside-toplevel
-    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
-    ws = wb.active
-    rows = list(ws.iter_rows(values_only=True))
-    wb.close()
-
-    if not rows:
+def _parse_price_index_sheet(ws: Any) -> Dict[Tuple[str, str], float]:
+    headers, data_rows = _read_excel_rows(ws)
+    if not headers or not data_rows:
         return {}
 
-    m_col, mo_col, idx_col, h_idx = _find_price_index_headers(rows)
-    if m_col is None or mo_col is None or idx_col is None:
+    fmt_a = _detect_format_a_columns(headers)
+    if fmt_a:
+        res = _parse_format_a(data_rows, fmt_a[0], fmt_a[1], fmt_a[2])
+        if res:
+            return res
+
+    fmt_b = _detect_format_b_columns(headers)
+    if fmt_b:
+        res = _parse_format_b(data_rows, fmt_b[0], fmt_b[1])
+        if res:
+            return res
+
+    return {}
+
+
+def _resolve_price_index_file_path() -> Optional[str]:
+    cfg_path = getattr(config, "PRICE_INDEX_EXCEL_PATH", None)
+    if cfg_path and os.path.exists(cfg_path):
+        return cfg_path
+
+    env_path = os.getenv("PRICE_INDEX_EXCEL_PATH")
+    if env_path and os.path.exists(env_path):
+        return env_path
+
+    common_locations = [
+        "Price Index.xlsx",
+        "Price_Index.xlsx",
+        "price_index.xlsx",
+        os.path.join("data", "Price Index.xlsx"),
+        os.path.join("assets", "Price Index.xlsx"),
+        os.path.join(os.path.dirname(__file__), "Price Index.xlsx"),
+        os.path.join(os.path.dirname(__file__), "..", "Price Index.xlsx"),
+        os.path.join(os.path.dirname(__file__), "..", "data", "Price Index.xlsx"),
+    ]
+    for loc in common_locations:
+        if os.path.exists(loc):
+            return os.path.abspath(loc)
+    return None
+
+
+def _load_excel_price_index(fpath: str) -> Dict[Tuple[str, str], float]:
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(fpath, data_only=True, read_only=True)
+    except Exception as err:
+        logger.warning("Could not open Price Index Excel '%s': %s", fpath, err)
         return {}
 
-    return _parse_price_index_sheet_rows(rows, m_col, mo_col, idx_col, h_idx)
+    result = {}
+    try:
+        for sheetname in wb.sheetnames:
+            ws = wb[sheetname]
+            parsed = _parse_price_index_sheet(ws)
+            if parsed:
+                result.update(parsed)
+    finally:
+        wb.close()
+    return result
 
 
 def load_price_index_map(force_reload: bool = False) -> Dict[Tuple[str, str], float]:
-    """Loads Price Index reference map keyed by (Month_3Letter, Model_Normalized) -> float multiplier."""
+    """Loads Price Index lookup map: (month_3letter, normalized_model) -> multiplier."""
     global _CACHED_PRICE_INDEX_MAP
     if _CACHED_PRICE_INDEX_MAP is not None and not force_reload:
         return _CACHED_PRICE_INDEX_MAP
 
-    paths_to_try = [
-        getattr(config, "PRICE_INDEX_FILE_PATH", None),
-        "Price Index.xlsx",
-        os.path.join(os.path.dirname(__file__), "..", "Price Index.xlsx"),
-        os.path.join(os.getcwd(), "Price Index.xlsx"),
-    ]
-    resolved_path = None
-    for p in paths_to_try:
-        if p and os.path.exists(p):
-            resolved_path = p
-            break
+    fpath = _resolve_price_index_file_path()
+    result = {}
+    if fpath:
+        result = _load_excel_price_index(fpath)
 
-    if not resolved_path:
-        logger.warning("Price Index.xlsx not found at candidate paths; defaulting to multiplier 1.0.")
-        _CACHED_PRICE_INDEX_MAP = {}
-        return _CACHED_PRICE_INDEX_MAP
+    fallback = _get_hardcoded_fallback_price_index()
+    for k, v in fallback.items():
+        if k not in result:
+            result[k] = v
 
-    try:
-        _CACHED_PRICE_INDEX_MAP = _load_price_index_from_excel(resolved_path)
-    except Exception as err:
-        logger.warning("Failed to parse Price Index file at %s: %s; using fallback.", resolved_path, err)
-        _CACHED_PRICE_INDEX_MAP = {}
-
+    _CACHED_PRICE_INDEX_MAP = result
     return _CACHED_PRICE_INDEX_MAP
 
 
@@ -403,7 +444,7 @@ def get_factory_pos_val(month_num: int, model_name: str | list[str], pos_val: fl
     return float(pos_val) * index_val, index_val
 
 
-# --- 3. Live PostgreSQL Building Block Planning Values -----------------------
+# ─── 3. Live PostgreSQL Building Block Planning Values ───────────────────────
 
 def load_live_building_blocks(domain: str = "CONSUMPTION") -> List[Dict[str, Any]]:
     """
@@ -429,7 +470,7 @@ def load_live_building_blocks(domain: str = "CONSUMPTION") -> List[Dict[str, Any
         AND bb.is_active = TRUE
         AND hm.is_active = TRUE
         AND (
-            pr.snapshot_id IS NULL 
+            pr.snapshot_id IS NULL
             OR pr.snapshot_id = (
                 SELECT s.snapshot_id
                 FROM public.{table_prefix}_snapshots s
@@ -470,34 +511,43 @@ def load_live_building_blocks(domain: str = "CONSUMPTION") -> List[Dict[str, Any
 def _matches_period(p_val: Any, year: int, month_nbr: int) -> bool:
     if not p_val:
         return False
-    dt = map_date_to_kv_calendar(p_val)
-    if dt:
-        return dt[0] == year and dt[1] == month_nbr
-    p_str = str(p_val).strip()
-    return p_str.startswith(f"{year}-{month_nbr:02d}")
+    if isinstance(p_val, (date, datetime)):
+        return p_val.year == year and p_val.month == month_nbr
+    s = str(p_val).strip()
+    try:
+        dt = date.fromisoformat(s[:10])
+        return dt.year == year and dt.month == month_nbr
+    except (ValueError, TypeError):
+        pass
+    for fmt in ("%m/%d/%Y", "%Y/%m/%d", "%d-%b-%Y", "%d-%b-%y", "%Y-%m"):
+        try:
+            dt = datetime.strptime(s[:10], fmt)
+            return dt.year == year and dt.month == month_nbr
+        except (ValueError, TypeError):
+            continue
+    return False
 
 
-def _matches_consumption_bb_row(r: dict, norm_targets: Set[str], year: int, month_nbr: int) -> bool:
+def _matches_consumption_bb_row(r: Dict[str, Any], norm_targets: Set[str], year: int, month_nbr: int) -> bool:
     if normalize_text(r.get("model", "")) not in norm_targets:
         return False
-    b_raw = str(r.get("building_block", "")).strip()
-    canon_b = RAW_BB_MAP.get(normalize_text(b_raw))
-    if not canon_b or canon_b not in ALLOWED_BUILDING_BLOCKS:
+    if normalize_text(r.get("building_block", "")) not in RAW_BB_MAP:
         return False
     return _matches_period(r.get("period_month"), year, month_nbr)
 
 
 def get_building_block_total_for_period(
-    model_name: str | list[str],
-    year: int,
-    month_nbr: int,
-    bb_rows: List[Dict[str, Any]]
+    model_name: str | list[str], year: int, month_nbr: int, bb_rows: List[Dict[str, Any]]
 ) -> float:
-    """Returns total active POS Building Block additions in thousands ($K) for period."""
-    if not model_name or not bb_rows:
+    """Returns total building block planning value in thousands ($K) for model(s) in period year-month."""
+    if not bb_rows or not model_name:
         return 0.0
-    targets = [model_name] if isinstance(model_name, str) else model_name
-    norm_targets = {normalize_text(m) for m in targets if m}
+
+    if isinstance(model_name, (list, tuple, set)):
+        norm_targets = {normalize_text(m) for m in model_name if m}
+    else:
+        norm_targets = {normalize_text(model_name)}
+
     return sum(
         float(r.get("value_in_thousands") or 0.0)
         for r in bb_rows
@@ -522,6 +572,8 @@ def map_shipment_bb_name(raw_name: str) -> Optional[str]:
     if not raw_name:
         return None
     norm = normalize_text(raw_name)
+    if "OTHER" in norm or "OVERLAY" in norm or "IBP" in norm:
+        return "Other"
     if "DISTRIBUT" in norm:
         return "Distribution"
     if "INNOVAT" in norm:
@@ -536,32 +588,32 @@ def map_shipment_bb_name(raw_name: str) -> Optional[str]:
         return "Supply Constraints"
     if "LIQUIDAT" in norm:
         return "Liquidations"
-    if "OTHER" in norm or "OVERLAY" in norm or "IBP" in norm:
-        return "Other"
-    return str(raw_name).strip() if norm else None
+    for b in SHIPMENT_ALLOWED_BUILDING_BLOCKS:
+        if normalize_text(b) == norm:
+            return b
+    return None
 
 
 def _matches_shipment_bb_row(r: Dict[str, Any], norm_targets: Set[str], year: int, month_nbr: int) -> bool:
     if normalize_text(r.get("model", "")) not in norm_targets:
         return False
-    b_raw = str(r.get("building_block", "")).strip()
-    canon_b = map_shipment_bb_name(b_raw)
-    if not canon_b or canon_b not in SHIPMENT_ALLOWED_BUILDING_BLOCKS:
+    if not map_shipment_bb_name(r.get("building_block", "")):
         return False
     return _matches_period(r.get("period_month"), year, month_nbr)
 
 
 def get_shipment_building_block_total_for_period(
-    model_name: str | list[str],
-    year: int,
-    month_nbr: int,
-    bb_rows: List[Dict[str, Any]]
+    model_name: str | list[str], year: int, month_nbr: int, bb_rows: List[Dict[str, Any]]
 ) -> float:
-    """Returns total active Shipment Building Block additions in thousands ($K) for period."""
-    if not model_name or not bb_rows:
+    """Returns total shipment building block planning value in thousands ($K) for model(s) in period year-month."""
+    if not bb_rows or not model_name:
         return 0.0
-    targets = [model_name] if isinstance(model_name, str) else model_name
-    norm_targets = {normalize_text(m) for m in targets if m}
+
+    if isinstance(model_name, (list, tuple, set)):
+        norm_targets = {normalize_text(m) for m in model_name if m}
+    else:
+        norm_targets = {normalize_text(model_name)}
+
     return sum(
         float(r.get("value_in_thousands") or 0.0)
         for r in bb_rows
@@ -580,12 +632,6 @@ def _extract_row_year_and_month_idx(r: Dict[str, Any]) -> Tuple[Optional[str], O
     if kv_info:
         return kv_info["y_str"], kv_info["m_idx"]
 
-    yr = str(r.get("YEAR") or 0)
-    m_raw = r.get("MONTHNUMBER") or r.get("MONTH_NUMBER") or r.get("MONTH")
-    m_3 = normalize_month_3letter(m_raw)
-    if yr.isdigit() and int(yr) >= 2022 and m_3 in MONTHS:
-        return yr, MONTHS.index(m_3)
-
     return None, None
 
 
@@ -595,22 +641,22 @@ def _accumulate_pos_maps(
     pos_u_map: Dict[Tuple[str, int], float],
 ) -> None:
     y_str, m_idx = _extract_row_year_and_month_idx(r)
-    if not y_str or m_idx is None:
+    if not y_str or m_idx is None or (y_str.isdigit() and int(y_str) < 2021):
         return
-    pv = r.get("POS_AMT") or r.get("POS_DOLLARS") or r.get("POS_VALUE")
-    pu = r.get("POS_QTY") or r.get("POS_UNITS")
-    key = (y_str, m_idx)
+
+    pv = r.get("POS_VALUE") if r.get("POS_VALUE") is not None else r.get("POS_DOLLARS")
+    pu = r.get("POS_UNITS")
+    key = (str(y_str), m_idx)
     if pv is not None:
-        pos_val_map[key] = (pos_val_map.get(key) or 0.0) + float(pv)
+        pos_val_map[key] = pos_val_map.get(key, 0.0) + float(pv)
     if pu is not None:
-        pos_u_map[key] = (pos_u_map.get(key) or 0.0) + float(pu)
+        pos_u_map[key] = pos_u_map.get(key, 0.0) + float(pu)
 
 
 def _build_factory_pos_map(
-    pos_val_map: Dict[Tuple[str, int], float],
-    model_name: str | list[str],
+    pos_val_map: Dict[Tuple[str, int], float], model_name: str | list[str]
 ) -> Dict[Tuple[str, int], float]:
-    factory_pos_map = {}
+    factory_pos_map: Dict[Tuple[str, int], float] = {}
     for (y_str, m_idx), pv_val in pos_val_map.items():
         f_pos, _ = get_factory_pos_val(m_idx + 1, model_name, pv_val)
         factory_pos_map[(str(y_str), m_idx)] = f_pos if f_pos is not None else pv_val
@@ -618,105 +664,123 @@ def _build_factory_pos_map(
 
 
 def extract_consumption_maps(
-    rows_cons: List[Dict[str, Any]],
-    model_name: str | list[str],
+    rows_cons: List[Dict[str, Any]], model_name: str | list[str]
 ) -> Tuple[Dict[Tuple[str, int], float], Dict[Tuple[str, int], float], Dict[Tuple[str, int], float]]:
-    """Extracts factory_pos_map, pos_val_map, pos_u_map from Snowflake consumption rows."""
+    """
+    Extracts factory_pos_map, pos_val_map, pos_u_map from Snowflake consumption rows.
+    Returns: (factory_pos_map, pos_val_map, pos_u_map) keyed by (year_str, month_idx 0..11).
+    """
     if not rows_cons:
         return {}, {}, {}
+
     pos_val_map: Dict[Tuple[str, int], float] = {}
     pos_u_map: Dict[Tuple[str, int], float] = {}
+
     for r in rows_cons:
         _accumulate_pos_maps(r, pos_val_map, pos_u_map)
+
     factory_pos_map = _build_factory_pos_map(pos_val_map, model_name)
     return factory_pos_map, pos_val_map, pos_u_map
 
 
-# --- 4. Full Metrics Matrix Calculators ---------------------------------------
+# ─── 4. Full Metrics Matrix Calculators ──────────────────────────────────────
 
 def calc_asp(pos_val: Optional[float], pos_units: Optional[float]) -> Optional[float]:
     if pos_val is None or pos_units is None or pos_units == 0:
         return None
-    return round(float(pos_val) / float(pos_units), 2)
+    return pos_val / pos_units
 
 
-def calc_pct_var(current: Optional[float], base: Optional[float]) -> Optional[float]:
-    if current is None or base is None or base == 0:
+def calc_pct_var(actual: Optional[float], comparison: Optional[float]) -> Optional[float]:
+    if actual is None or comparison is None or comparison == 0:
         return None
-    return round(((float(current) - float(base)) / abs(float(base))) * 100.0, 1)
+    return ((actual - comparison) / abs(comparison)) * 100.0
 
 
-def calc_share(sub_val: Optional[float], total_val: Optional[float]) -> Optional[float]:
-    if sub_val is None or total_val is None or total_val == 0:
+def calc_share(month_val: Optional[float], total_val: Optional[float]) -> Optional[float]:
+    if month_val is None or total_val is None or total_val == 0:
         return None
-    return round((float(sub_val) / float(total_val)) * 100.0, 1)
+    return (month_val / total_val) * 100.0
 
 
 def _accumulate_year_consumption_metrics(
     r: Dict[str, Any], data_by_year: Dict[str, Dict[str, List[Optional[float]]]]
 ) -> None:
     y_str, m_idx = _extract_row_year_and_month_idx(r)
-    if not y_str or m_idx is None:
+    if not y_str or m_idx is None or (y_str.isdigit() and int(y_str) < 2021):
         return
+
     if y_str not in data_by_year:
-        data_by_year[y_str] = {"pos_val": [None] * 12, "factory_pos": [None] * 12, "pos_u": [None] * 12}
-    amt = r.get("POS_AMT") or r.get("POS_DOLLARS") or r.get("POS_VALUE")
-    qty = r.get("POS_QTY") or r.get("POS_UNITS")
-    if amt is not None:
-        data_by_year[y_str]["pos_val"][m_idx] = (data_by_year[y_str]["pos_val"][m_idx] or 0.0) + float(amt)
-    if qty is not None:
-        data_by_year[y_str]["pos_u"][m_idx] = (data_by_year[y_str]["pos_u"][m_idx] or 0.0) + float(qty)
+        data_by_year[y_str] = {
+            "pos_val": [None] * 12,
+            "factory_pos": [None] * 12,
+            "pos_u": [None] * 12,
+        }
+    d_dict = data_by_year[y_str]
+    pv = r.get("POS_VALUE") or r.get("POS_DOLLARS")
+    pu = r.get("POS_UNITS")
+
+    if pv is not None:
+        d_dict["pos_val"][m_idx] = (d_dict["pos_val"][m_idx] or 0.0) + float(pv)
+    if pu is not None:
+        d_dict["pos_u"][m_idx] = (d_dict["pos_u"][m_idx] or 0.0) + float(pu)
 
 
-def _aggregate_consumption_sf_rows(rows_sf: List[Dict[str, Any]]) -> Dict[str, Dict[str, List[Optional[float]]]]:
+def _aggregate_consumption_sf_rows(
+    rows_cons: List[Dict[str, Any]], model_name: str | list[str]
+) -> Dict[str, Dict[str, List[Optional[float]]]]:
     data_by_year: Dict[str, Dict[str, List[Optional[float]]]] = {}
-    for r in rows_sf:
+    for r in rows_cons:
         _accumulate_year_consumption_metrics(r, data_by_year)
+
+    for _, d_dict in data_by_year.items():
+        for m_i in range(12):
+            pv_m = d_dict["pos_val"][m_i]
+            if pv_m is not None:
+                f_pos, _ = get_factory_pos_val(m_i + 1, model_name, pv_m)
+                d_dict["factory_pos"][m_i] = f_pos
     return data_by_year
 
 
-def _extract_ytd_slice(comp_status: dict) -> slice:
-    ytd_slice = comp_status.get("ytd_slice")
-    if not isinstance(ytd_slice, slice):
-        comp_m = comp_status.get("latest_complete_m_nbr") or 8
-        ytd_slice = slice(0, comp_m)
-    return ytd_slice
+def _extract_ytd_slice(comp_status: Dict[str, Any]) -> List[int]:
+    return comp_status.get("ytd_slice", [0, 8])
 
 
 def _compute_projected_asp(
-    data_by_year: dict, latest_year: str, prev_year: str, m_i: int, prev_yr_pos: float, ytd_slice: slice
+    data_by_year: Dict[str, Dict[str, List[Optional[float]]]],
+    latest_year: str,
+    prev_year: str,
+    m_i: int,
+    prev_yr_pos: float,
+    ytd_slice: List[int],
 ) -> Optional[float]:
-    asp_m = None
-    prev_yr_u = data_by_year.get(prev_year, {}).get("pos_u", [None] * 12)[m_i]
-    if prev_yr_u and prev_yr_u > 0:
-        prev_asp = prev_yr_pos / prev_yr_u
-        ytd_val_lat = sum(v for v in data_by_year[latest_year]["pos_val"][ytd_slice] if v is not None)
-        ytd_u_lat = sum(v for v in data_by_year[latest_year]["pos_u"][ytd_slice] if v is not None)
-        ytd_val_prv = sum(v for v in data_by_year.get(prev_year, {}).get("pos_val", [])[ytd_slice] if v is not None)
-        ytd_u_prv = sum(v for v in data_by_year.get(prev_year, {}).get("pos_u", [])[ytd_slice] if v is not None)
-        lat_asp_ytd = (ytd_val_lat / ytd_u_lat) if ytd_u_lat > 0 else 0.0
-        prv_asp_ytd = (ytd_val_prv / ytd_u_prv) if ytd_u_prv > 0 else 0.0
-        asp_trend = (lat_asp_ytd / prv_asp_ytd) if (lat_asp_ytd and prv_asp_ytd and prv_asp_ytd > 0) else 1.0
-        asp_m = prev_asp * asp_trend
-    return asp_m
+    curr_ytd_val = sum(x for x in data_by_year[latest_year]["pos_val"][ytd_slice[0]:ytd_slice[1]] if x is not None)
+    curr_ytd_u = sum(x for x in data_by_year[latest_year]["pos_u"][ytd_slice[0]:ytd_slice[1]] if x is not None)
+    curr_asp_ytd = (curr_ytd_val / curr_ytd_u) if curr_ytd_u and curr_ytd_u > 0 else 0.0
+
+    prev_ytd_val = sum(x for x in data_by_year.get(prev_year, {}).get("pos_val", [])[ytd_slice[0]:ytd_slice[1]] if x is not None)
+    prev_ytd_u = sum(x for x in data_by_year.get(prev_year, {}).get("pos_u", [])[ytd_slice[0]:ytd_slice[1]] if x is not None)
+    prev_asp_ytd = (prev_ytd_val / prev_ytd_u) if prev_ytd_u and prev_ytd_u > 0 else 0.0
+
+    prev_same_u = data_by_year.get(prev_year, {}).get("pos_u", [None] * 12)[m_i]
+    prev_same_asp = (prev_yr_pos / prev_same_u) if prev_same_u and prev_same_u > 0 else curr_asp_ytd
+    yoy_asp_pct = ((curr_asp_ytd - prev_asp_ytd) / prev_asp_ytd) if prev_asp_ytd > 0 else 0.0
+
+    return prev_same_asp * (1.0 + yoy_asp_pct)
 
 
 def _project_consumption_future_months(
-    data_by_year: dict,
+    data_by_year: Dict[str, Dict[str, List[Optional[float]]]],
     latest_year: str,
     prev_year: str,
     latest_year_int: int,
     latest_comp_m_nbr: int,
     model_name: str | list[str],
-    comp_status: dict,
+    comp_status: Dict[str, Any],
 ):
     if latest_comp_m_nbr >= 12:
         return
-    try:
-        bb_rows = load_live_building_blocks(domain="CONSUMPTION")
-    except (psycopg2.Error, OSError, ValueError, KeyError):
-        bb_rows = []
-
+    bb_rows = load_live_building_blocks(domain="CONSUMPTION")
     ytd_slice = _extract_ytd_slice(comp_status)
 
     for m_n in range(latest_comp_m_nbr + 1, 13):
@@ -738,145 +802,151 @@ def _project_consumption_future_months(
 
 
 def _calculate_single_year_consumption_metrics(
-    d: dict, prev_yr_dec_pos: Optional[float], prev_yr_dec_asp: Optional[float]
-) -> dict:
-    asp = [None] * 12
-    for i in range(12):
-        c_asp = calc_asp(d["pos_val"][i], d["pos_u"][i])
-        if c_asp is not None:
-            asp[i] = c_asp
-        elif i > 0:
-            asp[i] = asp[i - 1]
-        else:
-            asp[i] = prev_yr_dec_asp
+    d: Dict[str, List[Optional[float]]],
+    prev_yr_dec_pos: Optional[float],
+) -> Dict[str, Any]:
+    pos_val = d["pos_val"]
+    factory_pos = d["factory_pos"]
+    pos_u = d["pos_u"]
 
-    build = [None] * 12
-    for i in range(12):
-        cur_p = d["pos_val"][i]
-        prev_p = d["pos_val"][i - 1] if i > 0 else prev_yr_dec_pos
-        if cur_p is not None and prev_p is not None and prev_p != 0:
-            build[i] = round(cur_p / prev_p, 2)
+    asp_arr = [calc_asp(pos_val[i], pos_u[i]) for i in range(12)]
 
-    tot_p = sum(v for v in d["pos_val"] if v is not None and not (isinstance(v, float) and math.isnan(v)))
-    share = [calc_share(d["pos_val"][i], tot_p) for i in range(12)]
+    build_arr = [None] * 12
+    for i in range(12):
+        curr_m = pos_val[i]
+        prior_m = pos_val[i - 1] if i > 0 else prev_yr_dec_pos
+        if curr_m is not None and prior_m is not None and prior_m > 0:
+            build_arr[i] = (curr_m / prior_m) - 1.0
+
+    valid_vals = [v for v in pos_val if v is not None]
+    fy_tot = sum(valid_vals) if valid_vals else 0.0
+    share_arr = [calc_share(pos_val[i], fy_tot) for i in range(12)]
 
     return {
-        "pos_val": d["pos_val"],
-        "factory_pos": d["factory_pos"],
-        "pos_u": d["pos_u"],
-        "asp": asp,
-        "build": build,
-        "share": share,
+        "pos_val": pos_val,
+        "factory_pos": factory_pos,
+        "pos_u": pos_u,
+        "asp": asp_arr,
+        "build": build_arr,
+        "share": share_arr,
     }
 
 
-def _calculate_consumption_year_metrics(
-    data_by_year: dict, all_years: List[str]
-) -> Dict[str, Dict[str, Any]]:
-    year_metrics = {}
-    prev_yr_dec_pos = None
-    prev_yr_dec_asp = None
-    for yr in all_years:
-        d = data_by_year[yr]
-        metrics = _calculate_single_year_consumption_metrics(d, prev_yr_dec_pos, prev_yr_dec_asp)
-        year_metrics[yr] = metrics
-        prev_yr_dec_pos = d["pos_val"][11]
-        prev_yr_dec_asp = metrics["asp"][11]
-    return year_metrics
+def _calc_yoy_growth(
+    curr_arr: List[Optional[float]],
+    prev_arr: Optional[List[Optional[float]]]
+) -> List[Optional[float]]:
+    if not prev_arr:
+        return [None] * 12
+    return [calc_pct_var(curr_arr[i], prev_arr[i]) for i in range(12)]
 
 
-def _detect_consumption_build_outliers(
-    year_metrics: dict, latest_year: str, hist_years: List[str]
-) -> Dict[int, Dict[str, Any]]:
-    red_outliers = {}
-    if not hist_years:
-        return red_outliers
+def _detect_2sigma_outliers(
+    year_metrics: Dict[str, Dict[str, Any]],
+    latest_year: str,
+    ref_years: List[str]
+) -> Dict[int, str]:
+    outliers: Dict[int, str] = {}
     for m_i in range(12):
-        hist_vals = [
-            year_metrics[h_yr]["build"][m_i]
-            for h_yr in hist_years
-            if h_yr in year_metrics and year_metrics[h_yr]["build"][m_i] is not None
-        ]
-        if len(hist_vals) >= 2:
-            mean = statistics.mean(hist_vals)
-            stdev = statistics.stdev(hist_vals)
-            curr = year_metrics[latest_year]["build"][m_i]
-            if curr is not None and (curr < (mean - 2 * stdev) or curr > (mean + 2 * stdev)):
-                red_outliers[m_i] = {"mean": round(mean, 2), "stdev": round(stdev, 2), "value": curr}
-    return red_outliers
+        vals = []
+        for yr in ref_years:
+            b_val = year_metrics.get(yr, {}).get("build", [None] * 12)[m_i]
+            if b_val is not None and not (isinstance(b_val, float) and math.isnan(b_val)):
+                vals.append(b_val)
+        if len(vals) < 3:
+            continue
+        mean_val = statistics.mean(vals)
+        stdev_val = statistics.stdev(vals)
+        latest_val = year_metrics.get(latest_year, {}).get("build", [None] * 12)[m_i]
+        if latest_val is not None and stdev_val > 0.0001:
+            z_score = abs(latest_val - mean_val) / stdev_val
+            if z_score > 2.0:
+                outliers[m_i] = "red"
+    return outliers
 
 
-def build_consumption_matrix(rows_sf: List[Dict[str, Any]], model_name: str | list[str]) -> Dict[str, Any]:
-    """Computes complete Consumption Validation matrix from Snowflake weekly data and live DB building blocks."""
-    if not rows_sf:
+def build_consumption_matrix(
+    rows_cons: List[Dict[str, Any]],
+    model_name: str | list[str],
+    as_of_date: Optional[date] = None,
+) -> Dict[str, Any]:
+    """Computes complete Consumption Validation matrix matching official validation specifications."""
+    if not rows_cons:
         return {}
 
-    data_by_year = _aggregate_consumption_sf_rows(rows_sf)
-    all_years = sorted([yr for yr in data_by_year if yr.isdigit() and int(yr) >= 2022])
+    data_by_year = _aggregate_consumption_sf_rows(rows_cons, model_name)
+    all_years = sorted([yr for yr in data_by_year if yr.isdigit() and int(yr) >= 2021])
     if not all_years:
         return {}
 
     latest_year = all_years[-1]
     prev_year = str(int(latest_year) - 1)
+    ref_years = [y for y in all_years if y < latest_year][-4:]
+
+    comp_status = get_kv_month_completeness_status(as_of_date)
+    latest_comp_m_nbr = comp_status["latest_complete_m_nbr"]
     latest_year_int = int(latest_year)
-    hist_years = [str(latest_year_int - 5 + i) for i in range(5) if str(latest_year_int - 5 + i) in data_by_year]
-
-    for yr_k in all_years:
-        for m_i in range(12):
-            pv_val = data_by_year[yr_k]["pos_val"][m_i]
-            if pv_val is not None:
-                f_pos, _ = get_factory_pos_val(m_i + 1, model_name, pv_val)
-                data_by_year[yr_k]["factory_pos"][m_i] = f_pos
-
-    comp_status = get_kv_month_completeness_status(rows_sf, target_year=latest_year)
-    for yr_k in all_years:
-        yr_comp = get_kv_month_completeness_status(rows_sf, target_year=yr_k)
-        yr_m_details = yr_comp.get("month_details", {})
-        for m_n in range(1, 13):
-            if not yr_m_details.get(m_n, {}).get("is_complete", False):
-                m_i = m_n - 1
-                data_by_year[yr_k]["pos_val"][m_i] = None
-                data_by_year[yr_k]["pos_u"][m_i] = None
-                data_by_year[yr_k]["factory_pos"][m_i] = None
 
     _project_consumption_future_months(
-        data_by_year, latest_year, prev_year, latest_year_int, comp_status["latest_complete_m_nbr"], model_name, comp_status
+        data_by_year, latest_year, prev_year, latest_year_int, latest_comp_m_nbr, model_name, comp_status
     )
-    year_metrics = _calculate_consumption_year_metrics(data_by_year, all_years)
-    red_outliers = _detect_consumption_build_outliers(year_metrics, latest_year, hist_years)
+
+    year_metrics: Dict[str, Dict[str, Any]] = {}
+    for yr in all_years:
+        prev_dec = data_by_year.get(str(int(yr) - 1), {}).get("pos_val", [None] * 12)[11]
+        year_metrics[yr] = _calculate_single_year_consumption_metrics(data_by_year[yr], prev_dec)
+
+    yoy_metrics: Dict[str, Dict[str, List[Optional[float]]]] = {}
+    for yr in all_years:
+        prev_yr_str = str(int(yr) - 1)
+        if prev_yr_str in year_metrics:
+            yoy_metrics[yr] = {
+                "pos_val": _calc_yoy_growth(year_metrics[yr]["pos_val"], year_metrics[prev_yr_str]["pos_val"]),
+                "pos_u": _calc_yoy_growth(year_metrics[yr]["pos_u"], year_metrics[prev_yr_str]["pos_u"]),
+                "asp": _calc_yoy_growth(year_metrics[yr]["asp"], year_metrics[prev_yr_str]["asp"]),
+            }
+        else:
+            yoy_metrics[yr] = {
+                "pos_val": [None] * 12,
+                "pos_u": [None] * 12,
+                "asp": [None] * 12,
+            }
+
+    red_outliers = _detect_2sigma_outliers(year_metrics, latest_year, ref_years)
 
     return {
         "all_years": all_years,
         "latest_year": latest_year,
         "prev_year": prev_year,
+        "ref_years": ref_years,
         "year_metrics": year_metrics,
-        "comp_status": comp_status,
+        "yoy_metrics": yoy_metrics,
         "red_outliers": red_outliers,
+        "comp_status": comp_status,
         "data_by_year": data_by_year,
     }
 
 
-def _is_valid_numeric_val(val: Any) -> bool:
-    return val is not None and not (isinstance(val, float) and (math.isnan(val) or math.isinf(val)))
+# ─── 5. Shipment Authoritative Math Engine ───────────────────────────────────
 
-
-def _accumulate_shipment_row(
-    r: Dict[str, Any], data_by_year: Dict[str, Dict[str, List[Optional[float]]]]
-) -> None:
-    yr = str(r.get("YEAR") or 0)
-    m_nbr = int(r.get("MONTHNUMBER") or 0)
-    if not yr.isdigit() or int(yr) < 2022 or m_nbr < 1 or m_nbr > 12:
+def _accumulate_shipment_row(r: Dict[str, Any], data_by_year: Dict[str, Dict[str, List[Optional[float]]]]) -> None:
+    y_str, m_idx = _extract_row_year_and_month_idx(r)
+    if not y_str or m_idx is None or (y_str.isdigit() and int(y_str) < 2021):
         return
-    m_idx = m_nbr - 1
-    if yr not in data_by_year:
-        data_by_year[yr] = {"gts_val": [None] * 12, "gts_qty": [None] * 12}
-    amt_raw = r.get("GTS_AMT")
-    qty_raw = r.get("GTS_QTY")
-    if _is_valid_numeric_val(amt_raw):
-        data_by_year[yr]["gts_val"][m_idx] = (data_by_year[yr]["gts_val"][m_idx] or 0.0) + float(amt_raw)
-    if _is_valid_numeric_val(qty_raw):
-        q_num = float(qty_raw)
-        data_by_year[yr]["gts_qty"][m_idx] = (data_by_year[yr]["gts_qty"][m_idx] or 0.0) + (abs(q_num) if q_num != 0 else 0.0)
+
+    if y_str not in data_by_year:
+        data_by_year[y_str] = {
+            "gts_val": [None] * 12,
+            "gts_qty": [None] * 12,
+        }
+
+    gv = r.get("GTS_VAL") or r.get("GTS_DOLLARS") or r.get("GROSS_SALES")
+    gu = r.get("GTS_QTY") or r.get("GTS_UNITS") or r.get("GROSS_UNITS")
+
+    if gv is not None:
+        data_by_year[y_str]["gts_val"][m_idx] = (data_by_year[y_str]["gts_val"][m_idx] or 0.0) + float(gv)
+    if gu is not None:
+        data_by_year[y_str]["gts_qty"][m_idx] = (data_by_year[y_str]["gts_qty"][m_idx] or 0.0) + float(gu)
 
 
 def _aggregate_shipment_sf_rows(rows_ship: List[Dict[str, Any]]) -> Dict[str, Dict[str, List[Optional[float]]]]:
@@ -894,21 +964,16 @@ def _compute_prev_year_fy_price_factor(
 ) -> float:
     if prev_year not in data_by_year:
         return 1.0
-    prev_usd_arr = [v for v in data_by_year[prev_year]["gts_val"] if v is not None and not (isinstance(v, float) and math.isnan(v))]
-    prev_qty_arr = [v for v in data_by_year[prev_year]["gts_qty"] if v is not None and not (isinstance(v, float) and math.isnan(v))]
-    prev_pos_val_arr = [pos_val_map.get((str(prev_year), i)) for i in range(12) if pos_val_map.get((str(prev_year), i)) is not None]
-    prev_pos_u_arr = [pos_u_map.get((str(prev_year), i)) for i in range(12) if pos_u_map.get((str(prev_year), i)) is not None]
 
-    tot_prev_usd = sum(prev_usd_arr) if prev_usd_arr else 0.0
-    tot_prev_qty = sum(prev_qty_arr) if prev_qty_arr else 0.0
-    tot_prev_pos_val = sum(prev_pos_val_arr) if prev_pos_val_arr else 0.0
-    tot_prev_pos_u = sum(prev_pos_u_arr) if prev_pos_u_arr else 0.0
+    sum_gs_prev = sum(x for x in data_by_year[prev_year]["gts_val"] if x is not None)
+    sum_gu_prev = sum(x for x in data_by_year[prev_year]["gts_qty"] if x is not None)
+    fy_b3_prev = (sum_gs_prev / sum_gu_prev) if sum_gu_prev and sum_gu_prev > 0 else 1.0
 
-    asp_prev_fy = (tot_prev_pos_val / tot_prev_pos_u) if (tot_prev_pos_val > 0 and tot_prev_pos_u > 0) else None
-    b3_prev_fy = (tot_prev_usd / tot_prev_qty) if (tot_prev_usd > 0 and tot_prev_qty > 0) else None
-    if asp_prev_fy and b3_prev_fy and b3_prev_fy != 0:
-        return asp_prev_fy / b3_prev_fy
-    return 1.0
+    sum_pv_prev = sum(pos_val_map.get((prev_year, m), 0.0) for m in range(12))
+    sum_pu_prev = sum(pos_u_map.get((prev_year, m), 0.0) for m in range(12))
+    fy_asp_prev = (sum_pv_prev / sum_pu_prev) if sum_pu_prev and sum_pu_prev > 0 else 1.0
+
+    return (fy_asp_prev / fy_b3_prev) if fy_b3_prev and fy_b3_prev > 0 else 1.0
 
 
 def _resolve_month_factory_pos(
@@ -925,25 +990,20 @@ def _resolve_month_factory_pos(
     if factory_pos is not None:
         return factory_pos
 
-    prev_pos_val = pos_val_map.get((str(prev_year), m_i))
-
     if cons_bb_rows is None:
         try:
             cons_bb_rows = load_live_building_blocks(domain="CONSUMPTION")
         except (psycopg2.Error, OSError, ValueError, KeyError):
             cons_bb_rows = []
 
-    latest_year_int = int(latest_year) if str(latest_year).isdigit() else 2026
-    tot_cons_bb_k = get_building_block_total_for_period(model_name, latest_year_int, m_nbr, cons_bb_rows)
-    tot_cons_bb_usd = (tot_cons_bb_k * 1000.0) if tot_cons_bb_k else 0.0
+    prev_pos_val = pos_val_map.get((str(prev_year), m_i))
+    tot_cons_bb_k = get_building_block_total_for_period(model_name, int(latest_year), m_nbr, cons_bb_rows)
 
-    if prev_pos_val is not None:
-        projected_plan_pos = prev_pos_val + tot_cons_bb_usd
-        f_pos_calc, _ = get_factory_pos_val(m_nbr, model_name, projected_plan_pos)
-        factory_pos = f_pos_calc if f_pos_calc is not None else projected_plan_pos
-    elif tot_cons_bb_usd > 0:
-        f_pos_calc, _ = get_factory_pos_val(m_nbr, model_name, tot_cons_bb_usd)
-        factory_pos = f_pos_calc if f_pos_calc is not None else tot_cons_bb_usd
+    if prev_pos_val is not None or tot_cons_bb_k:
+        base_pos = prev_pos_val if prev_pos_val is not None else 0.0
+        plan_pos = base_pos + (tot_cons_bb_k * 1000.0)
+        f_pos_calc, _ = get_factory_pos_val(m_nbr, model_name, plan_pos)
+        factory_pos = f_pos_calc if f_pos_calc is not None else plan_pos
     else:
         factory_pos = 0.0
 
@@ -983,7 +1043,6 @@ def _project_shipment_future_months(
     fy_price_factor_prev: float,
     model_name: str | list[str],
     bb_rows: Optional[List[Dict[str, Any]]],
-    cons_bb_rows: Optional[List[Dict[str, Any]]] = None,
 ):
     if latest_comp_m_nbr >= 12:
         return
@@ -992,11 +1051,11 @@ def _project_shipment_future_months(
             bb_rows = load_live_building_blocks(domain="SHIPMENT")
         except (psycopg2.Error, OSError, ValueError, KeyError):
             bb_rows = []
-    if cons_bb_rows is None:
-        try:
-            cons_bb_rows = load_live_building_blocks(domain="CONSUMPTION")
-        except (psycopg2.Error, OSError, ValueError, KeyError):
-            cons_bb_rows = []
+
+    try:
+        cons_bb_rows = load_live_building_blocks(domain="CONSUMPTION")
+    except (psycopg2.Error, OSError, ValueError, KeyError):
+        cons_bb_rows = []
 
     for m_i in range(latest_comp_m_nbr, 12):
         m_nbr = m_i + 1
@@ -1064,33 +1123,34 @@ def _calc_single_yr_unit_ratio(
         gs = gts_val[m_i]
         if gs is None or gs == 0 or (isinstance(gs, float) and math.isnan(gs)):
             unit_ratio_arr[m_i] = None
-            continue
-        g_u = gts_qty[m_i]
-        p_u = pos_u_map.get((str(yr), m_i))
-        if p_u is None and prev_year:
-            p_u = pos_u_map.get((str(prev_year), m_i))
-        if g_u is not None and p_u and p_u != 0:
-            unit_ratio_arr[m_i] = round(g_u / p_u, 2)
         else:
-            unit_ratio_arr[m_i] = None
+            gu = gts_qty[m_i]
+            pu = pos_u_map.get((str(yr), m_i))
+            if (pu is None or pu == 0) and prev_year:
+                pu = pos_u_map.get((str(prev_year), m_i))
+            unit_ratio_arr[m_i] = ((gu / pu) * 100.0) if (gu is not None and pu is not None and pu != 0) else None
     return unit_ratio_arr
 
 
 def _calc_single_yr_price_factor(
-    b3_arr: List[Optional[float]],
+    gts_val: List[Optional[float]],
+    gts_qty: List[Optional[float]],
     yr: str,
     prev_year: str,
+    b3_arr: List[Optional[float]],
     pos_val_map: Dict[Tuple[str, int], float],
     pos_u_map: Dict[Tuple[str, int], float],
+    fy_price_factor_prev: float,
 ) -> List[Optional[float]]:
     price_factor_arr = [None] * 12
     for m_i in range(12):
-        b3_val = b3_arr[m_i]
-        asp_m = _resolve_month_asp(yr, prev_year, m_i, pos_val_map, pos_u_map)
-        if asp_m and b3_val and b3_val != 0:
-            price_factor_arr[m_i] = round(asp_m / b3_val, 2)
-        else:
+        gs = gts_val[m_i]
+        if gs is None or gs == 0 or (isinstance(gs, float) and math.isnan(gs)):
             price_factor_arr[m_i] = None
+        else:
+            b3 = b3_arr[m_i]
+            asp = _resolve_month_asp(yr, prev_year, m_i, pos_val_map, pos_u_map)
+            price_factor_arr[m_i] = (asp / b3) if (asp is not None and b3 is not None and b3 != 0) else fy_price_factor_prev
     return price_factor_arr
 
 
@@ -1103,63 +1163,84 @@ def _calculate_shipment_single_year_metrics(
     pos_u_map: Dict[Tuple[str, int], float],
     fy_price_factor_prev: float,
 ) -> Dict[str, Any]:
-    b3_arr = _calc_single_yr_b3(d["gts_val"], d["gts_qty"], yr, prev_year, pos_val_map, pos_u_map, fy_price_factor_prev)
-    build_bleed_arr = _calc_single_yr_build_bleed(d["gts_val"], yr, factory_pos_map)
-    unit_ratio_arr = _calc_single_yr_unit_ratio(d["gts_val"], d["gts_qty"], yr, prev_year, pos_u_map)
-    price_factor_arr = _calc_single_yr_price_factor(b3_arr, yr, prev_year, pos_val_map, pos_u_map)
+    gts_val = d["gts_val"]
+    gts_qty = d["gts_qty"]
+
+    b3_arr = _calc_single_yr_b3(gts_val, gts_qty, yr, prev_year, pos_val_map, pos_u_map, fy_price_factor_prev)
+    build_bleed_arr = _calc_single_yr_build_bleed(gts_val, yr, factory_pos_map)
+    unit_ratio_arr = _calc_single_yr_unit_ratio(gts_val, gts_qty, yr, prev_year, pos_u_map)
+    price_factor_arr = _calc_single_yr_price_factor(gts_val, gts_qty, yr, prev_year, b3_arr, pos_val_map, pos_u_map, fy_price_factor_prev)
 
     return {
-        "gts_val": d["gts_val"],
-        "gts_qty": d["gts_qty"],
+        "gts_val": gts_val,
+        "gts_qty": gts_qty,
         "b3": b3_arr,
         "build_bleed": build_bleed_arr,
         "unit_ratio": unit_ratio_arr,
         "price_factor": price_factor_arr,
+        "gross_ship": gts_val,
+        "gross_case": gts_qty,
+        "net_ship": b3_arr,
+        "share": unit_ratio_arr,
     }
 
 
 def _evaluate_month_unit_ratio_outlier(
     m_i: int,
-    ref_vals: List[float],
     year_metrics: Dict[str, Dict[str, Any]],
     latest_year: str,
-    unit_ratio_outliers: Dict[int, Dict[str, Any]]
-) -> None:
-    if len(ref_vals) < 2:
-        return
-    m_mean = statistics.mean(ref_vals)
-    m_sd = statistics.stdev(ref_vals)
-    curr_ur = year_metrics[latest_year]["unit_ratio"][m_i]
-    if curr_ur is not None and (curr_ur < (m_mean - 2 * m_sd) or curr_ur > (m_mean + 2 * m_sd)):
-        unit_ratio_outliers[m_i] = {"mean": round(m_mean, 2), "stdev": round(m_sd, 2), "value": curr_ur}
+    ref_years: List[str],
+) -> Optional[str]:
+    v_curr = year_metrics[latest_year]["unit_ratio"][m_i]
+    if v_curr is None or (isinstance(v_curr, float) and math.isnan(v_curr)):
+        return None
+
+    ref_4_vals = [
+        year_metrics[y]["unit_ratio"][m_i]
+        for y in ref_years
+        if y in year_metrics
+        and year_metrics[y]["unit_ratio"][m_i] is not None
+        and not (isinstance(year_metrics[y]["unit_ratio"][m_i], float) and math.isnan(year_metrics[y]["unit_ratio"][m_i]))
+    ]
+    if len(ref_4_vals) < 4:
+        return None
+
+    sum_ref = sum(ref_4_vals)
+    baseline = (sum_ref - min(ref_4_vals) - max(ref_4_vals)) / 2.0
+    if baseline <= 0:
+        return None
+
+    rel_diff_pct = abs((v_curr - baseline) / baseline) * 100.0
+    if rel_diff_pct > 10.0:
+        return "red"
+    if rel_diff_pct > 5.0:
+        return "yellow"
+    return None
 
 
 def _detect_unit_ratio_outliers(
     year_metrics: Dict[str, Dict[str, Any]],
     latest_year: str,
     ref_years: List[str],
-) -> Dict[int, Dict[str, Any]]:
-    unit_ratio_outliers: Dict[int, Dict[str, Any]] = {}
-    if not ref_years or latest_year not in year_metrics:
+) -> Dict[int, str]:
+    unit_ratio_outliers: Dict[int, str] = {}
+    if latest_year not in year_metrics:
         return unit_ratio_outliers
 
     for m_i in range(12):
-        ref_vals = [
-            year_metrics[y]["unit_ratio"][m_i]
-            for y in ref_years
-            if y in year_metrics and year_metrics[y]["unit_ratio"][m_i] is not None
-        ]
-        _evaluate_month_unit_ratio_outlier(m_i, ref_vals, year_metrics, latest_year, unit_ratio_outliers)
+        color = _evaluate_month_unit_ratio_outlier(m_i, year_metrics, latest_year, ref_years)
+        if color:
+            unit_ratio_outliers[m_i] = color
 
     return unit_ratio_outliers
 
 
-def _detect_shipment_cutoff_month(latest_year: str, gts_vals: List[Optional[float]]) -> int:
+def _detect_shipment_cutoff_month(latest_year: str, latest_gts_vals: List[Optional[float]]) -> int:
     cutoff = 8 if latest_year == "2026" else 12
-    for i in range(11, -1, -1):
-        if gts_vals[i] is not None and not (isinstance(gts_vals[i], float) and math.isnan(gts_vals[i])):
-            cutoff = i + 1
-            break
+    for m_i in range(11, -1, -1):
+        v = latest_gts_vals[m_i]
+        if v is not None and not (isinstance(v, float) and math.isnan(v)) and v > 0:
+            return m_i + 1
     return cutoff
 
 
@@ -1181,9 +1262,10 @@ def build_shipment_matrix(
     factory_pos_by_year: Optional[Dict[str, List[Optional[float]]]] = None,
     rows_cons: Optional[List[Dict[str, Any]]] = None,
     bb_rows: Optional[List[Dict[str, Any]]] = None,
-    cons_bb_rows: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    """Computes complete Shipment Validation matrix matching validation/ship.py specifications."""
+    """
+    Computes complete Shipment Validation matrix matching validation/ship.py specifications.
+    """
     if not rows_ship:
         return {}
 
@@ -1203,17 +1285,7 @@ def build_shipment_matrix(
     latest_comp_m_nbr = _detect_shipment_cutoff_month(latest_year, data_by_year[latest_year]["gts_val"])
 
     _project_shipment_future_months(
-        data_by_year,
-        latest_year,
-        prev_year,
-        latest_comp_m_nbr,
-        factory_pos_map,
-        pos_val_map,
-        pos_u_map,
-        fy_price_factor_prev,
-        model_name,
-        bb_rows,
-        cons_bb_rows,
+        data_by_year, latest_year, prev_year, latest_comp_m_nbr, factory_pos_map, pos_val_map, pos_u_map, fy_price_factor_prev, model_name, bb_rows
     )
 
     year_metrics = {
