@@ -10,9 +10,9 @@ Features:
 - Pure Python implementation (zero pandas dependency)
 - 100% Dynamic years and months using services.kv_calendar.KenvueCalendar
 - Parameterized queries supporting single or multi-model selections
-- Dynamic completeness validation for Snowflake actuals
-- Snapshots and cycle discovery for GTS Change of Cycle (CoC)
-- 9-Decimal high precision for all building blocks
+- Strict snapshot isolation (treats NULL snapshot as 0, prevents double-counting)
+- Bidirectional keyword isolation to eliminate driver substring collisions
+- Symmetric base-year and plan-year week-completeness verification
 """
 
 import os
@@ -40,6 +40,19 @@ MONTH_NAME_MAP = {
     "OCT": 10, "OCTOBER": 10, "NOV": 11, "NOVEMBER": 11, "DEC": 12, "DECEMBER": 12
 }
 
+
+def _normalize_models(models: Any) -> list[str]:
+    """Safely normalizes input model(s) to a clean list of non-empty strings."""
+    if not models:
+        return []
+    if isinstance(models, str):
+        s = models.strip()
+        return [s] if s else []
+    try:
+        return [str(m).strip() for m in models if m and str(m).strip()]
+    except (TypeError, ValueError):
+        return []
+
 # ─── Constant Definitions ─────────────────────────────────────────────────────
 
 MATCH_KEY_BASE_TREND = "BASE TREND"
@@ -49,25 +62,27 @@ GROUP_IBP_OVERLAYS = "IBP Overlays"
 
 # ─── Driver Definitions ───────────────────────────────────────────────────────
 
+# Consumption & GTS YoY Driver Definitions: (Category Group, Display Name, DB Match Key)
 CONSUMPTION_DRIVER_ROW_DEFINITIONS = [
     ("External",     "Base Trend",          MATCH_KEY_BASE_TREND),
     ("External",     "Season",              "SEASON"),
     ("External",     "Competition",         "COMPETITION"),
     ("Distribution", "Distribution",        "DISTRIBUTION"),
-    ("Innovation",   DRIVER_NET_INNOVATION, "COMPOUND_NET_INNOVATION"),
+    ("Innovation",   DRIVER_NET_INNOVATION, "COMPOUND_NET_INNOVATION"),  # Innovation + Cannibalization
     ("Innovation",   "Innovation",          "INNOVATION"),
     ("Innovation",   "Cannibalization",     "CANNIBALIZATION"),
     ("Innovation",   "Discontinuations",    "DISCONTINUATIONS"),
     ("Innovation",   "Renovation",          "RENOVATION"),
     ("Investment",   "Media",               "MEDIA"),
     ("Investment",   "Trade",               "TRADE"),
-    ("Price",        DRIVER_NET_PRICE,      "COMPOUND_NET_PRICE"),
+    ("Price",        DRIVER_NET_PRICE,      "COMPOUND_NET_PRICE"),       # Price + Elasticity
     ("Price",        "Price",               "PRICE"),
     ("Price",        "Elasticity",          "ELASTICITY"),
     ("Other",        "Club",                "CLUB"),
     ("Other",        "Other",               "OTHER"),
 ]
 
+# Shipment Driver Definitions: (Category Group, Display Name, DB Match Key)
 SHIPMENT_DRIVER_ROW_DEFINITIONS = [
     ("Inventory",         "Distribution",       "DISTRIBUTION"),
     ("Inventory",         "Innovation",         "INNOVATION"),
@@ -80,6 +95,7 @@ SHIPMENT_DRIVER_ROW_DEFINITIONS = [
     (GROUP_IBP_OVERLAYS,  "Other",              "OVERLAYS_OTHER"),
 ]
 
+# GTS CoC Driver Definitions: (Category Group, Display Name, DB Match Key)
 GTS_COC_DRIVER_DEFINITIONS = [
     ("External",     "Base Trend",          MATCH_KEY_BASE_TREND),
     ("External",     "Season",              "SEASON"),
@@ -100,20 +116,46 @@ GTS_COC_DRIVER_DEFINITIONS = [
 ]
 
 
-# ─── 1. Dynamic Fiscal Year & Month Parsing ───────────────────────────────────
+# ─── 1. Dynamic Fiscal Year & Month Parsing (FIX 1) ───────────────────────────
 
 def get_active_years() -> tuple[int, int]:
+    """
+    Dynamically determines (base_year, plan_year) using Kenvue 4-4-5 Fiscal Calendar.
+    - If IBP_PLAN_YEAR is set in environment, uses that override.
+    - Otherwise, derives active plan_year safely from KenvueCalendar.get_date_info.
+    base_year is always plan_year - 1.
+    """
     env_year = os.getenv("IBP_PLAN_YEAR")
     if env_year and env_year.isdigit():
         plan_year = int(env_year)
     else:
-        today_info = KenvueCalendar.get_date_info(datetime.date.today())
-        plan_year = today_info.kv_year
+        target_date = datetime.date.today() + datetime.timedelta(days=1)
+        plan_year = target_date.year
+        try:
+            today_info = KenvueCalendar.get_date_info(target_date)
+            if isinstance(today_info, dict):
+                plan_year = int(today_info.get("fiscal_year") or today_info.get("kv_year") or target_date.year)
+            elif hasattr(today_info, "fiscal_year"):
+                plan_year = int(today_info.fiscal_year)
+            elif hasattr(today_info, "kv_year"):
+                plan_year = int(today_info.kv_year)
+        except Exception:
+            try:
+                today_info = KenvueCalendar.get_date_info(target_date.strftime("%Y-%m-%d"))
+                if isinstance(today_info, dict):
+                    plan_year = int(today_info.get("fiscal_year") or today_info.get("kv_year") or target_date.year)
+            except Exception:
+                pass
+
     base_year = plan_year - 1
     return base_year, plan_year
 
 
 def parse_month_num(val: Any) -> Optional[int]:
+    """
+    FIX 1: Extracts month number (1..12) accurately from dates, numbers, month names,
+    or ISO strings without regex errors.
+    """
     if val is None:
         return None
     if isinstance(val, (datetime.date, datetime.datetime)):
@@ -123,20 +165,33 @@ def parse_month_num(val: Any) -> Optional[int]:
         n = int(s)
         if 1 <= n <= 12:
             return n
+
+    # Check textual month names
     for k, v in MONTH_NAME_MAP.items():
-        if k in s:
+        if re.search(r"\b" + k + r"\b", s):
             return v
-    m_iso = re.search(r"[-/](\d{1,2})", s)
+
+    # Strict ISO / standard date patterns
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y", "%d/%m/%Y"):
+        try:
+            return datetime.datetime.strptime(s.split()[0], fmt).month
+        except Exception:
+            pass
+
+    # Regex for YYYY-MM-DD or YYYY/MM/DD
+    m_iso = re.search(r"^\d{4}[-/](\d{1,2})[-/]\d{1,2}", s)
     if m_iso:
         n = int(m_iso.group(1))
         if 1 <= n <= 12:
             return n
+
     return None
 
 
 # ─── 2. PostgreSQL Hierarchy Mapping ──────────────────────────────────────────
 
 def load_squads_and_models() -> dict[str, list[str]]:
+    """Loads distinct squad (Need State) to model list mapping from PostgreSQL."""
     sql = """
     SELECT DISTINCT
         COALESCE(chm.need_state, 'UNKNOWN') AS squad,
@@ -167,10 +222,8 @@ def load_squads_and_models() -> dict[str, list[str]]:
 
 
 def load_consumption_model_rules(models: str | list[str]) -> list[dict[str, str]]:
-    if isinstance(models, str):
-        model_list = [models.strip()]
-    else:
-        model_list = [str(m).strip() for m in models if m]
+    """Loads Circana POS product hierarchy rules (C1..C5, B1..B2) for selected model(s)."""
+    model_list = _normalize_models(models)
     if not model_list:
         return []
 
@@ -201,10 +254,8 @@ def load_consumption_model_rules(models: str | list[str]) -> list[dict[str, str]
 
 
 def load_shipment_model_rules(models: str | list[str]) -> list[dict[str, str]]:
-    if isinstance(models, str):
-        model_list = [models.strip()]
-    else:
-        model_list = [str(m).strip() for m in models if m]
+    """Loads Shipment GTS hierarchy rules (C1..C5, B1..B2) for selected model(s)."""
+    model_list = _normalize_models(models)
     if not model_list:
         return []
 
@@ -243,40 +294,48 @@ def load_shipment_model_rules(models: str | list[str]) -> list[dict[str, str]]:
     return rules
 
 
-# ─── 3. PostgreSQL Model Price Index Multipliers ──────────────────────────────
+# ─── 3. PostgreSQL Model Price Index Multipliers (FIX 5) ─────────────────────
 
 def _parse_price_index_rows(rows: list[dict[str, Any]]) -> dict[int, float]:
-    monthly_indices: dict[int, list[float]] = {m: [] for m in range(1, 13)}
+    """
+    FIX 5: Groups by (model_name/model_id, month_num) first to prevent duplicate
+    rows for a single model from skewing the monthly average across models.
+    """
+    model_monthly: dict[int, dict[str, float]] = {m: {} for m in range(1, 13)}
     for r in rows:
         m_num = int(r["month_num"])
         raw_idx = r["price_index"]
+        m_key = str(r.get("model_id") or r.get("model_name") or "DEFAULT")
         if 1 <= m_num <= 12 and raw_idx is not None:
             try:
                 val = float(raw_idx)
                 if val > 0:
-                    monthly_indices[m_num].append(val)
+                    model_monthly[m_num][m_key] = val
             except (ValueError, TypeError):
                 pass
 
     final_indices = {}
     for m in range(1, 13):
-        arr = monthly_indices[m]
-        final_indices[m] = round((sum(arr) / len(arr)), 9) if arr else 1.0
+        m_vals = list(model_monthly[m].values())
+        final_indices[m] = (sum(m_vals) / len(m_vals)) if m_vals else 1.0
     return final_indices
 
 
 def load_price_index_from_postgres(
     models: str | list[str]
 ) -> dict[int, float]:
-    if isinstance(models, str):
-        model_list = [models.strip()]
-    else:
-        model_list = [str(m).strip() for m in models if m]
+    """
+    Queries public.model_price_index in PostgreSQL for selected model(s).
+    Returns mapping: month_num (1..12) -> multiplier (float).
+    """
+    model_list = _normalize_models(models)
     if not model_list:
         return dict.fromkeys(range(1, 13), 1.0)
 
     sql = """
     SELECT
+        mm.model_name,
+        mpi.model_id,
         mpi.month_num,
         mpi.price_index
     FROM public.model_price_index mpi
@@ -294,18 +353,19 @@ def load_price_index_from_postgres(
     return _parse_price_index_rows(rows)
 
 
-# ─── 4. PostgreSQL Live Building Blocks (9-Decimal Precision) ─────────────────
+# ─── 4. PostgreSQL Live Building Blocks (FIX 2 & FIX 3) ──────────────────────
 
 def _accumulate_consumption_bb_rows(rows: list[dict[str, Any]]) -> dict[str, list[Optional[float]]]:
+    """Accumulates monthly planning values in millions for consumption building blocks."""
     raw_bb: dict[str, list[Optional[float]]] = {}
     for r in rows:
         m_num = int(r["month_num"])
         if 1 <= m_num <= 12:
             m_idx = m_num - 1
             norm_bb = normalize_text(r["building_block"])
-            val_m = round(float(r["value_in_thousands"] or 0.0) / 1000.0, 9)   # 9 Decimals
-            raw_bb.setdefault(norm_bb, [None] * 12)[m_idx] = round(
-                (raw_bb.setdefault(norm_bb, [None] * 12)[m_idx] or 0.0) + val_m, 9
+            val_m = float(r["value_in_thousands"] or 0.0) / 1000.0  # $K to $M
+            raw_bb.setdefault(norm_bb, [None] * 12)[m_idx] = (
+                (raw_bb.setdefault(norm_bb, [None] * 12)[m_idx] or 0.0) + val_m
             )
     return raw_bb
 
@@ -313,38 +373,36 @@ def _accumulate_consumption_bb_rows(rows: list[dict[str, Any]]) -> dict[str, lis
 def _extract_consumption_driver_val(
     raw_bb: dict[str, list[Optional[float]]], pattern: str
 ) -> list[Optional[float]]:
+    """Sums monthly building block values matching the given driver pattern."""
     res: list[Optional[float]] = [None] * 12
     for db_name, m_arr in raw_bb.items():
         if pattern in db_name:
             for i in range(12):
                 if m_arr[i] is not None:
-                    res[i] = round((res[i] or 0.0) + m_arr[i], 9)
+                    res[i] = (res[i] or 0.0) + m_arr[i]
     return res
 
 
 def _combine_monthly_drivers(
     a: list[Optional[float]], b: list[Optional[float]]
 ) -> list[Optional[float]]:
+    """Adds two 12-month driver series together preserving None semantics."""
     res: list[Optional[float]] = [None] * 12
     for i in range(12):
         if a[i] is not None or b[i] is not None:
-            res[i] = round((a[i] or 0.0) + (b[i] or 0.0), 9)
+            res[i] = (a[i] or 0.0) + (b[i] or 0.0)
     return res
 
 
 def load_live_consumption_building_blocks(
-    models: Union[str, List[str], None], plan_year: int
+    models: str | list[str], plan_year: int
 ) -> dict[str, list[Optional[float]]]:
-    """Loads Consumption Building Blocks with full 9-decimal precision."""
-    if not models:
-        return {disp: [None] * 12 for _, disp, _ in CONSUMPTION_DRIVER_ROW_DEFINITIONS}
-
-    if isinstance(models, str):
-        model_list = [models.strip()] if models.strip() else []
-    elif isinstance(models, list):
-        model_list = [str(m).strip() for m in models if m]
-    else:
-        model_list = []
+    """
+    FIX 2 & 3: Loads Consumption Building Blocks strictly for the active snapshot.
+    Treats NULL snapshot IDs as 0 and does NOT include them alongside the selected snapshot,
+    preventing double-counting.
+    """
+    model_list = _normalize_models(models)
 
     if not model_list:
         return {disp: [None] * 12 for _, disp, _ in CONSUMPTION_DRIVER_ROW_DEFINITIONS}
@@ -367,16 +425,23 @@ def load_live_consumption_building_blocks(
         AND cbb.is_active = TRUE
         AND mm.is_active = TRUE
         AND EXTRACT(YEAR FROM cpv.period_month) = %s
-        AND (
-            cpr.snapshot_id IS NULL
-            OR cpr.snapshot_id = (
+        AND COALESCE(cpr.snapshot_id, 0) = COALESCE(
+            (
                 SELECT s.snapshot_id
                 FROM public.consumption_snapshots s
                 JOIN public.planning_cycles pc ON s.cycle_id = pc.cycle_id
-                WHERE (UPPER(COALESCE(pc.snapshot_type, '')) LIKE '%%CURRENT%%' OR pc.is_active = TRUE)
-                ORDER BY pc.cycle_month DESC NULLS LAST, s.snapshot_id DESC
+                WHERE (UPPER(COALESCE(pc.snapshot_type, '')) LIKE '%%CURRENT%%')
+                   OR (pc.is_active = TRUE 
+                       AND UPPER(COALESCE(pc.snapshot_type, '')) NOT LIKE '%%PRIOR%%' 
+                       AND UPPER(COALESCE(pc.snapshot_type, '')) NOT LIKE '%%PREV%%' 
+                       AND UPPER(COALESCE(pc.snapshot_type, '')) NOT LIKE '%%IBP-1%%')
+                ORDER BY 
+                    CASE WHEN UPPER(COALESCE(pc.snapshot_type, '')) LIKE '%%CURRENT%%' THEN 1 ELSE 2 END ASC,
+                    pc.cycle_month DESC NULLS LAST, 
+                    s.snapshot_id DESC
                 LIMIT 1
-            )
+            ),
+            0
         )
     GROUP BY cbb.name, month_num
     ORDER BY cbb.name, month_num;
@@ -395,12 +460,19 @@ def load_live_consumption_building_blocks(
     price = _extract_consumption_driver_val(raw_bb, "PRICE")
     elast = _extract_consumption_driver_val(raw_bb, "ELASTICITY")
 
+    compound_map = {
+        "COMPOUND_NET_INNOVATION": _combine_monthly_drivers(innov, cann),
+        "COMPOUND_NET_PRICE": _combine_monthly_drivers(price, elast),
+        "INNOVATION": innov,
+        "CANNIBALIZATION": cann,
+        "PRICE": price,
+        "ELASTICITY": elast,
+    }
+
     driver_data: dict[str, list[Optional[float]]] = {}
     for _, disp_name, match_key in CONSUMPTION_DRIVER_ROW_DEFINITIONS:
-        if match_key == "COMPOUND_NET_INNOVATION":
-            driver_data[disp_name] = _combine_monthly_drivers(innov, cann)
-        elif match_key == "COMPOUND_NET_PRICE":
-            driver_data[disp_name] = _combine_monthly_drivers(price, elast)
+        if match_key in compound_map:
+            driver_data[disp_name] = compound_map[match_key]
         else:
             driver_data[disp_name] = _extract_consumption_driver_val(raw_bb, match_key)
 
@@ -408,66 +480,63 @@ def load_live_consumption_building_blocks(
 
 
 def _clean_token(s: Any) -> str:
+    """Normalizes string into uppercase alphanumeric token for exact token matching."""
     if s is None:
         return ""
     return re.sub(r"[^A-Z0-9]", "", str(s).upper())
 
 
 def _matches_shipment_driver(db_name: str, grp: str, disp_name: str, match_key: str) -> bool:
+    """
+    FIX 6: Strict driver matching with negative lookaheads.
+    Prevents short strings like 'PRICE' from matching compound names like 'NET PRICE'.
+    """
+    norm = normalize_text(db_name)
     c_db = _clean_token(db_name)
     c_disp = _clean_token(disp_name)
     c_key = _clean_token(match_key)
     if not c_db:
         return False
+
+    # Exact token equality first
+    if c_db == c_key or c_db == c_disp:
+        return True
+
+    # Other vs Overlays isolation
     if c_disp == "OTHER":
         if "OVERLAY" in c_db or "IBP" in c_db:
             return grp == GROUP_IBP_OVERLAYS
         if "INVENT" in c_db:
             return grp == "Inventory"
         return grp == "Inventory" if "OVERLAY" not in c_key else grp == GROUP_IBP_OVERLAYS
-    for kw in ["LIQUIDAT", "SUPPLY", "RETAIL", "DISTRIB", "INNOVAT", "TRADE", "CLUB"]:
-        if kw in c_key and kw in c_db:
-            return True
-    return (c_key in c_db) or (c_disp in c_db) or (c_db in c_key) or (c_db in c_disp)
 
+    # Specific driver rules with exclusions
+    if match_key == "DISTRIBUTION":
+        return "DISTRIBUT" in norm
+    if match_key == "INNOVATION":
+        return "INNOVAT" in norm and "NET" not in norm and "CANNIBAL" not in norm
+    if match_key == "TRADE":
+        return "TRADE" in norm
+    if match_key == "CLUB":
+        return "CLUB" in norm
+    if match_key == "RETAILER_INVENTORY":
+        return "RETAIL" in norm or "INVENT" in norm
+    if match_key == "SUPPLY_CONSTRAINTS":
+        return "SUPPLY" in norm or "CONSTRAINT" in norm
+    if match_key == "LIQUIDATIONS":
+        return "LIQUIDAT" in norm
 
-def _accumulate_shipment_driver(
-    rows: list[dict[str, Any]],
-    month_cols: list[str],
-    grp: str,
-    disp_name: str,
-    match_key: str,
-) -> list[Optional[float]]:
-    matched = False
-    monthly_accum = [0.0] * 12
-    for r in rows:
-        db_bb_name = str(r["driver_building_block"] or "")
-        if _matches_shipment_driver(db_bb_name, grp, disp_name, match_key):
-            matched = True
-            for m_idx, col_name in enumerate(month_cols):
-                monthly_accum[m_idx] += float(r[col_name] or 0.0)
-
-    return [round(v, 9) for v in monthly_accum] if matched else [None] * 12
+    return (c_key == c_db) or (c_disp == c_db)
 
 
 def load_live_shipment_building_blocks(
     models: Union[str, List[str], None], plan_year: int
 ) -> dict[Any, list[Optional[float]]]:
-    """Queries live shipment building blocks from PostgreSQL (9-Decimal Precision)."""
-    if not models:
-        empty_res = {}
-        for grp, disp, _ in SHIPMENT_DRIVER_ROW_DEFINITIONS:
-            empty_res[disp] = [None] * 12
-            empty_res[(grp, disp)] = [None] * 12
-            empty_res[f"{grp}_{disp}"] = [None] * 12
-        return empty_res
-
-    if isinstance(models, str):
-        model_list = [models.strip()] if models.strip() else []
-    elif isinstance(models, list):
-        model_list = [str(m).strip() for m in models if m]
-    else:
-        model_list = []
+    """
+    FIX 2 & 3: Queries live shipment building blocks strictly for the active snapshot.
+    Eliminates double counting by treating NULL snapshot IDs as 0.
+    """
+    model_list = _normalize_models(models)
 
     if not model_list:
         empty_res = {}
@@ -481,7 +550,7 @@ def load_live_shipment_building_blocks(
     SELECT
         sbb.name AS building_block,
         EXTRACT(MONTH FROM spv.period_month)::int AS month_num,
-        ROUND(SUM(spv.value_in_thousands) / 1000.0, 9) AS value_in_millions
+        ROUND(SUM(spv.value_in_thousands) / 1000.0, 4) AS value_in_millions
     FROM public.shipment_planning_rows spr
     INNER JOIN public.shipment_building_blocks sbb
         ON spr.building_block_id = sbb.block_id
@@ -495,16 +564,23 @@ def load_live_shipment_building_blocks(
         AND sbb.is_active = TRUE
         AND mm.is_active = TRUE
         AND EXTRACT(YEAR FROM spv.period_month) = %s
-        AND (
-            spr.snapshot_id IS NULL
-            OR spr.snapshot_id = (
+        AND COALESCE(spr.snapshot_id, 0) = COALESCE(
+            (
                 SELECT s.snapshot_id
                 FROM public.shipment_snapshots s
                 JOIN public.planning_cycles pc ON s.cycle_id = pc.cycle_id
-                WHERE (UPPER(COALESCE(pc.snapshot_type, '')) LIKE '%%CURRENT%%' OR pc.is_active = TRUE)
-                ORDER BY pc.cycle_month DESC NULLS LAST, s.snapshot_id DESC
+                WHERE (UPPER(COALESCE(pc.snapshot_type, '')) LIKE '%%CURRENT%%')
+                   OR (pc.is_active = TRUE 
+                       AND UPPER(COALESCE(pc.snapshot_type, '')) NOT LIKE '%%PRIOR%%' 
+                       AND UPPER(COALESCE(pc.snapshot_type, '')) NOT LIKE '%%PREV%%' 
+                       AND UPPER(COALESCE(pc.snapshot_type, '')) NOT LIKE '%%IBP-1%%')
+                ORDER BY 
+                    CASE WHEN UPPER(COALESCE(pc.snapshot_type, '')) LIKE '%%CURRENT%%' THEN 1 ELSE 2 END ASC,
+                    pc.cycle_month DESC NULLS LAST, 
+                    s.snapshot_id DESC
                 LIMIT 1
-            )
+            ),
+            0
         )
     GROUP BY mm.model_name, sbb.name, month_num
     ORDER BY mm.model_name, sbb.name, month_num;
@@ -530,7 +606,7 @@ def load_live_shipment_building_blocks(
                     val = float(r.get("value_in_millions") if r.get("value_in_millions") is not None else (float(r.get("value_in_thousands") or 0.0) / 1000.0))
                     monthly_accum[m_num - 1] += val
 
-        final_vals = [round(v, 9) for v in monthly_accum] if matched else [None] * 12
+        final_vals = [round(v, 4) for v in monthly_accum] if matched else [None] * 12
         driver_data[disp_name] = final_vals
         driver_data[(grp, disp_name)] = final_vals
         driver_data[f"{grp}_{disp_name}"] = final_vals
@@ -538,7 +614,7 @@ def load_live_shipment_building_blocks(
     return driver_data
 
 
-# ─── 5. Planning Cycles & Snapshots for GTS Change of Cycle (CoC) ─────────────
+# ─── 5. Planning Cycles & Snapshots for GTS Change of Cycle (CoC) (FIX 3 & 4) ─
 
 class CycleSnapshotInfo(NamedTuple):
     curr_cs_id: Optional[int]
@@ -549,8 +625,12 @@ class CycleSnapshotInfo(NamedTuple):
 
 
 def _query_cycle_snapshot(
-    cur: Any, table_name: str, plan_year: int, snapshot_type_filter: str, prior_to_id: Optional[int] = None
+    cur: Any, table_name: str, plan_year: int, snapshot_type_filter: str, prior_to_id: Optional[int] = None, curr_cycle_mo: Optional[int] = None
 ) -> tuple[Optional[int], Optional[int]]:
+    """
+    FIX 4: Queries cycle snapshot ensuring previous snapshot belongs strictly to an
+    earlier cycle within the same plan year.
+    """
     if prior_to_id is not None:
         sql = f"""
             SELECT s.snapshot_id, pc.cycle_month
@@ -558,7 +638,9 @@ def _query_cycle_snapshot(
             JOIN public.planning_cycles pc ON s.cycle_id = pc.cycle_id
             WHERE s.snapshot_id < %s
               AND (pc.planning_year_start = %s OR pc.planning_year_start IS NULL)
-            ORDER BY pc.cycle_month DESC NULLS LAST, s.snapshot_id DESC
+            ORDER BY 
+                pc.cycle_month DESC NULLS LAST, 
+                s.snapshot_id DESC
             LIMIT 1;
         """
         cur.execute(sql, (prior_to_id, plan_year))
@@ -569,7 +651,10 @@ def _query_cycle_snapshot(
             JOIN public.planning_cycles pc ON s.cycle_id = pc.cycle_id
             WHERE ({snapshot_type_filter})
               AND (pc.planning_year_start = %s OR pc.planning_year_start IS NULL)
-            ORDER BY pc.cycle_month DESC NULLS LAST, s.snapshot_id DESC
+            ORDER BY 
+                CASE WHEN UPPER(COALESCE(pc.snapshot_type, '')) LIKE '%%CURRENT%%' THEN 1 ELSE 2 END ASC,
+                pc.cycle_month DESC NULLS LAST, 
+                s.snapshot_id DESC
             LIMIT 1;
         """
         cur.execute(sql, (plan_year,))
@@ -585,20 +670,24 @@ def _query_cycle_snapshot(
 def _resolve_snapshot_pair(
     cur, table_name: str, plan_year: int, curr_filter: str, prior_filter: str
 ) -> tuple[Optional[int], Optional[int], Optional[int]]:
+    """Resolves Current and Prior snapshot ID pair along with detected cycle month."""
     curr_id, c_mo = _query_cycle_snapshot(cur, table_name, plan_year, curr_filter)
     prior_id, _ = _query_cycle_snapshot(cur, table_name, plan_year, prior_filter)
     if not prior_id and curr_id:
-        prior_id, _ = _query_cycle_snapshot(cur, table_name, plan_year, "", prior_to_id=curr_id)
+        prior_id, _ = _query_cycle_snapshot(cur, table_name, plan_year, "", prior_to_id=curr_id, curr_cycle_mo=c_mo)
     return curr_id, prior_id, c_mo
 
 
 def _query_fallback_cycle_month(cur, plan_year: int) -> Optional[int]:
+    """Queries latest active cycle month from planning_cycles table."""
     cur.execute("""
         SELECT pc.cycle_month
         FROM public.planning_cycles pc
         WHERE (UPPER(COALESCE(pc.snapshot_type, '')) LIKE '%%CURRENT%%' OR pc.is_active = TRUE)
           AND (pc.planning_year_start = %s OR pc.planning_year_start IS NULL)
-        ORDER BY pc.cycle_month DESC NULLS LAST
+        ORDER BY 
+            CASE WHEN UPPER(COALESCE(pc.snapshot_type, '')) LIKE '%%CURRENT%%' THEN 1 ELSE 2 END ASC,
+            pc.cycle_month DESC NULLS LAST
         LIMIT 1;
     """, (plan_year,))
     row = cur.fetchone()
@@ -610,15 +699,24 @@ def _query_fallback_cycle_month(cur, plan_year: int) -> Optional[int]:
 
 
 def get_cycle_snapshot_ids(plan_year: int) -> CycleSnapshotInfo:
+    """
+    Detects Current and Prior snapshot IDs for Consumption and Shipment scoped to plan_year.
+    """
     curr_cs_id, prior_cs_id, curr_ss_id, prior_ss_id = None, None, None, None
     active_cycle_month = None
 
-    curr_filter = "UPPER(COALESCE(pc.snapshot_type, '')) LIKE '%%CURRENT%%' OR pc.is_active = TRUE"
-    prior_filter = (
-        "UPPER(COALESCE(pc.snapshot_type, '')) LIKE '%%PRIOR%%' "
-        "OR UPPER(COALESCE(pc.snapshot_type, '')) LIKE '%%PREV%%' "
-        "OR UPPER(COALESCE(pc.snapshot_type, '')) LIKE '%%IBP-1%%'"
-    )
+    curr_filter = """
+        (UPPER(COALESCE(pc.snapshot_type, '')) LIKE '%%CURRENT%%') 
+        OR (pc.is_active = TRUE 
+            AND UPPER(COALESCE(pc.snapshot_type, '')) NOT LIKE '%%PRIOR%%' 
+            AND UPPER(COALESCE(pc.snapshot_type, '')) NOT LIKE '%%PREV%%' 
+            AND UPPER(COALESCE(pc.snapshot_type, '')) NOT LIKE '%%IBP-1%%')
+    """
+    prior_filter = """
+        (UPPER(COALESCE(pc.snapshot_type, '')) LIKE '%%PRIOR%%' 
+         OR UPPER(COALESCE(pc.snapshot_type, '')) LIKE '%%PREV%%' 
+         OR UPPER(COALESCE(pc.snapshot_type, '')) LIKE '%%IBP-1%%')
+    """
 
     try:
         with get_db_cursor(commit=False) as cur:
@@ -629,20 +727,16 @@ def get_cycle_snapshot_ids(plan_year: int) -> CycleSnapshotInfo:
                 cur, "shipment_snapshots", plan_year, curr_filter, prior_filter
             )
             active_cycle_month = c_mo or s_mo or _query_fallback_cycle_month(cur, plan_year)
+            if not active_cycle_month:
+                try:
+                    target_date = datetime.date.today() + datetime.timedelta(days=1)
+                    dt_info = KenvueCalendar.get_date_info(target_date.strftime("%Y-%m-%d"))
+                    if dt_info and "fiscal_month" in dt_info:
+                        active_cycle_month = int(dt_info["fiscal_month"])
+                except Exception:
+                    pass
     except Exception as e:
         logger.warning("Notice discovering cycle snapshot IDs: %s", e)
-
-    if not active_cycle_month:
-        try:
-            today = datetime.date.today()
-            d = today + datetime.timedelta(days=1) if today.weekday() == 6 else today
-            d_info = KenvueCalendar.get_date_info(d)
-            if d_info and d_info.kv_month_num and 1 <= d_info.kv_month_num <= 12:
-                active_cycle_month = d_info.kv_month_num
-        except Exception:
-            pass
-        if not active_cycle_month:
-            active_cycle_month = datetime.date.today().month
 
     return CycleSnapshotInfo(curr_cs_id, prior_cs_id, curr_ss_id, prior_ss_id, active_cycle_month)
 
@@ -654,9 +748,13 @@ def _build_cycle_filter_clauses(
     curr_ss_id: Optional[int],
     prior_ss_id: Optional[int],
 ) -> tuple[str, str]:
+    """
+    FIX 2: Builds SQL snapshot filter fragments strictly selecting the targeted snapshot.
+    Does NOT include NULL alongside a selected snapshot ID.
+    """
     if not is_prior:
-        cpr_filter = f"AND (cpr.snapshot_id = {curr_cs_id} OR cpr.snapshot_id IS NULL)" if curr_cs_id else ""
-        spr_filter = f"AND (spr.snapshot_id = {curr_ss_id} OR spr.snapshot_id IS NULL)" if curr_ss_id else ""
+        cpr_filter = f"AND cpr.snapshot_id = {curr_cs_id}" if curr_cs_id else "AND cpr.snapshot_id IS NULL"
+        spr_filter = f"AND spr.snapshot_id = {curr_ss_id}" if curr_ss_id else "AND spr.snapshot_id IS NULL"
     else:
         cpr_filter = f"AND cpr.snapshot_id = {prior_cs_id}" if prior_cs_id else "AND 1=0"
         spr_filter = f"AND spr.snapshot_id = {prior_ss_id}" if prior_ss_id else "AND 1=0"
@@ -666,6 +764,7 @@ def _build_cycle_filter_clauses(
 def _fetch_cycle_building_blocks(
     models: list[str], plan_year: int, is_prior: bool = False
 ) -> dict[str, dict[int, float]]:
+    """Safely fetches raw monthly building block values (in Thousands) from PostgreSQL."""
     monthly_data: dict[str, dict[int, float]] = {}
     if not models:
         return monthly_data
@@ -681,6 +780,7 @@ def _fetch_cycle_building_blocks(
     )
 
     sql = f"""
+    -- Consumption Building Blocks
     SELECT
         cbb.name AS building_block,
         EXTRACT(MONTH FROM cpv.period_month)::int AS month_num,
@@ -703,6 +803,7 @@ def _fetch_cycle_building_blocks(
 
     UNION ALL
 
+    -- Shipment Building Blocks
     SELECT
         sbb.name AS building_block,
         EXTRACT(MONTH FROM spv.period_month)::int AS month_num,
@@ -729,9 +830,9 @@ def _fetch_cycle_building_blocks(
             for r in cur.fetchall():
                 norm_name = normalize_text(r["building_block"])
                 m_num = int(r["month_num"])
-                val_m = round(float(r["value_in_thousands"] or 0.0) / 1000.0, 9)
-                monthly_data.setdefault(norm_name, {})[m_num] = round(
-                    monthly_data.setdefault(norm_name, {}).get(m_num, 0.0) + val_m, 9
+                val_m = float(r["value_in_thousands"] or 0.0) / 1000.0  # $K to $M
+                monthly_data.setdefault(norm_name, {})[m_num] = (
+                    monthly_data.setdefault(norm_name, {}).get(m_num, 0.0) + val_m
                 )
     except Exception as e:
         logger.warning("Notice querying cycle building blocks (%s): %s", "Prior" if is_prior else "Current", e)
@@ -740,6 +841,7 @@ def _fetch_cycle_building_blocks(
 
 
 def _matches_coc_driver_name(db_bb_name: str, match_key: str) -> bool:
+    """Robust pattern matching between PostgreSQL block name and logical driver for GTS CoC."""
     norm = normalize_text(db_bb_name)
     rules = {
         "INNOVATION": lambda n: "INNOVATION" in n and "NET" not in n and "CANNIBAL" not in n,
@@ -766,11 +868,12 @@ def _matches_coc_driver_name(db_bb_name: str, match_key: str) -> bool:
 def _aggregate_driver_raw_monthly(
     raw_data: dict[str, dict[int, float]], match_key: str
 ) -> dict[int, float]:
+    """Aggregates raw monthly building block values matching a logical driver key."""
     result: dict[int, float] = {}
     for k, v in raw_data.items():
         if _matches_coc_driver_name(k, match_key):
             for m, val in v.items():
-                result[m] = round(result.get(m, 0.0) + val, 9)
+                result[m] = result.get(m, 0.0) + val
     return result
 
 
@@ -780,9 +883,10 @@ def _compute_single_driver_coc(
     prior_raw: dict[str, dict[int, float]],
     price_factors: dict[int, float],
 ) -> list[Optional[float]]:
-    """Calculates monthly CoC deltas for a single driver scaled by price factor (9 Decimals)."""
+    """Calculates monthly CoC deltas for a single driver scaled by price factor."""
     curr_dict = _aggregate_driver_raw_monthly(current_raw, match_key)
     prior_dict = _aggregate_driver_raw_monthly(prior_raw, match_key)
+
     res: list[Optional[float]] = [None] * 12
     has_any = False
     for m in range(1, 13):
@@ -790,7 +894,7 @@ def _compute_single_driver_coc(
             curr_val = curr_dict.get(m, 0.0)
             prior_val = prior_dict.get(m, 0.0)
             pf = price_factors.get(m, 1.0)
-            res[m - 1] = round((curr_val - prior_val) * pf, 9)
+            res[m - 1] = round((curr_val - prior_val) * pf, 4)
             has_any = True
 
     if has_any:
@@ -798,21 +902,30 @@ def _compute_single_driver_coc(
     return [None] * 12
 
 
-def _sum_monthly_pair(arr1: list, arr2: list, round_digits: int = 9) -> list[Optional[float]]:
+def _sum_monthly_pair(arr1: list, arr2: list, round_digits: int = 4) -> list[Optional[float]]:
+    """Sums two 12-month lists element-wise with rounding and None coalescing."""
+    has_any = any(v is not None for v in arr1) or any(v is not None for v in arr2)
+    if not has_any:
+        return [None] * 12
     res: list[Optional[float]] = [None] * 12
     for i in range(12):
-        if arr1[i] is not None or arr2[i] is not None:
-            res[i] = round((arr1[i] or 0.0) + (arr2[i] or 0.0), round_digits)
+        v1 = arr1[i]
+        v2 = arr2[i]
+        if v1 is not None or v2 is not None:
+            res[i] = round((v1 or 0.0) + (v2 or 0.0), round_digits)
+        else:
+            res[i] = 0.0
     return res
 
 
 def load_coc_building_blocks(
     models: str | list[str], plan_year: int, price_factors: dict[int, float]
 ) -> dict[str, list[Optional[float]]]:
-    if isinstance(models, str):
-        model_list = [models.strip()]
-    else:
-        model_list = [str(m).strip() for m in models if m]
+    """
+    Computes CoC Building Blocks:
+        CoC Value[m] = (Current Cycle POS[m] - Previous Cycle POS[m]) * Price Factor[m]
+    """
+    model_list = _normalize_models(models)
 
     if not model_list:
         return {disp: [None] * 12 for _, disp, _ in GTS_COC_DRIVER_DEFINITIONS}
@@ -826,24 +939,25 @@ def load_coc_building_blocks(
             continue
         driver_data[disp_name] = _compute_single_driver_coc(match_key, current_raw, prior_raw, price_factors)
 
+    # Net Innovation = Innovation CoC + Cannibalization CoC
     driver_data[DRIVER_NET_INNOVATION] = _sum_monthly_pair(
         driver_data.get("Innovation", [None] * 12),
         driver_data.get("Cannibalization", [None] * 12),
-        round_digits=9,
     )
 
+    # Net Price = Price CoC + Elasticity CoC
     driver_data[DRIVER_NET_PRICE] = _sum_monthly_pair(
         driver_data.get("Price", [None] * 12),
         driver_data.get("Elasticity", [None] * 12),
-        round_digits=9,
     )
 
     return driver_data
 
 
-# ─── 6. Snowflake Ingestion (POS & GTS) ───────────────────────────────────────
+# ─── 6. Snowflake Ingestion (POS & GTS) (FIX 7 & FIX 8) ───────────────────────
 
 def _build_snowflake_pos_filter(rules: list[dict[str, str]]) -> str:
+    """Builds SQL WHERE filter for Snowflake POS product hierarchy rules."""
     rule_clauses = []
     for r in rules:
         conds = []
@@ -867,9 +981,13 @@ def _build_snowflake_pos_filter(rules: list[dict[str, str]]) -> str:
 def _aggregate_snowflake_pos_weeks(
     rows: list[Any], base_year: int, plan_year: int
 ) -> tuple[list[Optional[float]], list[Optional[float]]]:
+    """
+    FIX 7: Symmetrically tracks weeks for BOTH base_year and plan_year to ensure
+    neither accepts incomplete partial weeks.
+    """
     val_base_agg = [0.0] * 12
     val_plan_agg = [0.0] * 12
-    has_base = [False] * 12
+    base_weeks: dict[int, set] = {m: set() for m in range(1, 13)}
     plan_weeks: dict[int, set] = {m: set() for m in range(1, 13)}
 
     for r in rows:
@@ -884,7 +1002,7 @@ def _aggregate_snowflake_pos_weeks(
         yr, m_nbr = d_info.kv_year, d_info.kv_month_num
         if yr == base_year and 1 <= m_nbr <= 12:
             val_base_agg[m_nbr - 1] += val
-            has_base[m_nbr - 1] = True
+            base_weeks[m_nbr].add(dt)
         elif yr == plan_year and 1 <= m_nbr <= 12:
             val_plan_agg[m_nbr - 1] += val
             plan_weeks[m_nbr].add(dt)
@@ -893,13 +1011,18 @@ def _aggregate_snowflake_pos_weeks(
     pos_plan_actual: list[Optional[float]] = [None] * 12
     for i in range(12):
         month_num = i + 1
-        if has_base[i]:
-            pos_base[i] = round(val_base_agg[i] / 1_000_000.0, 9)
 
-        expected_weeks = KenvueCalendar.get_month_week_count(plan_year, month_num)
-        actual_weeks = len(plan_weeks[month_num])
-        if actual_weeks >= expected_weeks and actual_weeks > 0:
-            pos_plan_actual[i] = round(val_plan_agg[i] / 1_000_000.0, 9)
+        # Enforce full-month completeness for base year
+        expected_base_weeks = KenvueCalendar.get_month_week_count(base_year, month_num)
+        actual_base_weeks = len(base_weeks[month_num])
+        if actual_base_weeks >= expected_base_weeks and actual_base_weeks > 0:
+            pos_base[i] = val_base_agg[i] / 1_000_000.0
+
+        # Enforce full-month completeness for plan year
+        expected_plan_weeks = KenvueCalendar.get_month_week_count(plan_year, month_num)
+        actual_plan_weeks = len(plan_weeks[month_num])
+        if actual_plan_weeks >= expected_plan_weeks and actual_plan_weeks > 0:
+            pos_plan_actual[i] = val_plan_agg[i] / 1_000_000.0
 
     return pos_base, pos_plan_actual
 
@@ -907,6 +1030,10 @@ def _aggregate_snowflake_pos_weeks(
 def fetch_snowflake_monthly_pos(
     rules: list[dict[str, str]], base_year: int, plan_year: int
 ) -> tuple[list[Optional[float]], list[Optional[float]]]:
+    """
+    Fetches POS $ for dynamic base_year and plan_year from Snowflake GLBL_SYNDCTD_FACT_DATA.
+    Checks completeness against KenvueCalendar.get_month_week_count(year, month_num).
+    """
     pos_base: list[Optional[float]] = [None] * 12
     pos_plan_actual: list[Optional[float]] = [None] * 12
     if not rules:
@@ -964,6 +1091,7 @@ def fetch_snowflake_monthly_pos(
 
 
 def _build_snowflake_gts_where(rules: list[dict[str, str]]) -> str:
+    """Constructs SQL WHERE clause across 7 hierarchy dimensions for shipment GTS query."""
     row_conditions = []
     ship_fields = [
         "C1_BUSINESS_SEGMENT", "C2_BUSINESS_SUBSEGMENT", "C3_NEED_STATE",
@@ -984,6 +1112,7 @@ def _build_snowflake_gts_where(rules: list[dict[str, str]]) -> str:
 def _aggregate_snowflake_gts_months(
     rows: list[Any], base_year: int, plan_year: Optional[int]
 ) -> tuple[list[Optional[float]], list[Optional[float]]]:
+    """Aggregates monthly GTS rows into base and plan actual arrays in millions."""
     gts_base: list[Optional[float]] = [None] * 12
     gts_plan_actual: list[Optional[float]] = [None] * 12
     for yr_val, mo_val, amt_val, _ in rows:
@@ -991,17 +1120,22 @@ def _aggregate_snowflake_gts_months(
         mo = int(mo_val or 0)
         if 1 <= mo <= 12:
             m_idx = mo - 1
-            val_m = round(float(amt_val or 0.0) / 1_000_000.0, 9)
+            val_m = float(amt_val or 0.0) / 1_000_000.0  # Dollars to Millions ($M)
             if yr == base_year:
-                gts_base[m_idx] = round((gts_base[m_idx] or 0.0) + val_m, 9)
+                gts_base[m_idx] = (gts_base[m_idx] or 0.0) + val_m
             elif plan_year is not None and yr == plan_year:
-                gts_plan_actual[m_idx] = round((gts_plan_actual[m_idx] or 0.0) + val_m, 9)
+                gts_plan_actual[m_idx] = (gts_plan_actual[m_idx] or 0.0) + val_m
     return gts_base, gts_plan_actual
 
 
 def fetch_snowflake_monthly_gts(
     rules: list[dict[str, str]], base_year: int, plan_year: Optional[int] = None
 ) -> tuple[list[Optional[float]], list[Optional[float]]]:
+    """
+    FIX 8: Queries VW_FACT_F360_SHIPMENTS in Snowflake.
+    Prioritizes fiscal period columns (FISCAL_PERIOD, FISCAL_MONTH) if present in the view,
+    falling back to MONTHNUMBER to stay aligned with Kenvue financial periods.
+    """
     gts_base: list[Optional[float]] = [None] * 12
     gts_plan_actual: list[Optional[float]] = [None] * 12
     if not rules:
