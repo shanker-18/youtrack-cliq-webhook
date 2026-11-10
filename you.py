@@ -1,233 +1,568 @@
 # pylint: disable=too-many-lines,too-many-locals,too-many-branches,broad-except
 """
-NA IBP Planning Application — Variance Grid Component
+NA IBP Planning Application — Variance Dashboard Page
 =====================================================
-Pure Python Dash HTML table renderers for the Variance Dashboard:
-1. Consumption Variance Table (IBP & BP modes)
-2. Shipment Variance Table (IBP & BP modes)
+Route: /variance
+Pure Python Dash Implementation aligned with Planning, Validation & Summary Design System:
+- Top Brand Accent Multi-Color Bar & Navigation Bar with Page Switcher
+- Left Sidebar: Compact 140px Dock with 2 Domain Tiles (Consumption, Shipment)
+- Top Horizon Bar above Workbench: [Squad] -> Peach [Model] -> [Compare: IBP / BP]
+- Default comparison mode on load: IBP
 """
 
-import math
-from typing import Optional, Dict, List, Any
-from dash import html
+from datetime import date
+from typing import Optional, Dict, List, Any, Tuple, Set
+from flask import has_request_context, request
+import psycopg2
+import dash
+from dash import html, dcc
+import dash_bootstrap_components as dbc
 
-from services.variance_service import (
-    CONSUMPTION_VARIANCE_DRIVER_DEFINITIONS,
-    SHIPMENT_VARIANCE_DRIVER_DEFINITIONS,
-)
+from auth.session import get_current_user, is_authenticated
+from config import config
+from services.kv_calendar import KenvueCalendar
+from repositories.hierarchy_repository import get_squads_by_gbu, get_models_by_squad
+from repositories.security_repository import get_ad_group_mapping
+from callbacks.filter_callbacks import AD_PERSONAS
+from components.header import render_workbench_header
+from components.summary_grid import render_summary_loading_skeleton
 
-MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
-SUB_DRIVERS = {"Innovation", "Cannibalization", "Price", "Elasticity"}
+VARIANCE_ROUTE = "/variance"
 
-COLOR_B600 = "var(--b600, #2E2E2E)"
-CLASS_ROW_YEAR_LABEL = "sum-driver-label sum-row-year-label fw-bold"
-CLASS_DRIVER_SUB = "sum-driver-label sum-driver-sub"
+dash.register_page(__name__, path=VARIANCE_ROUTE, title="Variance Dashboard — NA IBP Planning")
 
+_COLOR_TRUST_GREEN = "var(--trust-green, #019881)"
+_FONT_SIZE_SM_11_5 = "11.5px"
+DEFAULT_SQUAD_LABEL = "Select Squad"
+DEFAULT_MODEL_LABEL = "Select Model"
+DEFAULT_BODY_CARE = "Body Care"
+CLASS_TILE_INACTIVE = "val-tile-stacked inactive-domain"
+BG_GREEN_50 = "var(--green-50, #E6F5F2)"
+ICON_CHECKBOX_UNCHECKED = "bi bi-square"
+ICON_CHECKBOX_CHECKED = "bi bi-check-square-fill"
 
-def fmt_variance_number(val: Optional[float], decimals: int = 2, is_driver: bool = True) -> str:
-    """
-    Formats Variance numbers:
-    - None / NaN -> '' (clean blank cell)
-    - Negative with is_driver=True -> (0.14) (financial parentheses)
-    - Negative with is_driver=False -> -0.14
-    - True Zero -> 0.00
-    """
-    if val is None or (isinstance(val, float) and (math.isnan(val) or math.isinf(val))):
-        return ""
-    v = float(val)
-    rounded_val = round(abs(v), decimals)
-    if rounded_val == 0:
-        return f"{0.0:.{decimals}f}"
-    if v < 0:
-        return f"({rounded_val:.{decimals}f})" if is_driver else f"-{rounded_val:.{decimals}f}"
-    return f"{rounded_val:.{decimals}f}"
+TILE_BASE_STYLE = {
+    "display": "flex",
+    "flexDirection": "column",
+    "alignItems": "center",
+    "justifyContent": "center",
+    "padding": "10px 4px",
+    "borderRadius": "8px",
+    "cursor": "pointer",
+    "userSelect": "none",
+    "transition": "all 0.15s ease",
+    "minHeight": "62px",
+    "width": "100%",
+    "textAlign": "center",
+    "fontFamily": "'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif",
+}
 
+TILE_ACTIVE_STYLE = {
+    **TILE_BASE_STYLE,
+    "backgroundColor": _COLOR_TRUST_GREEN,
+    "color": "#ffffff",
+    "border": f"1.5px solid {_COLOR_TRUST_GREEN}",
+    "boxShadow": "0 2px 8px rgba(1, 152, 129, 0.25)",
+}
 
-def get_variance_heatmap_style(val: Optional[float], max_pos: float, max_neg_mag: float) -> tuple[str, str, str]:
-    if val is None or (isinstance(val, float) and math.isnan(val)) or abs(val) < 0.0001:
-        return "transparent", COLOR_B600, "normal"
-
-    v = float(val)
-    if v > 0:
-        norm = min(1.0, v / (max_pos if max_pos > 0 else 1.0))
-        if norm >= 0.8:
-            return "#00695C", "#FFFFFF", "bold"
-        if norm >= 0.6:
-            return "#00897B", "#FFFFFF", "bold"
-        if norm >= 0.4:
-            return "#4DB6AC", "#1A202C", "600"
-        if norm >= 0.2:
-            return "#80CBC4", "#1A202C", "normal"
-        return "#B2DFDB", "#1A202C", "normal"
-    else:
-        norm = min(1.0, abs(v) / (max_neg_mag if max_neg_mag > 0 else 1.0))
-        if norm >= 0.8:
-            return "#C62828", "#FFFFFF", "bold"
-        if norm >= 0.6:
-            return "#E53935", "#FFFFFF", "bold"
-        if norm >= 0.4:
-            return "#EF5350", "#FFFFFF", "600"
-        if norm >= 0.2:
-            return "#E57373", "#1A202C", "normal"
-        return "#FFCDD2", "#1A202C", "normal"
-
-
-def _get_thead(category_title: str = "CATEGORY", driver_title: str = "DRIVER") -> html.Thead:
-    hdr_row1 = html.Tr([
-        html.Th(category_title, rowSpan=2, className="sum-th-category"),
-        html.Th(driver_title, rowSpan=2, className="sum-th-driver"),
-        html.Th("Q1", colSpan=3, className="sum-th-quarter"),
-        html.Th("Q2", colSpan=3, className="sum-th-quarter"),
-        html.Th("Q3", colSpan=3, className="sum-th-quarter"),
-        html.Th("Q4", colSpan=3, className="sum-th-quarter sum-col-quarter-end"),
-        html.Th("TOTALS", colSpan=7, className="sum-th-total"),
-    ], className="sum-thead-tier1")
-
-    periods = ["Q1", "Q2", "Q3", "Q4", "FY", "YTD", "YTG"]
-    hdr_cells = []
-    for idx, m in enumerate(MONTHS):
-        cls = "sum-th-month sum-col-quarter-end" if idx in {2, 5, 8, 11} else "sum-th-month"
-        hdr_cells.append(html.Th(m, className=cls))
-
-    for p in periods:
-        cls = "sum-th-period sum-col-quarter-end" if p == "Q4" else "sum-th-period"
-        hdr_cells.append(html.Th(p, className=cls))
-
-    hdr_row2 = html.Tr(hdr_cells, className="sum-thead-tier2")
-    return html.Thead([hdr_row1, hdr_row2])
+TILE_INACTIVE_STYLE = {
+    **TILE_BASE_STYLE,
+    "backgroundColor": "#ffffff",
+    "color": "var(--b700, #424242)",
+    "border": "1.5px solid var(--b40, #E0E0E0)",
+    "boxShadow": "none",
+}
 
 
-def _render_styled_cell(
-    val: Optional[float],
-    max_pos: float,
-    max_neg_mag: float,
-    is_driver: bool,
-    decimals: int,
-    is_quarter_end: bool,
-    is_total: bool,
-) -> html.Td:
-    txt = fmt_variance_number(val, decimals=decimals, is_driver=is_driver)
-    base_cls = "sum-summary-cell" if is_total else "sum-num-cell"
-    cls_list = [base_cls]
-    if is_quarter_end:
-        cls_list.append("sum-col-quarter-end")
+# ─── Pure HTML Dropdown Menu Builders ─────────────────────────────────────────
 
-    style_dict = {}
-    if is_driver and txt != "":
-        bg_col, txt_col, font_wt = get_variance_heatmap_style(val, max_pos, max_neg_mag)
-        style_dict = {"backgroundColor": bg_col, "color": txt_col, "fontWeight": font_wt}
-
-    return html.Td(txt, className=" ".join(cls_list), style=style_dict if style_dict else None)
-
-
-def build_variance_data_cells(
-    m_vals: List[Optional[float]],
-    totals: Dict[str, Optional[float]],
-    max_pos: float,
-    max_neg_mag: float,
-    is_driver: bool = True,
-    decimals: int = 2,
-) -> List[html.Td]:
-    cells = [
-        _render_styled_cell(
-            val, max_pos, max_neg_mag, is_driver, decimals,
-            is_quarter_end=(m_idx in {2, 5, 8, 11}), is_total=False
-        )
-        for m_idx, val in enumerate(m_vals)
+def build_var_mode_menu_items(active_mode: str = "IBP") -> list:
+    """Build pure HTML dropdown menu items for IBP vs BP baseline selection."""
+    active = (active_mode or "IBP").upper()
+    options = [
+        ("IBP", "IBP (Prior Cycle)", "Current Cycle - Prior Cycle"),
+        ("BP",  "BP (Annual Plan)",  "Current Cycle - Annual BP"),
     ]
-    for col_name in ["Q1", "Q2", "Q3", "Q4", "FY", "YTD", "YTG"]:
-        val = totals.get(col_name) if totals else None
-        cells.append(
-            _render_styled_cell(
-                val, max_pos, max_neg_mag, is_driver, decimals,
-                is_quarter_end=(col_name == "Q4"), is_total=True
+    items = [
+        html.Div(
+            "Variance Baseline",
+            className="sidebar-dropdown-header",
+            style={
+                "padding": "6px 12px",
+                "fontSize": "10px",
+                "fontWeight": "700",
+                "color": _COLOR_TRUST_GREEN,
+                "textTransform": "uppercase",
+                "background": BG_GREEN_50,
+                "letterSpacing": "0.05em",
+                "borderBottom": "1px solid var(--green-100, #B0DFD8)",
+            },
+        )
+    ]
+    for mode_key, title, desc in options:
+        is_sel = (mode_key == active)
+        items.append(
+            html.Div(
+                className="sidebar-dropdown-item",
+                id={"type": "var-mode-select-item", "mode": mode_key},
+                n_clicks=0,
+                style={
+                    "padding": "8px 14px",
+                    "cursor": "pointer",
+                    "backgroundColor": "#F4FBF9" if is_sel else "#ffffff",
+                    "display": "flex",
+                    "alignItems": "center",
+                    "justifyContent": "space-between",
+                    "gap": "10px",
+                    "transition": "background 0.15s ease",
+                },
+                children=[
+                    html.Div([
+                        html.Div(
+                            title,
+                            style={
+                                "fontSize": "12.5px",
+                                "color": "#1A202C" if is_sel else "#4A5568",
+                                "fontWeight": "700" if is_sel else "500",
+                            },
+                        ),
+                        html.Div(desc, style={"fontSize": "10.5px", "color": "#6c757d"}),
+                    ]),
+                    html.I(className="bi bi-check2", style={"color": "#019881", "fontSize": "14px"}) if is_sel else html.Span(),
+                ],
             )
         )
-    return cells
+    return items
 
 
-def _build_placeholder_dash_cells() -> List[html.Td]:
-    cells = []
-    for m_idx in range(12):
-        cls_list = ["sum-num-cell"]
-        if m_idx in {2, 5, 8, 11}:
-            cls_list.append("sum-col-quarter-end")
-        cells.append(html.Td("-", className=" ".join(cls_list)))
+def _render_ad_switcher_item(key: str, name: str, sub: str, is_active: bool) -> html.Div:
+    cls = "header-dropdown-item active" if is_active else "header-dropdown-item"
+    children = [
+        html.Div([
+            html.Strong(name),
+            html.Br(),
+            html.Small(sub, className="text-muted"),
+        ])
+    ]
+    if is_active:
+        children.append(html.I(className="bi bi-check2"))
+    return html.Div(
+        className=cls,
+        id={"type": "var-ad-select-item", "key": key},
+        n_clicks=0,
+        children=children,
+    )
 
-    for col_name in ["Q1", "Q2", "Q3", "Q4", "FY", "YTD", "YTG"]:
-        cls_list = ["sum-summary-cell"]
-        if col_name == "Q4":
-            cls_list.append("sum-col-quarter-end")
-        cells.append(html.Td("-", className=" ".join(cls_list)))
-    return cells
+
+def _build_ad_switcher_from_db(db_mappings: list, active_key: str) -> list:
+    items = []
+    for m in db_mappings:
+        group_key = m["ad_group_name"]
+        perm = m.get("permission", "EDIT")
+        name = m.get("display_name") or group_key
+        sub = f"Role: {perm.title()}"
+        items.append(_render_ad_switcher_item(group_key, name, sub, group_key == active_key))
+    return items
 
 
-def _render_grouped_driver_rows(
-    definitions: list,
-    drivers_dict: dict,
-    driver_totals_dict: dict,
-    max_pos: float,
-    max_neg_mag: float,
-    is_shipment: bool = False,
-) -> List[html.Tr]:
-    group_counts: Dict[str, int] = {}
-    for grp, _, _ in definitions:
-        group_counts[grp] = group_counts.get(grp, 0) + 1
+def _build_ad_switcher_from_personas(active_key: str) -> list:
+    items = []
+    for key, p in AD_PERSONAS.items():
+        sub = f"{p['role_label']} ({p['gbu_label']})"
+        items.append(_render_ad_switcher_item(key, p["name"], sub, key == active_key))
+    return items
 
-    seen_groups = set()
-    group_rows_counter: Dict[str, int] = {}
-    rows = []
 
-    for grp, driver_name, _ in definitions:
-        cells = []
-        if grp not in seen_groups:
-            seen_groups.add(grp)
-            group_rows_counter[grp] = 0
-            cells.append(html.Td(grp, rowSpan=group_counts[grp], className="sum-category-label"))
+def build_var_ad_switcher_menu_items(active_key: str = "COM-APP-NA-IBP-SELFCARE") -> list:
+    curr_user = get_current_user() or {}
+    user_groups = curr_user.get("all_ad_groups", [])
 
-        group_rows_counter[grp] += 1
-        is_last_in_group = (group_rows_counter[grp] == group_counts[grp])
+    try:
+        from repositories.security_repository import get_all_ad_group_mappings, get_user_ad_group_mappings
+        if user_groups:
+            db_mappings = get_user_ad_group_mappings(user_groups)
+        else:
+            db_mappings = get_all_ad_group_mappings()
+    except (psycopg2.Error, KeyError, ValueError):
+        db_mappings = None
 
-        is_sub = driver_name in SUB_DRIVERS and not is_shipment
-        driver_cls = CLASS_DRIVER_SUB if is_sub else "sum-driver-label"
-        cells.append(html.Td(driver_name, className=driver_cls))
+    header_title = "Active AD Group" if user_groups else "Simulate AD Group"
+    items = [html.Div(header_title, className="header-dropdown-header")]
+    if db_mappings:
+        items.extend(_build_ad_switcher_from_db(db_mappings, active_key))
+    else:
+        items.extend(_build_ad_switcher_from_personas(active_key))
+    return items
 
-        d_vals = (
-            drivers_dict.get((grp, driver_name))
-            or drivers_dict.get(driver_name, [None] * 12)
+
+def format_var_squad_pill_label(selected_squads: str | list[str], total_squads: int = 0) -> str:
+    if not selected_squads:
+        return DEFAULT_SQUAD_LABEL
+    if isinstance(selected_squads, str):
+        return selected_squads.title()
+    clean_squads = [str(s) for s in selected_squads if s and str(s) != DEFAULT_SQUAD_LABEL]
+    if not clean_squads:
+        return DEFAULT_SQUAD_LABEL
+    if len(clean_squads) == 1:
+        return clean_squads[0].title()
+    if 0 < total_squads <= len(clean_squads):
+        return f"All Squads ({total_squads})"
+    return f"{len(clean_squads)} Squads Selected"
+
+
+def _render_var_squad_item(s: dict, is_checked: bool) -> html.Div:
+    s_name = s["squad_name"]
+    disp_name = s.get("display_name", s_name.title())
+    check_icon = ICON_CHECKBOX_CHECKED if is_checked else ICON_CHECKBOX_UNCHECKED
+    check_color = "#019881" if is_checked else "#adb5bd"
+
+    return html.Div(
+        className="sidebar-dropdown-item",
+        id={"type": "var-squad-select-item", "name": s_name, "disp": disp_name},
+        n_clicks=0,
+        style={
+            "padding": "7px 14px",
+            "cursor": "pointer",
+            "backgroundColor": "#F4FBF9" if is_checked else "#ffffff",
+            "display": "flex",
+            "alignItems": "center",
+            "justifyContent": "flex-start",
+            "gap": "10px",
+            "transition": "background 0.15s ease",
+        },
+        children=[
+            html.I(className=check_icon, style={"color": check_color, "fontSize": "14px"}),
+            html.Span(
+                disp_name,
+                style={
+                    "fontSize": "12.5px",
+                    "color": "#1A202C" if is_checked else "#4A5568",
+                    "fontWeight": "600" if is_checked else "400",
+                },
+            ),
+        ],
+    )
+
+
+def _build_var_squad_header(is_all_selected: bool, selected_count: int, total_count: int) -> html.Div:
+    return html.Div(
+        className="d-flex align-items-center justify-content-between px-3 py-2 border-bottom user-select-none",
+        style={
+            "background": BG_GREEN_50,
+            "fontSize": _FONT_SIZE_SM_11_5,
+            "fontWeight": "600",
+            "color": "var(--green-800, #004D40)",
+        },
+        children=[
+            html.Div(
+                id={"type": "var-squad-action", "action": "select-all"},
+                className="d-flex align-items-center gap-2",
+                n_clicks=0,
+                style={"cursor": "pointer", "color": "#019881" if is_all_selected else "#495057"},
+                children=[
+                    html.I(
+                        className=ICON_CHECKBOX_CHECKED if is_all_selected else ICON_CHECKBOX_UNCHECKED,
+                        style={"color": "#019881" if is_all_selected else "#adb5bd", "fontSize": "13px"},
+                    ),
+                    html.Span("Select All"),
+                ],
+            ),
+            html.Span(f"{selected_count}/{total_count} selected", style={"color": "#6c757d", "fontSize": "11px", "fontWeight": "500"}),
+        ],
+    )
+
+
+def _build_var_squad_footer(selected_count: int) -> html.Div:
+    return html.Div(
+        className="d-flex align-items-center justify-content-between px-3 py-2 border-top bg-light",
+        children=[
+            html.Span(
+                f"{selected_count} selected",
+                id="var-squad-dropdown-count",
+                style={"fontSize": _FONT_SIZE_SM_11_5, "color": "#495057", "fontWeight": "600"},
+            ),
+            html.Div(
+                className="d-flex gap-2",
+                children=[
+                    html.Button(
+                        "Reset",
+                        id={"type": "var-squad-action", "action": "reset"},
+                        className="btn btn-sm btn-outline-secondary",
+                        style={"fontSize": "11px", "padding": "2px 10px", "borderRadius": "4px", "fontWeight": "500"},
+                        n_clicks=0,
+                    ),
+                    html.Button(
+                        "Apply",
+                        id={"type": "var-squad-action", "action": "apply"},
+                        className="btn btn-sm text-white",
+                        style={
+                            "fontSize": "11px",
+                            "padding": "2px 16px",
+                            "backgroundColor": "#019881",
+                            "borderColor": "#019881",
+                            "fontWeight": "600",
+                            "borderRadius": "4px",
+                        },
+                        n_clicks=0,
+                    ),
+                ],
+            ),
+        ],
+    )
+
+
+def _build_var_gbu_squad_rows(gbus: Dict[str, list], active_set: Set[str]) -> list:
+    squad_rows = []
+    for gbu_name, gbu_squads in gbus.items():
+        squad_rows.append(
+            html.Div(
+                children=[html.I(className="bi bi-diagram-3 me-1"), gbu_name],
+                className="sidebar-dropdown-header",
+                style={
+                    "padding": "5px 12px",
+                    "fontSize": "10px",
+                    "fontWeight": "700",
+                    "color": _COLOR_TRUST_GREEN,
+                    "textTransform": "uppercase",
+                    "background": BG_GREEN_50,
+                    "letterSpacing": "0.05em",
+                    "borderBottom": "1px solid var(--green-100, #B0DFD8)",
+                },
+            )
         )
-        d_totals = (
-            driver_totals_dict.get((grp, driver_name))
-            or driver_totals_dict.get(driver_name, {})
+        for s in gbu_squads:
+            is_checked = s.get("squad_name", "").upper() in active_set
+            squad_rows.append(_render_var_squad_item(s, is_checked))
+    return squad_rows
+
+
+def build_var_squad_menu_items(squads: list, active_squad_name: str | list[str] = "BODY CARE") -> list:
+    if not squads:
+        return [html.Div("No squads available", className="p-3 text-center text-muted small")]
+
+    total_count = len(squads)
+    if isinstance(active_squad_name, str):
+        active_set = {active_squad_name.upper()} if active_squad_name and active_squad_name != DEFAULT_SQUAD_LABEL else set()
+    elif isinstance(active_squad_name, (list, tuple, set)):
+        active_set = {str(s).upper() for s in active_squad_name if s and str(s) != DEFAULT_SQUAD_LABEL}
+    else:
+        active_set = set()
+
+    selected_count = sum(1 for s in squads if s.get("squad_name", "").upper() in active_set)
+    is_all_selected = (selected_count == total_count) if total_count > 0 else False
+
+    gbus: Dict[str, list] = {}
+    for s in squads:
+        gbu = s.get("gbu", "ALL")
+        gbus.setdefault(gbu, []).append(s)
+
+    header_elem = _build_var_squad_header(is_all_selected, selected_count, total_count)
+    body_elem = html.Div(
+        id="var-squad-dropdown-body",
+        className="val-squad-dropdown-body",
+        style={"maxHeight": "260px", "overflowY": "auto", "padding": "4px 0"},
+        children=_build_var_gbu_squad_rows(gbus, active_set),
+    )
+    footer_elem = _build_var_squad_footer(selected_count)
+    return [header_elem, body_elem, footer_elem]
+
+
+def format_var_model_pill_label(selected_models: str | list[str], total_models: int = 0) -> str:
+    if not selected_models:
+        return DEFAULT_MODEL_LABEL
+    if isinstance(selected_models, str):
+        return selected_models
+    if len(selected_models) == 1:
+        return selected_models[0]
+    if 0 < total_models <= len(selected_models):
+        return f"All Models ({total_models})"
+    return f"{len(selected_models)} Models Selected"
+
+
+def _render_var_model_item(m: dict, is_checked: bool) -> html.Div:
+    m_id = m.get("model_id") if m.get("model_id") is not None else 0
+    m_name = m.get("model_name", str(m))
+    check_icon = ICON_CHECKBOX_CHECKED if is_checked else ICON_CHECKBOX_UNCHECKED
+    check_color = "#019881" if is_checked else "#adb5bd"
+
+    return html.Div(
+        className="sidebar-dropdown-item",
+        id={"type": "var-model-select-item", "id": m_id, "name": m_name},
+        n_clicks=0,
+        style={
+            "padding": "7px 14px",
+            "cursor": "pointer",
+            "backgroundColor": "#F4FBF9" if is_checked else "#ffffff",
+            "display": "flex",
+            "alignItems": "center",
+            "justifyContent": "flex-start",
+            "gap": "10px",
+            "transition": "background 0.15s ease",
+        },
+        children=[
+            html.I(className=check_icon, style={"color": check_color, "fontSize": "14px"}),
+            html.Span(
+                m_name,
+                style={
+                    "fontSize": "12.5px",
+                    "color": "#1A202C" if is_checked else "#4A5568",
+                    "fontWeight": "600" if is_checked else "400",
+                },
+            ),
+        ],
+    )
+
+
+def _build_var_model_header(is_all_selected: bool, selected_count: int, total_count: int) -> html.Div:
+    return html.Div(
+        className="d-flex align-items-center justify-content-between px-3 py-2 border-bottom user-select-none",
+        style={
+            "background": BG_GREEN_50,
+            "fontSize": _FONT_SIZE_SM_11_5,
+            "fontWeight": "600",
+            "color": "var(--green-800, #004D40)",
+        },
+        children=[
+            html.Div(
+                id={"type": "var-model-action", "action": "select-all"},
+                className="d-flex align-items-center gap-2",
+                n_clicks=0,
+                style={"cursor": "pointer", "color": "#019881" if is_all_selected else "#495057"},
+                children=[
+                    html.I(
+                        className=ICON_CHECKBOX_CHECKED if is_all_selected else ICON_CHECKBOX_UNCHECKED,
+                        style={"color": "#019881" if is_all_selected else "#adb5bd", "fontSize": "13px"},
+                    ),
+                    html.Span("Select All"),
+                ],
+            ),
+            html.Span(f"{selected_count}/{total_count} selected", style={"color": "#6c757d", "fontSize": "11px", "fontWeight": "500"}),
+        ],
+    )
+
+
+def _build_var_model_footer(selected_count: int) -> html.Div:
+    return html.Div(
+        className="d-flex align-items-center justify-content-between px-3 py-2 border-top bg-light",
+        children=[
+            html.Span(
+                f"{selected_count} selected",
+                id="var-model-dropdown-count",
+                style={"fontSize": _FONT_SIZE_SM_11_5, "color": "#495057", "fontWeight": "600"},
+            ),
+            html.Div(
+                className="d-flex gap-2",
+                children=[
+                    html.Button(
+                        "Reset",
+                        id={"type": "var-model-action", "action": "reset"},
+                        className="btn btn-sm btn-outline-secondary",
+                        style={"fontSize": "11px", "padding": "2px 10px", "borderRadius": "4px", "fontWeight": "500"},
+                        n_clicks=0,
+                    ),
+                    html.Button(
+                        "Apply",
+                        id={"type": "var-model-action", "action": "apply"},
+                        className="btn btn-sm text-white",
+                        style={
+                            "fontSize": "11px",
+                            "padding": "2px 16px",
+                            "backgroundColor": "#019881",
+                            "borderColor": "#019881",
+                            "fontWeight": "600",
+                            "borderRadius": "4px",
+                        },
+                        n_clicks=0,
+                    ),
+                ],
+            ),
+        ],
+    )
+
+
+def _build_var_squad_model_rows(models: list, active_set: Set[str]) -> list:
+    squad_groups: Dict[str, list] = {}
+    for m in models:
+        sq = m.get("squad_name") or m.get("primary_need_state") or "Other"
+        squad_groups.setdefault(sq, []).append(m)
+
+    has_squad_headers = len(squad_groups) > 1 or (len(squad_groups) == 1 and "Other" not in squad_groups)
+    model_rows = []
+
+    for sq_name, sq_models in squad_groups.items():
+        if has_squad_headers:
+            model_rows.append(
+                html.Div(
+                    children=[html.I(className="bi bi-diagram-3 me-1"), sq_name.title()],
+                    className="sidebar-dropdown-header",
+                    style={
+                        "padding": "5px 12px",
+                        "fontSize": "10px",
+                        "fontWeight": "700",
+                        "color": _COLOR_TRUST_GREEN,
+                        "textTransform": "uppercase",
+                        "background": BG_GREEN_50,
+                        "letterSpacing": "0.05em",
+                        "borderBottom": "1px solid var(--green-100, #B0DFD8)",
+                    },
+                )
+            )
+
+        for m in sq_models:
+            m_name = m.get("model_name", str(m))
+            is_checked = m_name.upper() in active_set
+            model_rows.append(_render_var_model_item(m, is_checked))
+    return model_rows
+
+
+def build_var_model_menu_items(
+    models: list,
+    active_model_name: str | list[str] = DEFAULT_BODY_CARE,
+    has_squad: bool = True,
+) -> list:
+    if not models:
+        empty_prompt = (
+            "No models available for this domain"
+            if has_squad
+            else "Please select a squad first to view available models."
         )
+        return [html.Div(empty_prompt, className="p-3 text-center text-muted small")]
 
-        cells.extend(build_variance_data_cells(d_vals, d_totals, max_pos, max_neg_mag, is_driver=True, decimals=2))
+    total_count = len(models)
+    if isinstance(active_model_name, str):
+        active_set = {active_model_name.upper()} if active_model_name and active_model_name != DEFAULT_MODEL_LABEL else set()
+    elif isinstance(active_model_name, (list, tuple, set)):
+        active_set = {str(m).upper() for m in active_model_name if m and str(m) != DEFAULT_MODEL_LABEL}
+    else:
+        active_set = set()
 
-        row_cls = "sum-row-group-bottom" if is_last_in_group else None
-        rows.append(html.Tr(cells, className=row_cls))
+    selected_count = sum(1 for m in models if m.get("model_name", "").upper() in active_set)
+    is_all_selected = (selected_count == total_count) if total_count > 0 else False
 
-    return rows
+    header_elem = _build_var_model_header(is_all_selected, selected_count, total_count)
+    body_elem = html.Div(
+        id="var-model-dropdown-body",
+        className="val-model-dropdown-body",
+        style={"maxHeight": "240px", "overflowY": "auto", "padding": "4px 0"},
+        children=_build_var_squad_model_rows(models, active_set),
+    )
+    footer_elem = _build_var_model_footer(selected_count)
+    return [header_elem, body_elem, footer_elem]
 
 
-def _render_base_row_cells(data: Dict[str, Any], max_pos: float, max_neg_mag: float) -> List[html.Td]:
-    base_vals = data.get("base_row_vals") or [None] * 12
-    if any(v is not None for v in base_vals):
-        return build_variance_data_cells(
-            base_vals, data.get("totals_base", {}), max_pos, max_neg_mag, is_driver=False, decimals=2
-        )
-    return _build_placeholder_dash_cells()
-
-
-def _render_bp_missing_notice(plan_year: Any, domain: str) -> html.Div:
+def render_empty_domain_alert(model_name: str, domain: str) -> html.Div:
     return html.Div(
         className="p-5 bg-white rounded border text-center my-4",
         style={"boxShadow": "0 1px 3px rgba(0, 0, 0, 0.05)", "maxWidth": "720px", "margin": "40px auto"},
         children=[
-            html.I(className="bi bi-calendar-x text-warning fs-1 mb-3 d-block"),
-            html.H5(f"No {domain.title()} BP Snapshot Found for {plan_year}", className="fw-bold text-dark mb-2"),
+            html.I(className="bi bi-exclamation-triangle text-warning fs-1 mb-3 d-block"),
+            html.H5(f"No {domain.title()} Variance Data for '{model_name}'", className="fw-bold text-dark mb-2"),
             html.P(
-                f"There is no locked BP snapshot recorded for planning year {plan_year}. "
-                "Switch back to IBP to compare Current Cycle vs Prior Cycle.",
+                [
+                    f"The model '{model_name}' has no building block changes recorded.",
+                    html.Br(),
+                    "Please select another model from the Model dropdown above.",
+                ],
                 className="text-muted mb-0",
                 style={"fontSize": "13px"},
             ),
@@ -235,88 +570,409 @@ def _render_bp_missing_notice(plan_year: Any, domain: str) -> html.Div:
     )
 
 
-def render_consumption_variance_table(data: Dict[str, Any]) -> html.Div:
-    if data.get("bp_missing"):
-        return _render_bp_missing_notice(data.get("plan_year"), "Consumption")
-
-    drivers_dict = data.get("drivers", {})
-    driver_totals_dict = data.get("driver_totals", {})
-    max_pos = data.get("max_pos", 1.0)
-    max_neg_mag = data.get("max_neg_mag", 1.0)
-
-    thead = _get_thead(category_title="CATEGORY", driver_title="DRIVER")
-    tbody_rows = [
-        html.Tr([
-            html.Td("", className="sum-category-label"),
-            html.Td(str(data.get("label_base") or data.get("base_year", "Base")), className=CLASS_ROW_YEAR_LABEL),
-            *_render_base_row_cells(data, max_pos, max_neg_mag),
-        ], className="sum-row-base")
-    ]
-
-    tbody_rows.extend(_render_grouped_driver_rows(
-        CONSUMPTION_VARIANCE_DRIVER_DEFINITIONS, drivers_dict, driver_totals_dict, max_pos, max_neg_mag, is_shipment=False
-    ))
-
-    plan_lbl = str(data.get("label_plan") or data.get("plan_year") or "Plan")
-    tbody_rows.append(html.Tr([
-        html.Td("", className="sum-category-label"),
-        html.Td(plan_lbl, className=CLASS_ROW_YEAR_LABEL),
-        *build_variance_data_cells(
-            data.get("plan_row_vals", [None] * 12), data.get("totals_plan", {}), max_pos, max_neg_mag, is_driver=False, decimals=2
-        ),
-    ], className="sum-row-active"))
+def render_empty_selection_card(empty_type: str = "model", domain: str = "CONSUMPTION") -> html.Div:
+    domain_title = (domain or "CONSUMPTION").title()
+    if empty_type == "squad":
+        icon_class = "bi bi-diagram-3 text-secondary fs-1 mb-3 d-block"
+        title_text = "No Squad Selected"
+        desc_text = "Please select one or more squads above to view available models and variance data."
+    else:
+        icon_class = "bi bi-grid-3x3 text-secondary fs-1 mb-3 d-block"
+        title_text = "No Model Selected"
+        desc_text = f"Please select one or more models from the Model dropdown above to view {domain_title} Variance data."
 
     return html.Div(
-        [html.Table([thead, html.Tbody(tbody_rows)], className="summary-table")],
-        className="summary-grid-card"
+        className="p-5 bg-white rounded border text-center my-4",
+        style={"boxShadow": "0 1px 3px rgba(0, 0, 0, 0.05)", "maxWidth": "720px", "margin": "40px auto"},
+        children=[
+            html.I(className=icon_class),
+            html.H5(title_text, className="fw-bold text-dark mb-2"),
+            html.P(desc_text, className="text-muted mb-0", style={"fontSize": "13px"}),
+        ],
     )
 
 
-def render_shipment_variance_table(data: Dict[str, Any]) -> html.Div:
-    if data.get("bp_missing"):
-        return _render_bp_missing_notice(data.get("plan_year"), "Shipment")
+# ─── Page Layout ──────────────────────────────────────────────────────────────
 
-    drivers_dict = data.get("drivers", {})
-    driver_totals_dict = data.get("driver_totals", {})
-    max_pos = data.get("max_pos", 1.0)
-    max_neg_mag = data.get("max_neg_mag", 1.0)
+def _handle_variance_auth_redirect() -> Optional[dcc.Location]:
+    if not has_request_context():
+        return None
 
-    thead = _get_thead(category_title="CATEGORY", driver_title="DRIVER")
-    tbody_rows = [
-        html.Tr([
-            html.Td("", className="sum-category-label"),
-            html.Td(str(data.get("label_base") or data.get("base_year", "Base")), className=CLASS_ROW_YEAR_LABEL),
-            *_render_base_row_cells(data, max_pos, max_neg_mag),
-        ], className="sum-row-base")
-    ]
+    if not is_authenticated():
+        if config.FLASK_ENV == "development":
+            from auth.routes import establish_local_dev_session
+            establish_local_dev_session()
+        else:
+            target_path = VARIANCE_ROUTE
+            if request.query_string:
+                target_path = f"{request.path}?{request.query_string.decode('utf-8')}"
+            return dcc.Location(href=f"/auth/login?next={target_path}", id="variance-auth-redirect", refresh=True)
 
-    tbody_rows.extend(_render_grouped_driver_rows(
-        SHIPMENT_VARIANCE_DRIVER_DEFINITIONS, drivers_dict, driver_totals_dict, max_pos, max_neg_mag, is_shipment=True
-    ))
+    curr_user = get_current_user() or {}
+    if not curr_user.get("ad_group"):
+        return dcc.Location(href="/unauthorized", id="variance-unauth-redirect", refresh=True)
+    return None
 
-    plan_lbl = str(data.get("label_plan") or data.get("plan_year") or "Plan")
-    tbody_rows.append(html.Tr([
-        html.Td("", className="sum-category-label"),
-        html.Td(plan_lbl, className=CLASS_ROW_YEAR_LABEL),
-        *build_variance_data_cells(
-            data.get("plan_row_vals", [None] * 12), data.get("totals_plan", {}), max_pos, max_neg_mag, is_driver=False, decimals=2
-        ),
-    ], className="sum-row-active"))
+
+def _resolve_variance_user_identity(user: dict, persona: dict) -> Tuple[str, str]:
+    user_name = user.get("display_name", "")
+    user_email = user.get("email", "")
+    if not user_name and user_email:
+        user_name = user_email.split("@")[0].replace(".", " ").title()
+    elif not user_name:
+        user_name = "User"
+    if not user_email:
+        user_email = persona["email"]
+    return user_name, user_email
+
+
+def _get_initial_gbu_codes(initial_persona_key: str, persona: dict) -> list:
+    try:
+        mapping = get_ad_group_mapping([initial_persona_key])
+        if mapping and mapping.get("gbu_codes"):
+            return mapping["gbu_codes"]
+    except (psycopg2.Error, KeyError, IndexError, ValueError):
+        pass
+    return persona.get("gbus", [])
+
+
+def _get_initial_squads(gbu_codes: list) -> Tuple[list, str, str]:
+    try:
+        squad_rows = get_squads_by_gbu(gbu_codes)
+    except (psycopg2.Error, KeyError, IndexError, ValueError):
+        squad_rows = []
+
+    squads = []
+    fallback_gbu = gbu_codes[0] if gbu_codes else ""
+    for s in squad_rows:
+        s_name = s["squad_name"]
+        gbu_c = s.get("gbu_code", fallback_gbu)
+        gbu_n = s.get("gbu_name", gbu_c)
+        squads.append({
+            "squad_name": s_name,
+            "display_name": s_name.title(),
+            "gbu": gbu_c,
+            "gbu_short": gbu_n.split()[0].title() if gbu_n else "",
+        })
+    active_squad_name = squads[0]["squad_name"] if squads else "BODY CARE"
+    active_squad_disp = squads[0]["display_name"] if squads else DEFAULT_BODY_CARE
+    return squads, active_squad_name, active_squad_disp
+
+
+def _get_initial_models(active_squad_name: str, gbu_codes: list) -> Tuple[list, str]:
+    try:
+        all_models = get_models_by_squad(active_squad_name, gbu_codes)
+    except (psycopg2.Error, KeyError, IndexError, ValueError):
+        all_models = []
+
+    cons_models = [m for m in all_models if m.get("has_pos")]
+    candidate_models = cons_models or all_models
+    active_model_name = candidate_models[0]["model_name"] if candidate_models else DEFAULT_BODY_CARE
+    return candidate_models, active_model_name
+
+
+def layout():
+    """Pure Python Dash layout evaluated dynamically per request."""
+    redirect = _handle_variance_auth_redirect()
+    if redirect is not None:
+        return redirect
+
+    user = get_current_user() or {}
+    curr_kv = KenvueCalendar.get_date_info(date.today())
+
+    initial_persona_key = user.get("ad_group") or "COM-APP-NA-IBP-SELFCARE"
+    if initial_persona_key not in AD_PERSONAS:
+        initial_persona_key = "COM-APP-NA-IBP-SELFCARE"
+    persona = AD_PERSONAS.get(initial_persona_key, AD_PERSONAS["COM-APP-NA-IBP-SELFCARE"])
+
+    user_name, user_email = _resolve_variance_user_identity(user, persona)
+    gbu_codes = _get_initial_gbu_codes(initial_persona_key, persona)
+    squads, active_squad_name, _ = _get_initial_squads(gbu_codes)
+    candidate_models, active_model_name = _get_initial_models(active_squad_name, gbu_codes)
+
+    ad_items = build_var_ad_switcher_menu_items(active_key=initial_persona_key)
+    squad_items = build_var_squad_menu_items(squads, active_squad_name=active_squad_name)
+    model_items = build_var_model_menu_items(candidate_models, active_model_name=active_model_name)
+    mode_items = build_var_mode_menu_items(active_mode="IBP")
 
     return html.Div(
-        [html.Table([thead, html.Tbody(tbody_rows)], className="summary-table")],
-        className="summary-grid-card"
+        id="variance-page-root",
+        className="d-flex flex-column",
+        style={"minHeight": "100vh", "backgroundColor": "var(--b10, #FAFAFA)"},
+        children=[
+            # ── State Stores ──────────────────────────────────────────────────
+            dcc.Store(id="filter-var-domain", data="consumption"),
+            dcc.Store(id="filter-var-mode", data="IBP"),  # Default = IBP
+            dcc.Store(id="filter-var-squad", data=[active_squad_name] if active_squad_name else []),
+            dcc.Store(id="var-squad-staging-store", data=None),
+            dcc.Store(id="filter-var-model", data=[active_model_name] if active_model_name else []),
+            dcc.Store(id="var-model-staging-store", data=None),
+            dcc.Store(id="var-header-ad-switcher", data=initial_persona_key),
+            dcc.Store(id="var-open-menu-store", data=None),
+            dcc.Store(id="var-cache-store", data={}),
+
+            # ── 1. Top Brand Accent Multi-Color Bar ───────────────────────────
+            html.Div(className="accent"),
+
+            # ── 2. Top Navigation Bar ─────────────────────────────────────────
+            render_workbench_header(
+                page="variance",
+                user_name=user_name,
+                user_email=user_email,
+                role_label=persona["role_label"],
+                role_color=persona["role_color"],
+                ad_items=ad_items,
+                initial_ad_badge_text=persona["name"],
+            ),
+
+            # ── 3. Main Workspace Layout (Sidebar + Workbench) ────────────────
+            html.Div(
+                className="app-workspace",
+                children=[
+                    # ── Left Compact Dock (140px Width) ──
+                    html.Aside(
+                        id="var-sidebar",
+                        className="planning-sidebar",
+                        style={
+                            "width": "140px",
+                            "minWidth": "140px",
+                            "maxWidth": "140px",
+                            "padding": "16px 10px 16px 14px",
+                            "display": "flex",
+                            "flexDirection": "column",
+                            "gap": "10px",
+                        },
+                        children=[
+                            html.Div([
+                                html.Div(
+                                    className="sidebar-section-title mb-2",
+                                    style={"justifyContent": "center"},
+                                    children=[
+                                        html.Span(
+                                            "DASHBOARD",
+                                            style={
+                                                "fontSize": "11px",
+                                                "fontWeight": "700",
+                                                "letterSpacing": "0.06em",
+                                                "color": "var(--b700, #1C1C1C)",
+                                            },
+                                        ),
+                                    ],
+                                ),
+                                dcc.Loading(
+                                    id="var-domain-loading",
+                                    type="dot",
+                                    color="#00B097",
+                                    children=html.Div(
+                                        className="d-flex flex-column gap-2",
+                                        children=[
+                                            html.Div(
+                                                id="card-var-consumption",
+                                                className="val-tile-stacked active-domain",
+                                                style=TILE_ACTIVE_STYLE,
+                                                n_clicks=0,
+                                                children=[
+                                                    html.I(className="bi bi-cart3 fs-5 mb-1"),
+                                                    html.Span("Consumption", className="val-tile-label", style={"fontWeight": "700", "fontSize": _FONT_SIZE_SM_11_5}),
+                                                ],
+                                            ),
+                                            html.Div(
+                                                id="card-var-shipment",
+                                                className=CLASS_TILE_INACTIVE,
+                                                style=TILE_INACTIVE_STYLE,
+                                                n_clicks=0,
+                                                children=[
+                                                    html.I(className="bi bi-truck fs-5 mb-1"),
+                                                    html.Span("Shipment", className="val-tile-label", style={"fontWeight": "700", "fontSize": _FONT_SIZE_SM_11_5}),
+                                                ],
+                                            ),
+                                        ],
+                                    ),
+                                ),
+                            ]),
+                        ],
+                    ),
+
+                    # ── Right Main Workbench Area ─────────────────────────────
+                    html.Main(
+                        id="var-workbench",
+                        className="planning-main",
+                        children=[
+                            # ── 1. Top Horizon Filter Bar (Squad -> Peach Model -> Compare IBP/BP) ──
+                            html.Section(
+                                className="horizon-top-bar",
+                                children=[
+                                    html.Div(
+                                        className="horizon-left-group",
+                                        children=[
+                                            # Need State / Squad Box
+                                            html.Div(
+                                                className="horizon-box horizon-squad-box",
+                                                id="pill-var-squad",
+                                                title="Select Need State / Squad",
+                                                n_clicks=0,
+                                                children=[
+                                                    html.Div(
+                                                        className="box-label",
+                                                        children=[
+                                                            html.I(className="bi bi-diagram-3 me-1 text-primary"),
+                                                            html.Span("Squad"),
+                                                            html.Span("\u25BC", className="caret ms-1"),
+                                                        ],
+                                                    ),
+                                                    html.Span(
+                                                        format_var_squad_pill_label([active_squad_name]),
+                                                        className="box-value",
+                                                        id="selected-var-squad-label",
+                                                    ),
+                                                    html.Div(
+                                                        className="sidebar-dropdown-menu",
+                                                        id="menu-var-squad",
+                                                        children=squad_items,
+                                                    ),
+                                                ],
+                                            ),
+
+                                            # Model Box (Peach Background)
+                                            html.Div(
+                                                className="horizon-box horizon-model-box",
+                                                id="pill-var-model",
+                                                title=DEFAULT_MODEL_LABEL,
+                                                n_clicks=0,
+                                                children=[
+                                                    html.Div(
+                                                        className="box-label",
+                                                        children=[
+                                                            html.I(className="bi bi-box-seam me-1 text-danger"),
+                                                            html.Span("Model"),
+                                                            html.Span("\u25BC", className="caret ms-1"),
+                                                        ],
+                                                    ),
+                                                    html.Span(
+                                                        format_var_model_pill_label([active_model_name]),
+                                                        className="box-value",
+                                                        id="selected-var-model-label",
+                                                    ),
+                                                    html.Div(
+                                                        className="sidebar-dropdown-menu",
+                                                        id="menu-var-model",
+                                                        children=model_items,
+                                                    ),
+                                                ],
+                                            ),
+
+                                            # Compare Mode Box (IBP / BP Selector)
+                                            html.Div(
+                                                className="horizon-box",
+                                                id="pill-var-mode",
+                                                title="Select Baseline (IBP vs BP)",
+                                                n_clicks=0,
+                                                style={"minWidth": "140px", "cursor": "pointer"},
+                                                children=[
+                                                    html.Div(
+                                                        className="box-label",
+                                                        children=[
+                                                            html.I(className="bi bi-layers me-1 text-success"),
+                                                            html.Span("Compare"),
+                                                            html.Span("\u25BC", className="caret ms-1"),
+                                                        ],
+                                                    ),
+                                                    html.Span(
+                                                        "IBP",
+                                                        className="box-value",
+                                                        id="selected-var-mode-label",
+                                                    ),
+                                                    html.Div(
+                                                        className="sidebar-dropdown-menu",
+                                                        id="menu-var-mode",
+                                                        style={"minWidth": "210px"},
+                                                        children=mode_items,
+                                                    ),
+                                                ],
+                                            ),
+                                        ],
+                                    ),
+                                ],
+                            ),
+
+                            # ── 2. Authoritative Context Ribbon ───────────────────────
+                            html.Div(
+                                className="planning-context-ribbon",
+                                children=[
+                                    html.Div(
+                                        className="ribbon-left d-flex align-items-center gap-2",
+                                        children=[
+                                            html.Span("▶", className="ribbon-play-icon", style={"color": _COLOR_TRUST_GREEN, "fontSize": "11px"}),
+                                            html.Strong(id="ribbon-var-domain-title", children="CONSUMPTION VARIANCE (IBP)", style={"fontSize": _FONT_SIZE_SM_11_5, "letterSpacing": "0.04em"}),
+                                            html.Span(" — "),
+                                            html.Strong(id="ribbon-var-model-title", children=active_model_name, style={"fontSize": _FONT_SIZE_SM_11_5}),
+                                            html.Span(
+                                                id="var-status-badge",
+                                                children="Current Cycle vs Prior Cycle | POS $ are in millions.",
+                                                style={"fontSize": _FONT_SIZE_SM_11_5, "color": "#495057", "fontWeight": "500", "fontStyle": "italic"},
+                                            ),
+                                        ],
+                                    ),
+                                    html.Div(
+                                        className="ribbon-badges",
+                                        children=[
+                                            dbc.Badge(
+                                                f"Fiscal: {curr_kv.kv_month_abbr} {curr_kv.kv_year}",
+                                                color="success",
+                                                className="border",
+                                                style={"fontSize": "11px", "borderRadius": "20px", "padding": "4px 12px", "backgroundColor": _COLOR_TRUST_GREEN},
+                                            ),
+                                        ],
+                                    ),
+                                ],
+                            ),
+
+                            # ── 3. Main Data Workbench Table Container ────────────────
+                            dcc.Loading(
+                                id="var-loading",
+                                type="circle",
+                                color="#00B097",
+                                delay_show=0,
+                                delay_hide=150,
+                                overlay_style={"visibility": "visible", "opacity": 0.65, "backgroundColor": "rgba(255, 255, 255, 0.7)"},
+                                children=html.Div(
+                                    id="var-grid-container",
+                                    children=render_summary_loading_skeleton("CONSUMPTION"),
+                                ),
+                            ),
+                        ],
+                    ),
+                ],
+            ),
+
+            # ── 4. Global Footer ──────────────────────────────────────────────
+            html.Footer(
+                className="global-footer",
+                children=[
+                    html.Div(
+                        className="footer-left",
+                        children=[
+                            html.Span(
+                                id="var-footer-status-indicator",
+                                className="footer-status-indicator",
+                                children=[
+                                    html.Span(id="var-footer-status-dot", className="status-dot status-dot-online"),
+                                    html.Span(id="var-footer-status-text", children="System Online"),
+                                ],
+                            ),
+                            html.Span("|", className="footer-pipe text-muted", style={"opacity": "0.35", "margin": "0 8px"}),
+                            html.Span(id="var-footer-db-status", children="Consolidated View Active", className="text-muted"),
+                        ],
+                    ),
+                    html.Div(
+                        className="footer-right d-flex align-items-center",
+                        children=[
+                            html.Span("© 2026 Kenvue Inc.", className="text-muted small"),
+                            html.Span("|", className="footer-pipe text-muted", style={"opacity": "0.35", "margin": "0 8px"}),
+                            html.Span("NA IBP Variance Dashboard v1.1", className="text-muted small"),
+                        ],
+                    ),
+                ],
+            ),
+        ],
     )
-
-
-def render_variance_matrix_table(
-    data: Dict[str, Any], domain: str = "CONSUMPTION", model_name: str = ""
-) -> html.Div:
-    """Master entry point for rendering the active variance dashboard matrix."""
-    if not data or not data.get("plan_year"):
-        return html.Div(html.P("No variance data loaded.", className="text-muted p-4 text-center"), className="summary-grid-card")
-
-    dom = domain.upper()
-    if dom in ["SHIPMENT", "SHIPMENT VARIANCE"]:
-        return render_shipment_variance_table(data)
-    return render_consumption_variance_table(data)
