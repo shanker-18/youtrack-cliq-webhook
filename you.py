@@ -1,269 +1,322 @@
 # pylint: disable=too-many-lines,too-many-locals,too-many-branches,broad-except
 """
-NA IBP Planning Application — Variance Calculations Engine
-==========================================================
-Authoritative calculation engine for:
-1. Consumption Variance Matrix (IBP: Current - Prior | BP: Current - Annual BP)
-2. Shipment Variance Matrix (IBP: Current - Prior | BP: Current - Annual BP)
-
-Rules:
-- Top Row {base_year}: Current cycle in base year - Baseline in base year
-- Bottom Row {plan_year}: Sum of active driver variances; labelled strictly with the year (e.g. '2026')
-- Monospace 2-decimal formatting with parentheses for negatives e.g. (0.10) and blanks for no data
+NA IBP Planning Application — Variance Grid Component
+=====================================================
+Pure Python Dash HTML table renderers for the Variance Dashboard:
+1. Consumption Variance Table (IBP & BP modes)
+2. Shipment Variance Table (IBP & BP modes)
 """
 
 import math
-import os
-import datetime
-from typing import Optional, Dict, List, Any, Union
+from typing import Optional, Dict, List, Any
+from dash import html
 
 from services.variance_service import (
-    get_active_years,
-    get_cycle_snapshot_ids,
-    load_consumption_variance_drivers,
-    load_shipment_variance_drivers,
     CONSUMPTION_VARIANCE_DRIVER_DEFINITIONS,
     SHIPMENT_VARIANCE_DRIVER_DEFINITIONS,
-    DRIVER_BASE_TREND,
-    DRIVER_NET_INNOVATION,
-    DRIVER_NET_PRICE,
 )
-from utils.logger import get_logger
 
-logger = get_logger(__name__)
+MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
+SUB_DRIVERS = {"Innovation", "Cannibalization", "Price", "Elasticity"}
 
-MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-
-CONSUMPTION_PARENT_DRIVER_NAMES = [
-    DRIVER_BASE_TREND, "Season", "Competition", "Distribution", DRIVER_NET_INNOVATION,
-    "Discontinuations", "Renovation", "Media", "Trade", DRIVER_NET_PRICE,
-    "Club", "Other"
-]
+COLOR_B600 = "var(--b600, #2E2E2E)"
+CLASS_ROW_YEAR_LABEL = "sum-driver-label sum-row-year-label fw-bold"
+CLASS_DRIVER_SUB = "sum-driver-label sum-driver-sub"
 
 
-def calc_variance_totals(
-    monthly_vals: List[Optional[float]], cutoff_month: int = 0
-) -> Dict[str, Optional[float]]:
-    """Calculates Q1..Q4, FY, YTD, and YTG totals preserving None and 0.0."""
-    has_data = any(v is not None and not (isinstance(v, float) and math.isnan(v)) for v in monthly_vals)
-    if not has_data:
-        return dict.fromkeys(["Q1", "Q2", "Q3", "Q4", "FY", "YTD", "YTG"], None)
-
-    def _sum_range(st: int, en: int) -> Optional[float]:
-        if st >= en:
-            return None
-        arr = [v for v in monthly_vals[st:en] if v is not None and not (isinstance(v, float) and math.isnan(v))]
-        return round(sum(arr), 9) if arr else None
-
-    safe_cutoff = max(0, min(12, int(cutoff_month or 0)))
-    return {
-        "Q1": _sum_range(0, 3),
-        "Q2": _sum_range(3, 6),
-        "Q3": _sum_range(6, 9),
-        "Q4": _sum_range(9, 12),
-        "FY": _sum_range(0, 12),
-        "YTD": _sum_range(0, safe_cutoff),
-        "YTG": _sum_range(safe_cutoff, 12),
-    }
-
-
-def _resolve_cutoff_month(active_cycle_month: Optional[int]) -> int:
-    env_cutoff = os.getenv("IBP_CUTOFF_MONTH")
-    if env_cutoff and env_cutoff.isdigit():
-        return int(env_cutoff)
-    if active_cycle_month and 1 <= active_cycle_month <= 12:
-        return active_cycle_month
-    try:
-        from services.kv_calendar import KenvueCalendar
-        info = KenvueCalendar.get_date_info(datetime.date.today())
-        if isinstance(info, dict):
-            return int(info.get("fiscal_month") or info.get("kv_month_num") or 1)
-        return int(getattr(info, "kv_month_num", None) or getattr(info, "fiscal_month", None) or datetime.date.today().month)
-    except Exception:
-        return datetime.date.today().month
-
-
-def calculate_driver_heatmap_ranges(drivers: dict, driver_totals: Optional[dict] = None) -> tuple[float, float]:
-    all_vals: List[float] = []
-    for d_vals in drivers.values():
-        if isinstance(d_vals, list):
-            for v in d_vals:
-                if v is not None and not (isinstance(v, float) and (math.isnan(v) or math.isinf(v))):
-                    all_vals.append(float(v))
-    if driver_totals:
-        for t_dict in driver_totals.values():
-            if isinstance(t_dict, dict):
-                for v in t_dict.values():
-                    if v is not None and not (isinstance(v, float) and (math.isnan(v) or math.isinf(v))):
-                        all_vals.append(float(v))
-    pos_vals = [v for v in all_vals if v > 0]
-    neg_vals = [abs(v) for v in all_vals if v < 0]
-    max_pos = max(pos_vals) if pos_vals else 1.0
-    max_neg_mag = max(neg_vals) if neg_vals else 1.0
-    return max_pos, max_neg_mag
-
-
-# ─── 1. Consumption Variance Calculation Engine ──────────────────────────────
-
-def compute_consumption_variance_matrix(
-    models: Union[str, List[str]], comparison_mode: str = "IBP"
-) -> Dict[str, Any]:
+def fmt_variance_number(val: Optional[float], decimals: int = 2, is_driver: bool = True) -> str:
     """
-    Computes Consumption Variance Matrix for IBP (Current - Prior) or BP (Current - Annual BP).
+    Formats Variance numbers:
+    - None / NaN -> '' (clean blank cell)
+    - Negative with is_driver=True -> (0.14) (financial parentheses)
+    - Negative with is_driver=False -> -0.14
+    - True Zero -> 0.00
     """
-    mode = (comparison_mode or "IBP").upper()
-    base_year, plan_year = get_active_years()
-    snap_info = get_cycle_snapshot_ids(plan_year)
-    cutoff_month = _resolve_cutoff_month(snap_info.active_cycle_month)
+    if val is None or (isinstance(val, float) and (math.isnan(val) or math.isinf(val))):
+        return ""
+    v = float(val)
+    rounded_val = round(abs(v), decimals)
+    if rounded_val == 0:
+        return f"{0.0:.{decimals}f}"
+    if v < 0:
+        return f"({rounded_val:.{decimals}f})" if is_driver else f"-{rounded_val:.{decimals}f}"
+    return f"{rounded_val:.{decimals}f}"
 
-    # 1. Base Year Variance (Current base_year - Baseline base_year)
-    base_year_drivers, _ = load_consumption_variance_drivers(models, base_year, comparison_mode=mode)
-    for d_name, d_vals in list(base_year_drivers.items()):
-        base_year_drivers[d_name] = [
-            round(v, 9) if (v is not None and not (isinstance(v, float) and math.isnan(v))) else None
-            for v in d_vals
-        ]
 
-    base_monthly_tot = [0.0] * 12
-    base_has_month = [False] * 12
-    for d_name in CONSUMPTION_PARENT_DRIVER_NAMES:
-        d_vals = base_year_drivers.get(d_name, [None] * 12)
-        for i in range(12):
-            if d_vals[i] is not None:
-                base_monthly_tot[i] += d_vals[i]
-                base_has_month[i] = True
+def get_variance_heatmap_style(val: Optional[float], max_pos: float, max_neg_mag: float) -> tuple[str, str, str]:
+    if val is None or (isinstance(val, float) and math.isnan(val)) or abs(val) < 0.0001:
+        return "transparent", COLOR_B600, "normal"
 
-    pos_base_variance = [
-        round(base_monthly_tot[i], 9) if base_has_month[i] else None
-        for i in range(12)
+    v = float(val)
+    if v > 0:
+        norm = min(1.0, v / (max_pos if max_pos > 0 else 1.0))
+        if norm >= 0.8:
+            return "#00695C", "#FFFFFF", "bold"
+        if norm >= 0.6:
+            return "#00897B", "#FFFFFF", "bold"
+        if norm >= 0.4:
+            return "#4DB6AC", "#1A202C", "600"
+        if norm >= 0.2:
+            return "#80CBC4", "#1A202C", "normal"
+        return "#B2DFDB", "#1A202C", "normal"
+    else:
+        norm = min(1.0, abs(v) / (max_neg_mag if max_neg_mag > 0 else 1.0))
+        if norm >= 0.8:
+            return "#C62828", "#FFFFFF", "bold"
+        if norm >= 0.6:
+            return "#E53935", "#FFFFFF", "bold"
+        if norm >= 0.4:
+            return "#EF5350", "#FFFFFF", "600"
+        if norm >= 0.2:
+            return "#E57373", "#1A202C", "normal"
+        return "#FFCDD2", "#1A202C", "normal"
+
+
+def _get_thead(category_title: str = "CATEGORY", driver_title: str = "DRIVER") -> html.Thead:
+    hdr_row1 = html.Tr([
+        html.Th(category_title, rowSpan=2, className="sum-th-category"),
+        html.Th(driver_title, rowSpan=2, className="sum-th-driver"),
+        html.Th("Q1", colSpan=3, className="sum-th-quarter"),
+        html.Th("Q2", colSpan=3, className="sum-th-quarter"),
+        html.Th("Q3", colSpan=3, className="sum-th-quarter"),
+        html.Th("Q4", colSpan=3, className="sum-th-quarter sum-col-quarter-end"),
+        html.Th("TOTALS", colSpan=7, className="sum-th-total"),
+    ], className="sum-thead-tier1")
+
+    periods = ["Q1", "Q2", "Q3", "Q4", "FY", "YTD", "YTG"]
+    hdr_cells = []
+    for idx, m in enumerate(MONTHS):
+        cls = "sum-th-month sum-col-quarter-end" if idx in {2, 5, 8, 11} else "sum-th-month"
+        hdr_cells.append(html.Th(m, className=cls))
+
+    for p in periods:
+        cls = "sum-th-period sum-col-quarter-end" if p == "Q4" else "sum-th-period"
+        hdr_cells.append(html.Th(p, className=cls))
+
+    hdr_row2 = html.Tr(hdr_cells, className="sum-thead-tier2")
+    return html.Thead([hdr_row1, hdr_row2])
+
+
+def _render_styled_cell(
+    val: Optional[float],
+    max_pos: float,
+    max_neg_mag: float,
+    is_driver: bool,
+    decimals: int,
+    is_quarter_end: bool,
+    is_total: bool,
+) -> html.Td:
+    txt = fmt_variance_number(val, decimals=decimals, is_driver=is_driver)
+    base_cls = "sum-summary-cell" if is_total else "sum-num-cell"
+    cls_list = [base_cls]
+    if is_quarter_end:
+        cls_list.append("sum-col-quarter-end")
+
+    style_dict = {}
+    if is_driver and txt != "":
+        bg_col, txt_col, font_wt = get_variance_heatmap_style(val, max_pos, max_neg_mag)
+        style_dict = {"backgroundColor": bg_col, "color": txt_col, "fontWeight": font_wt}
+
+    return html.Td(txt, className=" ".join(cls_list), style=style_dict if style_dict else None)
+
+
+def build_variance_data_cells(
+    m_vals: List[Optional[float]],
+    totals: Dict[str, Optional[float]],
+    max_pos: float,
+    max_neg_mag: float,
+    is_driver: bool = True,
+    decimals: int = 2,
+) -> List[html.Td]:
+    cells = [
+        _render_styled_cell(
+            val, max_pos, max_neg_mag, is_driver, decimals,
+            is_quarter_end=(m_idx in {2, 5, 8, 11}), is_total=False
+        )
+        for m_idx, val in enumerate(m_vals)
+    ]
+    for col_name in ["Q1", "Q2", "Q3", "Q4", "FY", "YTD", "YTG"]:
+        val = totals.get(col_name) if totals else None
+        cells.append(
+            _render_styled_cell(
+                val, max_pos, max_neg_mag, is_driver, decimals,
+                is_quarter_end=(col_name == "Q4"), is_total=True
+            )
+        )
+    return cells
+
+
+def _build_placeholder_dash_cells() -> List[html.Td]:
+    cells = []
+    for m_idx in range(12):
+        cls_list = ["sum-num-cell"]
+        if m_idx in {2, 5, 8, 11}:
+            cls_list.append("sum-col-quarter-end")
+        cells.append(html.Td("-", className=" ".join(cls_list)))
+
+    for col_name in ["Q1", "Q2", "Q3", "Q4", "FY", "YTD", "YTG"]:
+        cls_list = ["sum-summary-cell"]
+        if col_name == "Q4":
+            cls_list.append("sum-col-quarter-end")
+        cells.append(html.Td("-", className=" ".join(cls_list)))
+    return cells
+
+
+def _render_grouped_driver_rows(
+    definitions: list,
+    drivers_dict: dict,
+    driver_totals_dict: dict,
+    max_pos: float,
+    max_neg_mag: float,
+    is_shipment: bool = False,
+) -> List[html.Tr]:
+    group_counts: Dict[str, int] = {}
+    for grp, _, _ in definitions:
+        group_counts[grp] = group_counts.get(grp, 0) + 1
+
+    seen_groups = set()
+    group_rows_counter: Dict[str, int] = {}
+    rows = []
+
+    for grp, driver_name, _ in definitions:
+        cells = []
+        if grp not in seen_groups:
+            seen_groups.add(grp)
+            group_rows_counter[grp] = 0
+            cells.append(html.Td(grp, rowSpan=group_counts[grp], className="sum-category-label"))
+
+        group_rows_counter[grp] += 1
+        is_last_in_group = (group_rows_counter[grp] == group_counts[grp])
+
+        is_sub = driver_name in SUB_DRIVERS and not is_shipment
+        driver_cls = CLASS_DRIVER_SUB if is_sub else "sum-driver-label"
+        cells.append(html.Td(driver_name, className=driver_cls))
+
+        d_vals = (
+            drivers_dict.get((grp, driver_name))
+            or drivers_dict.get(driver_name, [None] * 12)
+        )
+        d_totals = (
+            driver_totals_dict.get((grp, driver_name))
+            or driver_totals_dict.get(driver_name, {})
+        )
+
+        cells.extend(build_variance_data_cells(d_vals, d_totals, max_pos, max_neg_mag, is_driver=True, decimals=2))
+
+        row_cls = "sum-row-group-bottom" if is_last_in_group else None
+        rows.append(html.Tr(cells, className=row_cls))
+
+    return rows
+
+
+def _render_base_row_cells(data: Dict[str, Any], max_pos: float, max_neg_mag: float) -> List[html.Td]:
+    base_vals = data.get("base_row_vals") or [None] * 12
+    if any(v is not None for v in base_vals):
+        return build_variance_data_cells(
+            base_vals, data.get("totals_base", {}), max_pos, max_neg_mag, is_driver=False, decimals=2
+        )
+    return _build_placeholder_dash_cells()
+
+
+def _render_bp_missing_notice(plan_year: Any, domain: str) -> html.Div:
+    return html.Div(
+        className="p-5 bg-white rounded border text-center my-4",
+        style={"boxShadow": "0 1px 3px rgba(0, 0, 0, 0.05)", "maxWidth": "720px", "margin": "40px auto"},
+        children=[
+            html.I(className="bi bi-calendar-x text-warning fs-1 mb-3 d-block"),
+            html.H5(f"No {domain.title()} BP Snapshot Found for {plan_year}", className="fw-bold text-dark mb-2"),
+            html.P(
+                f"There is no locked BP snapshot recorded for planning year {plan_year}. "
+                "Switch back to IBP to compare Current Cycle vs Prior Cycle.",
+                className="text-muted mb-0",
+                style={"fontSize": "13px"},
+            ),
+        ],
+    )
+
+
+def render_consumption_variance_table(data: Dict[str, Any]) -> html.Div:
+    if data.get("bp_missing"):
+        return _render_bp_missing_notice(data.get("plan_year"), "Consumption")
+
+    drivers_dict = data.get("drivers", {})
+    driver_totals_dict = data.get("driver_totals", {})
+    max_pos = data.get("max_pos", 1.0)
+    max_neg_mag = data.get("max_neg_mag", 1.0)
+
+    thead = _get_thead(category_title="CATEGORY", driver_title="DRIVER")
+    tbody_rows = [
+        html.Tr([
+            html.Td("", className="sum-category-label"),
+            html.Td(str(data.get("label_base") or data.get("base_year", "Base")), className=CLASS_ROW_YEAR_LABEL),
+            *_render_base_row_cells(data, max_pos, max_neg_mag),
+        ], className="sum-row-base")
     ]
 
-    # 2. Plan Year Driver Variances (Current plan_year - Baseline plan_year)
-    drivers, has_plan_baseline = load_consumption_variance_drivers(models, plan_year, comparison_mode=mode)
-    for d_name, d_vals in list(drivers.items()):
-        drivers[d_name] = [
-            round(v, 9) if (v is not None and not (isinstance(v, float) and math.isnan(v))) else None
-            for v in d_vals
-        ]
+    tbody_rows.extend(_render_grouped_driver_rows(
+        CONSUMPTION_VARIANCE_DRIVER_DEFINITIONS, drivers_dict, driver_totals_dict, max_pos, max_neg_mag, is_shipment=False
+    ))
 
-    # 3. Plan Year Bottom Row (Sum of all active parent building blocks)
-    plan_monthly_tot = [0.0] * 12
-    plan_has_month = [False] * 12
-    for d_name in CONSUMPTION_PARENT_DRIVER_NAMES:
-        d_vals = drivers.get(d_name, [None] * 12)
-        for i in range(12):
-            if d_vals[i] is not None:
-                plan_monthly_tot[i] += d_vals[i]
-                plan_has_month[i] = True
+    plan_lbl = str(data.get("label_plan") or data.get("plan_year") or "Plan")
+    tbody_rows.append(html.Tr([
+        html.Td("", className="sum-category-label"),
+        html.Td(plan_lbl, className=CLASS_ROW_YEAR_LABEL),
+        *build_variance_data_cells(
+            data.get("plan_row_vals", [None] * 12), data.get("totals_plan", {}), max_pos, max_neg_mag, is_driver=False, decimals=2
+        ),
+    ], className="sum-row-active"))
 
-    pos_plan_variance = [
-        round(plan_monthly_tot[i], 9) if plan_has_month[i] else None
-        for i in range(12)
+    return html.Div(
+        [html.Table([thead, html.Tbody(tbody_rows)], className="summary-table")],
+        className="summary-grid-card"
+    )
+
+
+def render_shipment_variance_table(data: Dict[str, Any]) -> html.Div:
+    if data.get("bp_missing"):
+        return _render_bp_missing_notice(data.get("plan_year"), "Shipment")
+
+    drivers_dict = data.get("drivers", {})
+    driver_totals_dict = data.get("driver_totals", {})
+    max_pos = data.get("max_pos", 1.0)
+    max_neg_mag = data.get("max_neg_mag", 1.0)
+
+    thead = _get_thead(category_title="CATEGORY", driver_title="DRIVER")
+    tbody_rows = [
+        html.Tr([
+            html.Td("", className="sum-category-label"),
+            html.Td(str(data.get("label_base") or data.get("base_year", "Base")), className=CLASS_ROW_YEAR_LABEL),
+            *_render_base_row_cells(data, max_pos, max_neg_mag),
+        ], className="sum-row-base")
     ]
 
-    totals_base = calc_variance_totals(pos_base_variance, cutoff_month)
-    totals_plan = calc_variance_totals(pos_plan_variance, cutoff_month)
+    tbody_rows.extend(_render_grouped_driver_rows(
+        SHIPMENT_VARIANCE_DRIVER_DEFINITIONS, drivers_dict, driver_totals_dict, max_pos, max_neg_mag, is_shipment=True
+    ))
 
-    driver_totals = {
-        disp_name: calc_variance_totals(drivers.get(disp_name, [None] * 12), cutoff_month)
-        for _, disp_name, _ in CONSUMPTION_VARIANCE_DRIVER_DEFINITIONS
-    }
+    plan_lbl = str(data.get("label_plan") or data.get("plan_year") or "Plan")
+    tbody_rows.append(html.Tr([
+        html.Td("", className="sum-category-label"),
+        html.Td(plan_lbl, className=CLASS_ROW_YEAR_LABEL),
+        *build_variance_data_cells(
+            data.get("plan_row_vals", [None] * 12), data.get("totals_plan", {}), max_pos, max_neg_mag, is_driver=False, decimals=2
+        ),
+    ], className="sum-row-active"))
 
-    max_pos, max_neg_mag = calculate_driver_heatmap_ranges(drivers, driver_totals)
-
-    return {
-        "comparison_mode": mode,
-        "bp_missing": (mode == "BP" and not has_plan_baseline),
-        "base_year": base_year,
-        "plan_year": plan_year,
-        "label_base": str(base_year),
-        "label_plan": str(plan_year),
-        "cutoff_month": cutoff_month,
-        "models": models,
-        "base_row_vals": pos_base_variance,
-        "totals_base": totals_base,
-        "plan_row_vals": pos_plan_variance,
-        "totals_plan": totals_plan,
-        "drivers": drivers,
-        "driver_totals": driver_totals,
-        "max_pos": max_pos,
-        "max_neg_mag": max_neg_mag,
-    }
+    return html.Div(
+        [html.Table([thead, html.Tbody(tbody_rows)], className="summary-table")],
+        className="summary-grid-card"
+    )
 
 
-# ─── 2. Shipment Variance Calculation Engine ─────────────────────────────────
+def render_variance_matrix_table(
+    data: Dict[str, Any], domain: str = "CONSUMPTION", model_name: str = ""
+) -> html.Div:
+    """Master entry point for rendering the active variance dashboard matrix."""
+    if not data or not data.get("plan_year"):
+        return html.Div(html.P("No variance data loaded.", className="text-muted p-4 text-center"), className="summary-grid-card")
 
-def compute_shipment_variance_matrix(
-    models: Union[str, List[str]], comparison_mode: str = "IBP"
-) -> Dict[str, Any]:
-    """
-    Computes Shipment Variance Matrix for IBP (Current - Prior) or BP (Current - Annual BP).
-    """
-    mode = (comparison_mode or "IBP").upper()
-    base_year, plan_year = get_active_years()
-    snap_info = get_cycle_snapshot_ids(plan_year)
-    cutoff_month = _resolve_cutoff_month(snap_info.active_cycle_month)
-
-    # 1. Base Year Shipment Variance
-    base_year_drivers, _ = load_shipment_variance_drivers(models, base_year, comparison_mode=mode)
-    base_monthly_tot = [0.0] * 12
-    base_has_month = [False] * 12
-    for grp, disp_name, _ in SHIPMENT_VARIANCE_DRIVER_DEFINITIONS:
-        d_vals = base_year_drivers.get((grp, disp_name)) or base_year_drivers.get(disp_name, [None] * 12)
-        for i in range(12):
-            if d_vals[i] is not None:
-                base_monthly_tot[i] += d_vals[i]
-                base_has_month[i] = True
-
-    ship_base_variance = [
-        round(base_monthly_tot[i], 9) if base_has_month[i] else None
-        for i in range(12)
-    ]
-
-    # 2. Plan Year Shipment Driver Variances
-    drivers, has_plan_baseline = load_shipment_variance_drivers(models, plan_year, comparison_mode=mode)
-    plan_monthly_tot = [0.0] * 12
-    plan_has_month = [False] * 12
-    driver_totals = {}
-    for grp, disp_name, _ in SHIPMENT_VARIANCE_DRIVER_DEFINITIONS:
-        d_vals = drivers.get((grp, disp_name)) or drivers.get(disp_name, [None] * 12)
-        for i in range(12):
-            if d_vals[i] is not None:
-                plan_monthly_tot[i] += d_vals[i]
-                plan_has_month[i] = True
-
-        tot = calc_variance_totals(d_vals, cutoff_month)
-        driver_totals[disp_name] = tot
-        driver_totals[(grp, disp_name)] = tot
-        driver_totals[f"{grp}_{disp_name}"] = tot
-
-    # 3. Plan Year Bottom Row
-    ship_plan_variance = [
-        round(plan_monthly_tot[i], 9) if plan_has_month[i] else None
-        for i in range(12)
-    ]
-
-    totals_base = calc_variance_totals(ship_base_variance, cutoff_month)
-    totals_plan = calc_variance_totals(ship_plan_variance, cutoff_month)
-
-    plain_drivers = {disp: drivers.get(disp, [None] * 12) for _, disp, _ in SHIPMENT_VARIANCE_DRIVER_DEFINITIONS}
-    max_pos, max_neg_mag = calculate_driver_heatmap_ranges(plain_drivers, driver_totals)
-
-    return {
-        "comparison_mode": mode,
-        "bp_missing": (mode == "BP" and not has_plan_baseline),
-        "base_year": base_year,
-        "plan_year": plan_year,
-        "label_base": str(base_year),
-        "label_plan": str(plan_year),
-        "cutoff_month": cutoff_month,
-        "models": models,
-        "base_row_vals": ship_base_variance,
-        "totals_base": totals_base,
-        "plan_row_vals": ship_plan_variance,
-        "totals_plan": totals_plan,
-        "drivers": drivers,
-        "driver_totals": driver_totals,
-        "max_pos": max_pos,
-        "max_neg_mag": max_neg_mag,
-    }
+    dom = domain.upper()
+    if dom in ["SHIPMENT", "SHIPMENT VARIANCE"]:
+        return render_shipment_variance_table(data)
+    return render_consumption_variance_table(data)
