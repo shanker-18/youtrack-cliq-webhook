@@ -1,978 +1,879 @@
-# pylint: disable=too-many-lines,too-many-locals,too-many-branches,broad-except
+# pylint: disable=too-many-lines,too-many-return-statements,too-many-locals,broad-except
 """
-NA IBP Planning Application — Variance Dashboard Page
-=====================================================
-Route: /variance
-Pure Python Dash Implementation aligned with Planning, Validation & Summary Design System:
-- Top Brand Accent Multi-Color Bar & Navigation Bar with Page Switcher
-- Left Sidebar: Compact 140px Dock with 2 Domain Tiles (Consumption, Shipment)
-- Top Horizon Bar above Workbench: [Squad] -> Peach [Model] -> [Compare: IBP / BP]
-- Default comparison mode on load: IBP
+NA IBP Planning Application — Variance Dashboard Callbacks
+==========================================================
+Handles all interactive callbacks for the Variance Dashboard:
+- 2-Domain card toggling (Consumption Variance, Shipment Variance) in Left Sidebar
+- Baseline comparison mode selector (IBP [default] vs BP) next to Model
+- Cascading hierarchy in native Dash HTML (Squad -> Peach Model) governed by active AD Group
+- Pure HTML dropdown menu toggles via fast clientside callback (<1ms)
 """
 
-from datetime import date
-from typing import Optional, Dict, List, Any, Tuple, Set
-from flask import has_request_context, request
+from typing import Optional, Dict, Any, List, Tuple
 import psycopg2
-import dash
-from dash import html, dcc
-import dash_bootstrap_components as dbc
+from dash import callback, clientside_callback, Output, Input, State, callback_context, no_update, html, ALL
 
-from auth.session import get_current_user, is_authenticated
-from config import config
-from services.kv_calendar import KenvueCalendar
-from repositories.hierarchy_repository import get_squads_by_gbu, get_models_by_squad
+from services.variance_calculations import (
+    compute_consumption_variance_matrix,
+    compute_shipment_variance_matrix,
+)
+from repositories.hierarchy_repository import (
+    get_squads_by_gbu,
+    get_models_by_squad,
+)
 from repositories.security_repository import get_ad_group_mapping
 from callbacks.filter_callbacks import AD_PERSONAS
-from components.header import render_workbench_header
-from components.summary_grid import render_summary_loading_skeleton
-
-VARIANCE_ROUTE = "/variance"
-
-dash.register_page(__name__, path=VARIANCE_ROUTE, title="Variance Dashboard — NA IBP Planning")
-
-_COLOR_TRUST_GREEN = "var(--trust-green, #019881)"
-_FONT_SIZE_SM_11_5 = "11.5px"
-DEFAULT_SQUAD_LABEL = "Select Squad"
-DEFAULT_MODEL_LABEL = "Select Model"
-DEFAULT_BODY_CARE = "Body Care"
-CLASS_TILE_INACTIVE = "val-tile-stacked inactive-domain"
-BG_GREEN_50 = "var(--green-50, #E6F5F2)"
-ICON_CHECKBOX_UNCHECKED = "bi bi-square"
-ICON_CHECKBOX_CHECKED = "bi bi-check-square-fill"
-
-TILE_BASE_STYLE = {
-    "display": "flex",
-    "flexDirection": "column",
-    "alignItems": "center",
-    "justifyContent": "center",
-    "padding": "10px 4px",
-    "borderRadius": "8px",
-    "cursor": "pointer",
-    "userSelect": "none",
-    "transition": "all 0.15s ease",
-    "minHeight": "62px",
-    "width": "100%",
-    "textAlign": "center",
-    "fontFamily": "'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif",
-}
-
-TILE_ACTIVE_STYLE = {
-    **TILE_BASE_STYLE,
-    "backgroundColor": _COLOR_TRUST_GREEN,
-    "color": "#ffffff",
-    "border": f"1.5px solid {_COLOR_TRUST_GREEN}",
-    "boxShadow": "0 2px 8px rgba(1, 152, 129, 0.25)",
-}
-
-TILE_INACTIVE_STYLE = {
-    **TILE_BASE_STYLE,
-    "backgroundColor": "#ffffff",
-    "color": "var(--b700, #424242)",
-    "border": "1.5px solid var(--b40, #E0E0E0)",
-    "boxShadow": "none",
-}
-
-
-# ─── Pure HTML Dropdown Menu Builders ─────────────────────────────────────────
-
-def build_var_mode_menu_items(active_mode: str = "IBP") -> list:
-    """Build pure HTML dropdown menu items for IBP vs BP baseline selection."""
-    active = (active_mode or "IBP").upper()
-    options = [
-        ("IBP", "IBP (Prior Cycle)", "Current Cycle - Prior Cycle"),
-        ("BP",  "BP (Annual Plan)",  "Current Cycle - Annual BP"),
-    ]
-    items = [
-        html.Div(
-            "Variance Baseline",
-            className="sidebar-dropdown-header",
-            style={
-                "padding": "6px 12px",
-                "fontSize": "10px",
-                "fontWeight": "700",
-                "color": _COLOR_TRUST_GREEN,
-                "textTransform": "uppercase",
-                "background": BG_GREEN_50,
-                "letterSpacing": "0.05em",
-                "borderBottom": "1px solid var(--green-100, #B0DFD8)",
-            },
-        )
-    ]
-    for mode_key, title, desc in options:
-        is_sel = (mode_key == active)
-        items.append(
-            html.Div(
-                className="sidebar-dropdown-item",
-                id={"type": "var-mode-select-item", "mode": mode_key},
-                n_clicks=0,
-                style={
-                    "padding": "8px 14px",
-                    "cursor": "pointer",
-                    "backgroundColor": "#F4FBF9" if is_sel else "#ffffff",
-                    "display": "flex",
-                    "alignItems": "center",
-                    "justifyContent": "space-between",
-                    "gap": "10px",
-                    "transition": "background 0.15s ease",
-                },
-                children=[
-                    html.Div([
-                        html.Div(
-                            title,
-                            style={
-                                "fontSize": "12.5px",
-                                "color": "#1A202C" if is_sel else "#4A5568",
-                                "fontWeight": "700" if is_sel else "500",
-                            },
-                        ),
-                        html.Div(desc, style={"fontSize": "10.5px", "color": "#6c757d"}),
-                    ]),
-                    html.I(className="bi bi-check2", style={"color": "#019881", "fontSize": "14px"}) if is_sel else html.Span(),
-                ],
-            )
-        )
-    return items
-
-
-def _render_ad_switcher_item(key: str, name: str, sub: str, is_active: bool) -> html.Div:
-    cls = "header-dropdown-item active" if is_active else "header-dropdown-item"
-    children = [
-        html.Div([
-            html.Strong(name),
-            html.Br(),
-            html.Small(sub, className="text-muted"),
-        ])
-    ]
-    if is_active:
-        children.append(html.I(className="bi bi-check2"))
-    return html.Div(
-        className=cls,
-        id={"type": "var-ad-select-item", "key": key},
-        n_clicks=0,
-        children=children,
-    )
-
-
-def _build_ad_switcher_from_db(db_mappings: list, active_key: str) -> list:
-    items = []
-    for m in db_mappings:
-        group_key = m["ad_group_name"]
-        perm = m.get("permission", "EDIT")
-        name = m.get("display_name") or group_key
-        sub = f"Role: {perm.title()}"
-        items.append(_render_ad_switcher_item(group_key, name, sub, group_key == active_key))
-    return items
-
-
-def _build_ad_switcher_from_personas(active_key: str) -> list:
-    items = []
-    for key, p in AD_PERSONAS.items():
-        sub = f"{p['role_label']} ({p['gbu_label']})"
-        items.append(_render_ad_switcher_item(key, p["name"], sub, key == active_key))
-    return items
-
-
-def build_var_ad_switcher_menu_items(active_key: str = "COM-APP-NA-IBP-SELFCARE") -> list:
-    curr_user = get_current_user() or {}
-    user_groups = curr_user.get("all_ad_groups", [])
-
-    try:
-        from repositories.security_repository import get_all_ad_group_mappings, get_user_ad_group_mappings
-        if user_groups:
-            db_mappings = get_user_ad_group_mappings(user_groups)
-        else:
-            db_mappings = get_all_ad_group_mappings()
-    except (psycopg2.Error, KeyError, ValueError):
-        db_mappings = None
-
-    header_title = "Active AD Group" if user_groups else "Simulate AD Group"
-    items = [html.Div(header_title, className="header-dropdown-header")]
-    if db_mappings:
-        items.extend(_build_ad_switcher_from_db(db_mappings, active_key))
-    else:
-        items.extend(_build_ad_switcher_from_personas(active_key))
-    return items
-
-
-def format_var_squad_pill_label(selected_squads: str | list[str], total_squads: int = 0) -> str:
-    if not selected_squads:
-        return DEFAULT_SQUAD_LABEL
-    if isinstance(selected_squads, str):
-        return selected_squads.title()
-    clean_squads = [str(s) for s in selected_squads if s and str(s) != DEFAULT_SQUAD_LABEL]
-    if not clean_squads:
-        return DEFAULT_SQUAD_LABEL
-    if len(clean_squads) == 1:
-        return clean_squads[0].title()
-    if 0 < total_squads <= len(clean_squads):
-        return f"All Squads ({total_squads})"
-    return f"{len(clean_squads)} Squads Selected"
-
-
-def _render_var_squad_item(s: dict, is_checked: bool) -> html.Div:
-    s_name = s["squad_name"]
-    disp_name = s.get("display_name", s_name.title())
-    check_icon = ICON_CHECKBOX_CHECKED if is_checked else ICON_CHECKBOX_UNCHECKED
-    check_color = "#019881" if is_checked else "#adb5bd"
-
-    return html.Div(
-        className="sidebar-dropdown-item",
-        id={"type": "var-squad-select-item", "name": s_name, "disp": disp_name},
-        n_clicks=0,
-        style={
-            "padding": "7px 14px",
-            "cursor": "pointer",
-            "backgroundColor": "#F4FBF9" if is_checked else "#ffffff",
-            "display": "flex",
-            "alignItems": "center",
-            "justifyContent": "flex-start",
-            "gap": "10px",
-            "transition": "background 0.15s ease",
-        },
-        children=[
-            html.I(className=check_icon, style={"color": check_color, "fontSize": "14px"}),
-            html.Span(
-                disp_name,
-                style={
-                    "fontSize": "12.5px",
-                    "color": "#1A202C" if is_checked else "#4A5568",
-                    "fontWeight": "600" if is_checked else "400",
-                },
-            ),
-        ],
-    )
-
-
-def _build_var_squad_header(is_all_selected: bool, selected_count: int, total_count: int) -> html.Div:
-    return html.Div(
-        className="d-flex align-items-center justify-content-between px-3 py-2 border-bottom user-select-none",
-        style={
-            "background": BG_GREEN_50,
-            "fontSize": _FONT_SIZE_SM_11_5,
-            "fontWeight": "600",
-            "color": "var(--green-800, #004D40)",
-        },
-        children=[
-            html.Div(
-                id={"type": "var-squad-action", "action": "select-all"},
-                className="d-flex align-items-center gap-2",
-                n_clicks=0,
-                style={"cursor": "pointer", "color": "#019881" if is_all_selected else "#495057"},
-                children=[
-                    html.I(
-                        className=ICON_CHECKBOX_CHECKED if is_all_selected else ICON_CHECKBOX_UNCHECKED,
-                        style={"color": "#019881" if is_all_selected else "#adb5bd", "fontSize": "13px"},
-                    ),
-                    html.Span("Select All"),
-                ],
-            ),
-            html.Span(f"{selected_count}/{total_count} selected", style={"color": "#6c757d", "fontSize": "11px", "fontWeight": "500"}),
-        ],
-    )
-
-
-def _build_var_squad_footer(selected_count: int) -> html.Div:
-    return html.Div(
-        className="d-flex align-items-center justify-content-between px-3 py-2 border-top bg-light",
-        children=[
-            html.Span(
-                f"{selected_count} selected",
-                id="var-squad-dropdown-count",
-                style={"fontSize": _FONT_SIZE_SM_11_5, "color": "#495057", "fontWeight": "600"},
-            ),
-            html.Div(
-                className="d-flex gap-2",
-                children=[
-                    html.Button(
-                        "Reset",
-                        id={"type": "var-squad-action", "action": "reset"},
-                        className="btn btn-sm btn-outline-secondary",
-                        style={"fontSize": "11px", "padding": "2px 10px", "borderRadius": "4px", "fontWeight": "500"},
-                        n_clicks=0,
-                    ),
-                    html.Button(
-                        "Apply",
-                        id={"type": "var-squad-action", "action": "apply"},
-                        className="btn btn-sm text-white",
-                        style={
-                            "fontSize": "11px",
-                            "padding": "2px 16px",
-                            "backgroundColor": "#019881",
-                            "borderColor": "#019881",
-                            "fontWeight": "600",
-                            "borderRadius": "4px",
-                        },
-                        n_clicks=0,
-                    ),
-                ],
-            ),
-        ],
-    )
-
-
-def _build_var_gbu_squad_rows(gbus: Dict[str, list], active_set: Set[str]) -> list:
-    squad_rows = []
-    for gbu_name, gbu_squads in gbus.items():
-        squad_rows.append(
-            html.Div(
-                children=[html.I(className="bi bi-diagram-3 me-1"), gbu_name],
-                className="sidebar-dropdown-header",
-                style={
-                    "padding": "5px 12px",
-                    "fontSize": "10px",
-                    "fontWeight": "700",
-                    "color": _COLOR_TRUST_GREEN,
-                    "textTransform": "uppercase",
-                    "background": BG_GREEN_50,
-                    "letterSpacing": "0.05em",
-                    "borderBottom": "1px solid var(--green-100, #B0DFD8)",
-                },
-            )
-        )
-        for s in gbu_squads:
-            is_checked = s.get("squad_name", "").upper() in active_set
-            squad_rows.append(_render_var_squad_item(s, is_checked))
-    return squad_rows
-
-
-def build_var_squad_menu_items(squads: list, active_squad_name: str | list[str] = "BODY CARE") -> list:
-    if not squads:
-        return [html.Div("No squads available", className="p-3 text-center text-muted small")]
-
-    total_count = len(squads)
-    if isinstance(active_squad_name, str):
-        active_set = {active_squad_name.upper()} if active_squad_name and active_squad_name != DEFAULT_SQUAD_LABEL else set()
-    elif isinstance(active_squad_name, (list, tuple, set)):
-        active_set = {str(s).upper() for s in active_squad_name if s and str(s) != DEFAULT_SQUAD_LABEL}
-    else:
-        active_set = set()
-
-    selected_count = sum(1 for s in squads if s.get("squad_name", "").upper() in active_set)
-    is_all_selected = (selected_count == total_count) if total_count > 0 else False
-
-    gbus: Dict[str, list] = {}
-    for s in squads:
-        gbu = s.get("gbu", "ALL")
-        gbus.setdefault(gbu, []).append(s)
-
-    header_elem = _build_var_squad_header(is_all_selected, selected_count, total_count)
-    body_elem = html.Div(
-        id="var-squad-dropdown-body",
-        className="val-squad-dropdown-body",
-        style={"maxHeight": "260px", "overflowY": "auto", "padding": "4px 0"},
-        children=_build_var_gbu_squad_rows(gbus, active_set),
-    )
-    footer_elem = _build_var_squad_footer(selected_count)
-    return [header_elem, body_elem, footer_elem]
-
-
-def format_var_model_pill_label(selected_models: str | list[str], total_models: int = 0) -> str:
-    if not selected_models:
-        return DEFAULT_MODEL_LABEL
-    if isinstance(selected_models, str):
-        return selected_models
-    if len(selected_models) == 1:
-        return selected_models[0]
-    if 0 < total_models <= len(selected_models):
-        return f"All Models ({total_models})"
-    return f"{len(selected_models)} Models Selected"
-
-
-def _render_var_model_item(m: dict, is_checked: bool) -> html.Div:
-    m_id = m.get("model_id") if m.get("model_id") is not None else 0
-    m_name = m.get("model_name", str(m))
-    check_icon = ICON_CHECKBOX_CHECKED if is_checked else ICON_CHECKBOX_UNCHECKED
-    check_color = "#019881" if is_checked else "#adb5bd"
-
-    return html.Div(
-        className="sidebar-dropdown-item",
-        id={"type": "var-model-select-item", "id": m_id, "name": m_name},
-        n_clicks=0,
-        style={
-            "padding": "7px 14px",
-            "cursor": "pointer",
-            "backgroundColor": "#F4FBF9" if is_checked else "#ffffff",
-            "display": "flex",
-            "alignItems": "center",
-            "justifyContent": "flex-start",
-            "gap": "10px",
-            "transition": "background 0.15s ease",
-        },
-        children=[
-            html.I(className=check_icon, style={"color": check_color, "fontSize": "14px"}),
-            html.Span(
-                m_name,
-                style={
-                    "fontSize": "12.5px",
-                    "color": "#1A202C" if is_checked else "#4A5568",
-                    "fontWeight": "600" if is_checked else "400",
-                },
-            ),
-        ],
-    )
-
-
-def _build_var_model_header(is_all_selected: bool, selected_count: int, total_count: int) -> html.Div:
-    return html.Div(
-        className="d-flex align-items-center justify-content-between px-3 py-2 border-bottom user-select-none",
-        style={
-            "background": BG_GREEN_50,
-            "fontSize": _FONT_SIZE_SM_11_5,
-            "fontWeight": "600",
-            "color": "var(--green-800, #004D40)",
-        },
-        children=[
-            html.Div(
-                id={"type": "var-model-action", "action": "select-all"},
-                className="d-flex align-items-center gap-2",
-                n_clicks=0,
-                style={"cursor": "pointer", "color": "#019881" if is_all_selected else "#495057"},
-                children=[
-                    html.I(
-                        className=ICON_CHECKBOX_CHECKED if is_all_selected else ICON_CHECKBOX_UNCHECKED,
-                        style={"color": "#019881" if is_all_selected else "#adb5bd", "fontSize": "13px"},
-                    ),
-                    html.Span("Select All"),
-                ],
-            ),
-            html.Span(f"{selected_count}/{total_count} selected", style={"color": "#6c757d", "fontSize": "11px", "fontWeight": "500"}),
-        ],
-    )
-
-
-def _build_var_model_footer(selected_count: int) -> html.Div:
-    return html.Div(
-        className="d-flex align-items-center justify-content-between px-3 py-2 border-top bg-light",
-        children=[
-            html.Span(
-                f"{selected_count} selected",
-                id="var-model-dropdown-count",
-                style={"fontSize": _FONT_SIZE_SM_11_5, "color": "#495057", "fontWeight": "600"},
-            ),
-            html.Div(
-                className="d-flex gap-2",
-                children=[
-                    html.Button(
-                        "Reset",
-                        id={"type": "var-model-action", "action": "reset"},
-                        className="btn btn-sm btn-outline-secondary",
-                        style={"fontSize": "11px", "padding": "2px 10px", "borderRadius": "4px", "fontWeight": "500"},
-                        n_clicks=0,
-                    ),
-                    html.Button(
-                        "Apply",
-                        id={"type": "var-model-action", "action": "apply"},
-                        className="btn btn-sm text-white",
-                        style={
-                            "fontSize": "11px",
-                            "padding": "2px 16px",
-                            "backgroundColor": "#019881",
-                            "borderColor": "#019881",
-                            "fontWeight": "600",
-                            "borderRadius": "4px",
-                        },
-                        n_clicks=0,
-                    ),
-                ],
-            ),
-        ],
-    )
-
-
-def _build_var_squad_model_rows(models: list, active_set: Set[str]) -> list:
-    squad_groups: Dict[str, list] = {}
-    for m in models:
-        sq = m.get("squad_name") or m.get("primary_need_state") or "Other"
-        squad_groups.setdefault(sq, []).append(m)
-
-    has_squad_headers = len(squad_groups) > 1 or (len(squad_groups) == 1 and "Other" not in squad_groups)
-    model_rows = []
-
-    for sq_name, sq_models in squad_groups.items():
-        if has_squad_headers:
-            model_rows.append(
-                html.Div(
-                    children=[html.I(className="bi bi-diagram-3 me-1"), sq_name.title()],
-                    className="sidebar-dropdown-header",
-                    style={
-                        "padding": "5px 12px",
-                        "fontSize": "10px",
-                        "fontWeight": "700",
-                        "color": _COLOR_TRUST_GREEN,
-                        "textTransform": "uppercase",
-                        "background": BG_GREEN_50,
-                        "letterSpacing": "0.05em",
-                        "borderBottom": "1px solid var(--green-100, #B0DFD8)",
-                    },
-                )
-            )
-
-        for m in sq_models:
-            m_name = m.get("model_name", str(m))
-            is_checked = m_name.upper() in active_set
-            model_rows.append(_render_var_model_item(m, is_checked))
-    return model_rows
-
-
-def build_var_model_menu_items(
-    models: list,
-    active_model_name: str | list[str] = DEFAULT_BODY_CARE,
-    has_squad: bool = True,
-) -> list:
-    if not models:
-        empty_prompt = (
-            "No models available for this domain"
-            if has_squad
-            else "Please select a squad first to view available models."
-        )
-        return [html.Div(empty_prompt, className="p-3 text-center text-muted small")]
-
-    total_count = len(models)
-    if isinstance(active_model_name, str):
-        active_set = {active_model_name.upper()} if active_model_name and active_model_name != DEFAULT_MODEL_LABEL else set()
-    elif isinstance(active_model_name, (list, tuple, set)):
-        active_set = {str(m).upper() for m in active_model_name if m and str(m) != DEFAULT_MODEL_LABEL}
-    else:
-        active_set = set()
-
-    selected_count = sum(1 for m in models if m.get("model_name", "").upper() in active_set)
-    is_all_selected = (selected_count == total_count) if total_count > 0 else False
-
-    header_elem = _build_var_model_header(is_all_selected, selected_count, total_count)
-    body_elem = html.Div(
-        id="var-model-dropdown-body",
-        className="val-model-dropdown-body",
-        style={"maxHeight": "240px", "overflowY": "auto", "padding": "4px 0"},
-        children=_build_var_squad_model_rows(models, active_set),
-    )
-    footer_elem = _build_var_model_footer(selected_count)
-    return [header_elem, body_elem, footer_elem]
-
-
-def render_empty_domain_alert(model_name: str, domain: str) -> html.Div:
-    return html.Div(
-        className="p-5 bg-white rounded border text-center my-4",
-        style={"boxShadow": "0 1px 3px rgba(0, 0, 0, 0.05)", "maxWidth": "720px", "margin": "40px auto"},
-        children=[
-            html.I(className="bi bi-exclamation-triangle text-warning fs-1 mb-3 d-block"),
-            html.H5(f"No {domain.title()} Variance Data for '{model_name}'", className="fw-bold text-dark mb-2"),
-            html.P(
-                [
-                    f"The model '{model_name}' has no building block changes recorded.",
-                    html.Br(),
-                    "Please select another model from the Model dropdown above.",
-                ],
-                className="text-muted mb-0",
-                style={"fontSize": "13px"},
-            ),
-        ],
-    )
-
-
-def render_empty_selection_card(empty_type: str = "model", domain: str = "CONSUMPTION") -> html.Div:
-    domain_title = (domain or "CONSUMPTION").title()
-    if empty_type == "squad":
-        icon_class = "bi bi-diagram-3 text-secondary fs-1 mb-3 d-block"
-        title_text = "No Squad Selected"
-        desc_text = "Please select one or more squads above to view available models and variance data."
-    else:
-        icon_class = "bi bi-grid-3x3 text-secondary fs-1 mb-3 d-block"
-        title_text = "No Model Selected"
-        desc_text = f"Please select one or more models from the Model dropdown above to view {domain_title} Variance data."
-
-    return html.Div(
-        className="p-5 bg-white rounded border text-center my-4",
-        style={"boxShadow": "0 1px 3px rgba(0, 0, 0, 0.05)", "maxWidth": "720px", "margin": "40px auto"},
-        children=[
-            html.I(className=icon_class),
-            html.H5(title_text, className="fw-bold text-dark mb-2"),
-            html.P(desc_text, className="text-muted mb-0", style={"fontSize": "13px"}),
-        ],
-    )
-
-
-# ─── Page Layout ──────────────────────────────────────────────────────────────
-
-def _handle_variance_auth_redirect() -> Optional[dcc.Location]:
-    if not has_request_context():
-        return None
-
-    if not is_authenticated():
-        if config.FLASK_ENV == "development":
-            from auth.routes import establish_local_dev_session
-            establish_local_dev_session()
-        else:
-            target_path = VARIANCE_ROUTE
-            if request.query_string:
-                target_path = f"{request.path}?{request.query_string.decode('utf-8')}"
-            return dcc.Location(href=f"/auth/login?next={target_path}", id="variance-auth-redirect", refresh=True)
-
-    curr_user = get_current_user() or {}
-    if not curr_user.get("ad_group"):
-        return dcc.Location(href="/unauthorized", id="variance-unauth-redirect", refresh=True)
-    return None
-
-
-def _resolve_variance_user_identity(user: dict, persona: dict) -> Tuple[str, str]:
+from components.variance_grid import render_variance_matrix_table
+from pages.variance import (
+    build_var_ad_switcher_menu_items,
+    build_var_squad_menu_items,
+    build_var_model_menu_items,
+    build_var_mode_menu_items,
+    format_var_squad_pill_label,
+    format_var_model_pill_label,
+    render_empty_selection_card,
+    TILE_ACTIVE_STYLE,
+    TILE_INACTIVE_STYLE,
+)
+
+from utils.constants import GBU_PAIN_CARE
+from utils.logger import get_logger
+from auth.session import get_current_user, set_user_session
+
+logger = get_logger(__name__)
+
+_SELECT_MODEL = "Select Model"
+_SELECT_SQUAD = "Select Squad"
+
+
+def _build_variance_user_identity_elem(persona_email: str) -> list:
+    user = get_current_user() or {}
     user_name = user.get("display_name", "")
-    user_email = user.get("email", "")
+    user_email = user.get("email") or persona_email
     if not user_name and user_email:
         user_name = user_email.split("@")[0].replace(".", " ").title()
     elif not user_name:
         user_name = "User"
-    if not user_email:
-        user_email = persona["email"]
-    return user_name, user_email
+    return [
+        html.Span(user_name, className="fw-bold text-dark lh-sm", style={"fontSize": "12px"}),
+        html.Span(user_email, className="text-muted lh-sm", style={"fontSize": "11px"}),
+    ]
 
 
-def _get_initial_gbu_codes(initial_persona_key: str, persona: dict) -> list:
+_VAR_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def clear_variance_cache() -> None:
+    _VAR_CACHE.clear()
+
+
+# ─── 0. Pure HTML Dropdown Menu Open/Close State Manager (Clientside) ─────────
+
+clientside_callback(
+    """
+    function(n_ad, n_squad, n_model, n_mode,
+             ad_clicks, squad_clicks, model_clicks, mode_clicks,
+             action_clicks, squad_action_clicks, currentOpen) {
+
+        var MENU_MAP = {
+            "btn-var-ad-group-switcher": { key: "ad",    menuId: "menu-var-ad-switcher", baseCls: "header-dropdown-menu" },
+            "pill-var-squad":            { key: "squad", menuId: "menu-var-squad",       baseCls: "sidebar-dropdown-menu" },
+            "pill-var-model":            { key: "model", menuId: "menu-var-model",       baseCls: "sidebar-dropdown-menu" },
+            "pill-var-mode":             { key: "mode",  menuId: "menu-var-mode",        baseCls: "sidebar-dropdown-menu" }
+        };
+
+        var ALL_MENUS = [
+            { id: "menu-var-ad-switcher", baseCls: "header-dropdown-menu",  key: "ad" },
+            { id: "menu-var-squad",       baseCls: "sidebar-dropdown-menu", key: "squad" },
+            { id: "menu-var-model",       baseCls: "sidebar-dropdown-menu", key: "model" },
+            { id: "menu-var-mode",        baseCls: "sidebar-dropdown-menu", key: "mode" }
+        ];
+
+        var ctx = window.dash_clientside.callback_context;
+        if (!ctx || !ctx.triggered || ctx.triggered.length === 0) {
+            return window.dash_clientside.no_update;
+        }
+
+        var clickTrigger = ctx.triggered.find(function(t) {
+            return t.value !== null && t.value !== undefined && t.value > 0;
+        });
+        if (!clickTrigger) {
+            return window.dash_clientside.no_update;
+        }
+
+        var triggeredId = clickTrigger.prop_id.split(".")[0];
+        var parsedId = null;
+        try { parsedId = JSON.parse(triggeredId); } catch(e) {}
+
+        var newOpenKey = null;
+
+        if (parsedId && typeof parsedId === "object" && parsedId.type) {
+            if (parsedId.type === "var-model-select-item") {
+                newOpenKey = "model";
+                var mBodySel = document.getElementById("var-model-dropdown-body");
+                if (mBodySel) { window._varModelScroll = mBodySel.scrollTop; }
+            } else if (parsedId.type === "var-model-action") {
+                if (parsedId.action === "apply") {
+                    newOpenKey = null;
+                    window._varModelScroll = 0;
+                } else if (parsedId.action === "reset") {
+                    newOpenKey = "model";
+                    window._varModelScroll = 0;
+                    var mBodyRst = document.getElementById("var-model-dropdown-body");
+                    if (mBodyRst) { mBodyRst.scrollTop = 0; }
+                } else {
+                    newOpenKey = "model";
+                    var mBodyAct = document.getElementById("var-model-dropdown-body");
+                    if (mBodyAct) { window._varModelScroll = mBodyAct.scrollTop; }
+                }
+            } else if (parsedId.type === "var-squad-select-item") {
+                newOpenKey = "squad";
+                var sBodySel = document.getElementById("var-squad-dropdown-body");
+                if (sBodySel) { window._varSquadScroll = sBodySel.scrollTop; }
+            } else if (parsedId.type === "var-squad-action") {
+                if (parsedId.action === "apply") {
+                    newOpenKey = null;
+                    window._varSquadScroll = 0;
+                } else if (parsedId.action === "reset") {
+                    newOpenKey = "squad";
+                    window._varSquadScroll = 0;
+                    var sBodyRst = document.getElementById("var-squad-dropdown-body");
+                    if (sBodyRst) { sBodyRst.scrollTop = 0; }
+                } else {
+                    newOpenKey = "squad";
+                    var sBodyAct = document.getElementById("var-squad-dropdown-body");
+                    if (sBodyAct) { window._varSquadScroll = sBodyAct.scrollTop; }
+                }
+            } else {
+                newOpenKey = null;
+            }
+        } else {
+            var entry = MENU_MAP[triggeredId];
+            if (entry) {
+                newOpenKey = (currentOpen === entry.key) ? null : entry.key;
+                if (newOpenKey === "squad" && currentOpen !== "squad") {
+                    window._varSquadScroll = 0;
+                    var sBodyOpen = document.getElementById("var-squad-dropdown-body");
+                    if (sBodyOpen) { sBodyOpen.scrollTop = 0; }
+                }
+                if (newOpenKey === "model" && currentOpen !== "model") {
+                    window._varModelScroll = 0;
+                    var mBodyOpen = document.getElementById("var-model-dropdown-body");
+                    if (mBodyOpen) { mBodyOpen.scrollTop = 0; }
+                }
+            }
+        }
+
+        ALL_MENUS.forEach(function(m) {
+            var el = document.getElementById(m.id);
+            if (!el) return;
+            var shouldShow = (newOpenKey === m.key);
+            el.className = shouldShow ? m.baseCls + " show" : m.baseCls;
+        });
+
+        return [
+            newOpenKey,
+            ALL_MENUS[0].baseCls + (newOpenKey === "ad"    ? " show" : ""),
+            ALL_MENUS[1].baseCls + (newOpenKey === "squad" ? " show" : ""),
+            ALL_MENUS[2].baseCls + (newOpenKey === "model" ? " show" : ""),
+            ALL_MENUS[3].baseCls + (newOpenKey === "mode"  ? " show" : "")
+        ];
+    }
+    """,
+    Output("var-open-menu-store", "data"),
+    Output("menu-var-ad-switcher", "className"),
+    Output("menu-var-squad", "className"),
+    Output("menu-var-model", "className"),
+    Output("menu-var-mode", "className"),
+    Input("btn-var-ad-group-switcher", "n_clicks"),
+    Input("pill-var-squad", "n_clicks"),
+    Input("pill-var-model", "n_clicks"),
+    Input("pill-var-mode", "n_clicks"),
+    Input({"type": "var-ad-select-item", "key": ALL}, "n_clicks"),
+    Input({"type": "var-squad-select-item", "name": ALL, "disp": ALL}, "n_clicks"),
+    Input({"type": "var-model-select-item", "id": ALL, "name": ALL}, "n_clicks"),
+    Input({"type": "var-mode-select-item", "mode": ALL}, "n_clicks"),
+    Input({"type": "var-model-action", "action": ALL}, "n_clicks"),
+    Input({"type": "var-squad-action", "action": ALL}, "n_clicks"),
+    State("var-open-menu-store", "data"),
+    prevent_initial_call=True,
+)
+
+
+def _normalize_squad_list(active_squads: str | list[str] | None) -> list[str]:
+    if not active_squads:
+        return []
+    if isinstance(active_squads, str):
+        return [active_squads] if active_squads != _SELECT_SQUAD else []
+    return [str(s) for s in active_squads if s and str(s) != _SELECT_SQUAD]
+
+
+def _normalize_model_list(models: str | list[str] | None) -> list[str]:
+    if not models:
+        return []
+    if isinstance(models, str):
+        return [models] if models != _SELECT_MODEL else []
+    return [str(m) for m in models if m and str(m) != _SELECT_MODEL]
+
+
+def _pick_active_models(
+    current_model: str | list[str] | None,
+    avail_models: List[Dict[str, Any]],
+    all_models: List[Dict[str, Any]],
+) -> Tuple[List[str], Optional[int]]:
+    curr_list = _normalize_model_list(current_model)
+    pool = avail_models or all_models
+    pool_names = {m["model_name"].upper(): m for m in pool if m.get("model_name")}
+
+    matched = [m for m in curr_list if m.upper() in pool_names]
+    if matched:
+        first_m = pool_names[matched[0].upper()]
+        return matched, first_m.get("model_id")
+
+    if pool:
+        first = pool[0]
+        return [first["model_name"]], first.get("model_id")
+
+    return [], None
+
+
+def _safe_get_squads_by_gbu(gbu_codes: list) -> list:
     try:
-        mapping = get_ad_group_mapping([initial_persona_key])
-        if mapping and mapping.get("gbu_codes"):
-            return mapping["gbu_codes"]
+        return get_squads_by_gbu(gbu_codes) or []
     except (psycopg2.Error, KeyError, IndexError, ValueError):
-        pass
-    return persona.get("gbus", [])
+        return []
 
 
-def _get_initial_squads(gbu_codes: list) -> Tuple[list, str, str]:
-    try:
-        squad_rows = get_squads_by_gbu(gbu_codes)
-    except (psycopg2.Error, KeyError, IndexError, ValueError):
-        squad_rows = []
-
-    squads = []
-    fallback_gbu = gbu_codes[0] if gbu_codes else ""
-    for s in squad_rows:
-        s_name = s["squad_name"]
-        gbu_c = s.get("gbu_code", fallback_gbu)
-        gbu_n = s.get("gbu_name", gbu_c)
-        squads.append({
-            "squad_name": s_name,
-            "display_name": s_name.title(),
-            "gbu": gbu_c,
-            "gbu_short": gbu_n.split()[0].title() if gbu_n else "",
-        })
-    active_squad_name = squads[0]["squad_name"] if squads else "BODY CARE"
-    active_squad_disp = squads[0]["display_name"] if squads else DEFAULT_BODY_CARE
-    return squads, active_squad_name, active_squad_disp
+def _get_models_for_squads(squad_names: List[str], gbu_codes: Optional[list]) -> List[Dict[str, Any]]:
+    clean_squads = [s for s in squad_names if s and s != _SELECT_SQUAD]
+    if not clean_squads:
+        return []
+    combined = []
+    seen = set()
+    for s_name in clean_squads:
+        try:
+            m_list = get_models_by_squad(s_name, gbu_codes) or []
+            for m in m_list:
+                m_id = m.get("model_id")
+                if m_id not in seen:
+                    seen.add(m_id)
+                    combined.append(m)
+        except (psycopg2.Error, KeyError, IndexError, ValueError):
+            pass
+    return combined
 
 
-def _get_initial_models(active_squad_name: str, gbu_codes: list) -> Tuple[list, str]:
-    try:
-        all_models = get_models_by_squad(active_squad_name, gbu_codes)
-    except (psycopg2.Error, KeyError, IndexError, ValueError):
-        all_models = []
+def _resolve_var_squad_selection(gbu_codes: list, current_squad: Any) -> Tuple[list, str, list]:
+    squad_rows = _safe_get_squads_by_gbu(gbu_codes)
+    default_gbu = gbu_codes[0] if gbu_codes else ""
+    squad_list = [
+        {
+            "squad_name": s["squad_name"],
+            "display_name": s["squad_name"].title(),
+            "gbu": s.get("gbu_code", default_gbu),
+            "gbu_short": (s.get("gbu_name", "")).split()[0].title() if s.get("gbu_name") else "",
+        }
+        for s in squad_rows
+    ]
+    curr_list = _normalize_squad_list(current_squad)
+    avail_names = {s["squad_name"].upper(): s["squad_name"] for s in squad_list}
 
-    cons_models = [m for m in all_models if m.get("has_pos")]
-    candidate_models = cons_models or all_models
-    active_model_name = candidate_models[0]["model_name"] if candidate_models else DEFAULT_BODY_CARE
-    return candidate_models, active_model_name
+    matched = [avail_names[s.upper()] for s in curr_list if s.upper() in avail_names]
+    if matched:
+        active_squads = matched
+    elif squad_list:
+        active_squads = [squad_list[0]["squad_name"]]
+    else:
+        active_squads = []
+
+    squad_disp = format_var_squad_pill_label(active_squads, total_squads=len(squad_list))
+    squad_items = build_var_squad_menu_items(squad_list, active_squad_name=active_squads)
+    return active_squads, squad_disp, squad_items
 
 
-def layout():
-    """Pure Python Dash layout evaluated dynamically per request."""
-    redirect = _handle_variance_auth_redirect()
-    if redirect is not None:
-        return redirect
+def _resolve_var_model_selection(
+    active_squads: list, gbu_codes: list, domain: str, current_model: Any
+) -> Tuple[list, Optional[int], list, str]:
+    flag_key = "has_shipment" if domain == "shipment" else "has_pos"
+    all_models = _get_models_for_squads(active_squads, gbu_codes)
+    avail_models = [m for m in all_models if m.get(flag_key)]
+    display_pool = avail_models or all_models
 
-    user = get_current_user() or {}
-    curr_kv = KenvueCalendar.get_date_info(date.today())
-
-    initial_persona_key = user.get("ad_group") or "COM-APP-NA-IBP-SELFCARE"
-    if initial_persona_key not in AD_PERSONAS:
-        initial_persona_key = "COM-APP-NA-IBP-SELFCARE"
-    persona = AD_PERSONAS.get(initial_persona_key, AD_PERSONAS["COM-APP-NA-IBP-SELFCARE"])
-
-    user_name, user_email = _resolve_variance_user_identity(user, persona)
-    gbu_codes = _get_initial_gbu_codes(initial_persona_key, persona)
-    squads, active_squad_name, _ = _get_initial_squads(gbu_codes)
-    candidate_models, active_model_name = _get_initial_models(active_squad_name, gbu_codes)
-
-    ad_items = build_var_ad_switcher_menu_items(active_key=initial_persona_key)
-    squad_items = build_var_squad_menu_items(squads, active_squad_name=active_squad_name)
-    model_items = build_var_model_menu_items(candidate_models, active_model_name=active_model_name)
-    mode_items = build_var_mode_menu_items(active_mode="IBP")
-
-    return html.Div(
-        id="variance-page-root",
-        className="d-flex flex-column",
-        style={"minHeight": "100vh", "backgroundColor": "var(--b10, #FAFAFA)"},
-        children=[
-            # ── State Stores ──────────────────────────────────────────────────
-            dcc.Store(id="filter-var-domain", data="consumption"),
-            dcc.Store(id="filter-var-mode", data="IBP"),  # Default = IBP
-            dcc.Store(id="filter-var-squad", data=[active_squad_name] if active_squad_name else []),
-            dcc.Store(id="var-squad-staging-store", data=None),
-            dcc.Store(id="filter-var-model", data=[active_model_name] if active_model_name else []),
-            dcc.Store(id="var-model-staging-store", data=None),
-            dcc.Store(id="var-header-ad-switcher", data=initial_persona_key),
-            dcc.Store(id="var-open-menu-store", data=None),
-            dcc.Store(id="var-cache-store", data={}),
-
-            # ── 1. Top Brand Accent Multi-Color Bar ───────────────────────────
-            html.Div(className="accent"),
-
-            # ── 2. Top Navigation Bar ─────────────────────────────────────────
-            render_workbench_header(
-                page="variance",
-                user_name=user_name,
-                user_email=user_email,
-                role_label=persona["role_label"],
-                role_color=persona["role_color"],
-                ad_items=ad_items,
-                initial_ad_badge_text=persona["name"],
-            ),
-
-            # ── 3. Main Workspace Layout (Sidebar + Workbench) ────────────────
-            html.Div(
-                className="app-workspace",
-                children=[
-                    # ── Left Compact Dock (140px Width) ──
-                    html.Aside(
-                        id="var-sidebar",
-                        className="planning-sidebar",
-                        style={
-                            "width": "140px",
-                            "minWidth": "140px",
-                            "maxWidth": "140px",
-                            "padding": "16px 10px 16px 14px",
-                            "display": "flex",
-                            "flexDirection": "column",
-                            "gap": "10px",
-                        },
-                        children=[
-                            html.Div([
-                                html.Div(
-                                    className="sidebar-section-title mb-2",
-                                    style={"justifyContent": "center"},
-                                    children=[
-                                        html.Span(
-                                            "DASHBOARD",
-                                            style={
-                                                "fontSize": "11px",
-                                                "fontWeight": "700",
-                                                "letterSpacing": "0.06em",
-                                                "color": "var(--b700, #1C1C1C)",
-                                            },
-                                        ),
-                                    ],
-                                ),
-                                dcc.Loading(
-                                    id="var-domain-loading",
-                                    type="dot",
-                                    color="#00B097",
-                                    children=html.Div(
-                                        className="d-flex flex-column gap-2",
-                                        children=[
-                                            html.Div(
-                                                id="card-var-consumption",
-                                                className="val-tile-stacked active-domain",
-                                                style=TILE_ACTIVE_STYLE,
-                                                n_clicks=0,
-                                                children=[
-                                                    html.I(className="bi bi-cart3 fs-5 mb-1"),
-                                                    html.Span("Consumption", className="val-tile-label", style={"fontWeight": "700", "fontSize": _FONT_SIZE_SM_11_5}),
-                                                ],
-                                            ),
-                                            html.Div(
-                                                id="card-var-shipment",
-                                                className=CLASS_TILE_INACTIVE,
-                                                style=TILE_INACTIVE_STYLE,
-                                                n_clicks=0,
-                                                children=[
-                                                    html.I(className="bi bi-truck fs-5 mb-1"),
-                                                    html.Span("Shipment", className="val-tile-label", style={"fontWeight": "700", "fontSize": _FONT_SIZE_SM_11_5}),
-                                                ],
-                                            ),
-                                        ],
-                                    ),
-                                ),
-                            ]),
-                        ],
-                    ),
-
-                    # ── Right Main Workbench Area ─────────────────────────────
-                    html.Main(
-                        id="var-workbench",
-                        className="planning-main",
-                        children=[
-                            # ── 1. Top Horizon Filter Bar (Squad -> Peach Model -> Compare IBP/BP) ──
-                            html.Section(
-                                className="horizon-top-bar",
-                                children=[
-                                    html.Div(
-                                        className="horizon-left-group",
-                                        children=[
-                                            # Need State / Squad Box
-                                            html.Div(
-                                                className="horizon-box horizon-squad-box",
-                                                id="pill-var-squad",
-                                                title="Select Need State / Squad",
-                                                n_clicks=0,
-                                                children=[
-                                                    html.Div(
-                                                        className="box-label",
-                                                        children=[
-                                                            html.I(className="bi bi-diagram-3 me-1 text-primary"),
-                                                            html.Span("Squad"),
-                                                            html.Span("\u25BC", className="caret ms-1"),
-                                                        ],
-                                                    ),
-                                                    html.Span(
-                                                        format_var_squad_pill_label([active_squad_name]),
-                                                        className="box-value",
-                                                        id="selected-var-squad-label",
-                                                    ),
-                                                    html.Div(
-                                                        className="sidebar-dropdown-menu",
-                                                        id="menu-var-squad",
-                                                        children=squad_items,
-                                                    ),
-                                                ],
-                                            ),
-
-                                            # Model Box (Peach Background)
-                                            html.Div(
-                                                className="horizon-box horizon-model-box",
-                                                id="pill-var-model",
-                                                title=DEFAULT_MODEL_LABEL,
-                                                n_clicks=0,
-                                                children=[
-                                                    html.Div(
-                                                        className="box-label",
-                                                        children=[
-                                                            html.I(className="bi bi-box-seam me-1 text-danger"),
-                                                            html.Span("Model"),
-                                                            html.Span("\u25BC", className="caret ms-1"),
-                                                        ],
-                                                    ),
-                                                    html.Span(
-                                                        format_var_model_pill_label([active_model_name]),
-                                                        className="box-value",
-                                                        id="selected-var-model-label",
-                                                    ),
-                                                    html.Div(
-                                                        className="sidebar-dropdown-menu",
-                                                        id="menu-var-model",
-                                                        children=model_items,
-                                                    ),
-                                                ],
-                                            ),
-
-                                            # Compare Mode Box (IBP / BP Selector)
-                                            html.Div(
-                                                className="horizon-box",
-                                                id="pill-var-mode",
-                                                title="Select Baseline (IBP vs BP)",
-                                                n_clicks=0,
-                                                style={"minWidth": "140px", "cursor": "pointer"},
-                                                children=[
-                                                    html.Div(
-                                                        className="box-label",
-                                                        children=[
-                                                            html.I(className="bi bi-layers me-1 text-success"),
-                                                            html.Span("Compare"),
-                                                            html.Span("\u25BC", className="caret ms-1"),
-                                                        ],
-                                                    ),
-                                                    html.Span(
-                                                        "IBP",
-                                                        className="box-value",
-                                                        id="selected-var-mode-label",
-                                                    ),
-                                                    html.Div(
-                                                        className="sidebar-dropdown-menu",
-                                                        id="menu-var-mode",
-                                                        style={"minWidth": "210px"},
-                                                        children=mode_items,
-                                                    ),
-                                                ],
-                                            ),
-                                        ],
-                                    ),
-                                ],
-                            ),
-
-                            # ── 2. Authoritative Context Ribbon ───────────────────────
-                            html.Div(
-                                className="planning-context-ribbon",
-                                children=[
-                                    html.Div(
-                                        className="ribbon-left d-flex align-items-center gap-2",
-                                        children=[
-                                            html.Span("▶", className="ribbon-play-icon", style={"color": _COLOR_TRUST_GREEN, "fontSize": "11px"}),
-                                            html.Strong(id="ribbon-var-domain-title", children="CONSUMPTION VARIANCE (IBP)", style={"fontSize": _FONT_SIZE_SM_11_5, "letterSpacing": "0.04em"}),
-                                            html.Span(" — "),
-                                            html.Strong(id="ribbon-var-model-title", children=active_model_name, style={"fontSize": _FONT_SIZE_SM_11_5}),
-                                            html.Span(
-                                                id="var-status-badge",
-                                                children="Current Cycle vs Prior Cycle | POS $ are in millions.",
-                                                style={"fontSize": _FONT_SIZE_SM_11_5, "color": "#495057", "fontWeight": "500", "fontStyle": "italic"},
-                                            ),
-                                        ],
-                                    ),
-                                    html.Div(
-                                        className="ribbon-badges",
-                                        children=[
-                                            dbc.Badge(
-                                                f"Fiscal: {curr_kv.kv_month_abbr} {curr_kv.kv_year}",
-                                                color="success",
-                                                className="border",
-                                                style={"fontSize": "11px", "borderRadius": "20px", "padding": "4px 12px", "backgroundColor": _COLOR_TRUST_GREEN},
-                                            ),
-                                        ],
-                                    ),
-                                ],
-                            ),
-
-                            # ── 3. Main Data Workbench Table Container ────────────────
-                            dcc.Loading(
-                                id="var-loading",
-                                type="circle",
-                                color="#00B097",
-                                delay_show=0,
-                                delay_hide=150,
-                                overlay_style={"visibility": "visible", "opacity": 0.65, "backgroundColor": "rgba(255, 255, 255, 0.7)"},
-                                children=html.Div(
-                                    id="var-grid-container",
-                                    children=render_summary_loading_skeleton("CONSUMPTION"),
-                                ),
-                            ),
-                        ],
-                    ),
-                ],
-            ),
-
-            # ── 4. Global Footer ──────────────────────────────────────────────
-            html.Footer(
-                className="global-footer",
-                children=[
-                    html.Div(
-                        className="footer-left",
-                        children=[
-                            html.Span(
-                                id="var-footer-status-indicator",
-                                className="footer-status-indicator",
-                                children=[
-                                    html.Span(id="var-footer-status-dot", className="status-dot status-dot-online"),
-                                    html.Span(id="var-footer-status-text", children="System Online"),
-                                ],
-                            ),
-                            html.Span("|", className="footer-pipe text-muted", style={"opacity": "0.35", "margin": "0 8px"}),
-                            html.Span(id="var-footer-db-status", children="Consolidated View Active", className="text-muted"),
-                        ],
-                    ),
-                    html.Div(
-                        className="footer-right d-flex align-items-center",
-                        children=[
-                            html.Span("© 2026 Kenvue Inc.", className="text-muted small"),
-                            html.Span("|", className="footer-pipe text-muted", style={"opacity": "0.35", "margin": "0 8px"}),
-                            html.Span("NA IBP Variance Dashboard v1.1", className="text-muted small"),
-                        ],
-                    ),
-                ],
-            ),
-        ],
+    active_models, primary_id = _pick_active_models(current_model, avail_models, all_models)
+    pill_lbl = format_var_model_pill_label(active_models, total_models=len(display_pool))
+    model_items = build_var_model_menu_items(
+        display_pool,
+        active_model_name=active_models,
+        has_squad=bool(active_squads),
     )
+    return active_models, primary_id, model_items, pill_lbl
+
+
+# ─── 1. Comparison Mode Selection (IBP vs BP) ───────────────────────────────
+
+@callback(
+    Output("filter-var-mode", "data"),
+    Output("selected-var-mode-label", "children"),
+    Output("menu-var-mode", "children"),
+    Input({"type": "var-mode-select-item", "mode": ALL}, "n_clicks"),
+    State("filter-var-mode", "data"),
+    prevent_initial_call=True,
+)
+def handle_var_mode_selection(n_clicks, current_mode):
+    trig = callback_context.triggered_id
+    if not isinstance(trig, dict) or not any(c for c in (n_clicks or []) if c):
+        return no_update, no_update, no_update
+
+    new_mode = (trig.get("mode") or "IBP").upper()
+    if new_mode == (current_mode or "IBP").upper():
+        return no_update, no_update, no_update
+
+    return new_mode, new_mode, build_var_mode_menu_items(new_mode)
+
+
+# ─── 2. AD Persona Switcher in Variance Dashboard ───────────────────────────
+
+@callback(
+    Output("var-header-ad-switcher", "data"),
+    Output("var-header-ad-badge", "children"),
+    Output("var-header-role-badge", "children"),
+    Output("var-header-role-badge", "color"),
+    Output("var-header-user-email", "children"),
+    Output("menu-var-ad-switcher", "children"),
+    Output("menu-var-squad", "children", allow_duplicate=True),
+    Output("selected-var-squad-label", "children", allow_duplicate=True),
+    Output("filter-var-squad", "data", allow_duplicate=True),
+    Output("menu-var-model", "children", allow_duplicate=True),
+    Output("selected-var-model-label", "children", allow_duplicate=True),
+    Output("filter-var-model", "data", allow_duplicate=True),
+    Output("session-active-ad-group-store", "data", allow_duplicate=True),
+    Output("var-model-staging-store", "data", allow_duplicate=True),
+    Output("var-squad-staging-store", "data", allow_duplicate=True),
+    Output("session-active-model-store", "data", allow_duplicate=True),
+    Input({"type": "var-ad-select-item", "key": ALL}, "n_clicks"),
+    State("var-header-ad-switcher", "data"),
+    State("filter-var-domain", "data"),
+    State("filter-var-squad", "data"),
+    State("filter-var-model", "data"),
+    prevent_initial_call=True,
+)
+def handle_var_ad_persona_selection(n_clicks, current_key, domain, current_squad, current_model):
+    trig = callback_context.triggered_id
+    if not isinstance(trig, dict) or not any(n_clicks):
+        return (no_update,) * 16
+
+    key = trig.get("key", "COM-APP-NA-IBP-SELFCARE")
+    if current_key and key == current_key:
+        return (no_update,) * 16
+
+    curr_user = get_current_user()
+    user_groups = curr_user.get("all_ad_groups", []) if curr_user else []
+    if user_groups and key not in user_groups:
+        return (no_update,) * 16
+
+    persona = AD_PERSONAS.get(key, AD_PERSONAS["COM-APP-NA-IBP-SELFCARE"])
+    mapping = get_ad_group_mapping([key])
+    gbu_codes = mapping["gbu_codes"] if mapping and mapping.get("gbu_codes") else persona["gbus"]
+
+    ad_items = build_var_ad_switcher_menu_items(active_key=key)
+    active_squads, active_squad_disp, squad_items = _resolve_var_squad_selection(gbu_codes, current_squad)
+    active_models, _, model_items, active_pill_lbl = _resolve_var_model_selection(
+        active_squads, gbu_codes, domain, current_model
+    )
+
+    user_email_elem = _build_variance_user_identity_elem(persona["email"])
+    session_ad_data = {"persona_key": key, "source": "variance"}
+    curr_user = get_current_user()
+    if curr_user:
+        curr_user["ad_group"] = key
+        set_user_session(curr_user)
+
+    p_squad = active_squads[0] if active_squads else ""
+    p_model = active_models[0] if active_models else ""
+    session_model_data = {
+        "model_id": None,
+        "model_name": p_model,
+        "squad_name": p_squad,
+        "selected_models": active_models,
+        "selected_squads": active_squads,
+        "source": "variance",
+    }
+
+    return (
+        key,
+        persona["name"],
+        persona["role_label"],
+        persona["role_color"],
+        user_email_elem,
+        ad_items,
+        squad_items,
+        active_squad_disp,
+        active_squads,
+        model_items,
+        active_pill_lbl,
+        active_models,
+        session_ad_data,
+        None,
+        None,
+        session_model_data,
+    )
+
+
+# ─── 3. Multi-Squad Dropdown Checkbox Staging & Apply ───────────────────────
+
+def _get_staging_squads_list(staging_store: Any, committed_squad: Any) -> List[str]:
+    if staging_store is not None:
+        return _normalize_squad_list(staging_store)
+    return _normalize_squad_list(committed_squad)
+
+
+def _calculate_next_squad_staging(trig: dict, current_staging: List[str], all_squad_names: List[str]) -> Optional[List[str]]:
+    trig_type = trig.get("type")
+    if trig_type == "var-squad-select-item":
+        s_name = trig.get("name")
+        staging_set = {s.upper() for s in current_staging}
+        if s_name.upper() in staging_set:
+            staging_set.remove(s_name.upper())
+            return [s for s in all_squad_names if s.upper() in staging_set]
+        return current_staging + [s_name]
+
+    if trig_type == "var-squad-action":
+        action = trig.get("action")
+        if action == "select-all":
+            if len(current_staging) == len(all_squad_names):
+                return []
+            return list(all_squad_names)
+        if action == "reset":
+            return []
+    return None
+
+
+def _is_staging_callback_active(select_clicks: Any, action_clicks: Any, trig: Any) -> bool:
+    has_sel = any(c for c in (select_clicks or []) if c)
+    has_act = any(c for c in (action_clicks or []) if c)
+    return bool((has_sel or has_act) and isinstance(trig, dict))
+
+
+def _resolve_staging_gbu_codes(persona_key: Optional[str]) -> list:
+    persona = AD_PERSONAS.get(persona_key, AD_PERSONAS["COM-APP-NA-IBP-SELFCARE"])
+    mapping = get_ad_group_mapping([persona_key]) if persona_key else None
+    return mapping["gbu_codes"] if mapping and mapping.get("gbu_codes") else persona["gbus"]
+
+
+@callback(
+    Output("var-squad-staging-store", "data", allow_duplicate=True),
+    Output("menu-var-squad", "children", allow_duplicate=True),
+    Input({"type": "var-squad-select-item", "name": ALL, "disp": ALL}, "n_clicks"),
+    Input({"type": "var-squad-action", "action": ALL}, "n_clicks"),
+    State("var-squad-staging-store", "data"),
+    State("filter-var-squad", "data"),
+    State("var-header-ad-switcher", "data"),
+    prevent_initial_call=True,
+)
+def handle_var_squad_staging(select_clicks, action_clicks, staging_store, committed_squad, persona_key):
+    trig = callback_context.triggered_id
+    if not _is_staging_callback_active(select_clicks, action_clicks, trig):
+        return no_update, no_update
+
+    gbu_codes = _resolve_staging_gbu_codes(persona_key)
+    squad_rows = _safe_get_squads_by_gbu(gbu_codes)
+    default_gbu = gbu_codes[0] if gbu_codes else ""
+    squad_list = [
+        {
+            "squad_name": s["squad_name"],
+            "display_name": s["squad_name"].title(),
+            "gbu": s.get("gbu_code", default_gbu),
+            "gbu_short": (s.get("gbu_name", "")).split()[0].title() if s.get("gbu_name") else "",
+        }
+        for s in squad_rows
+    ]
+    all_squad_names = [s["squad_name"] for s in squad_list]
+
+    current_staging = _get_staging_squads_list(staging_store, committed_squad)
+    new_staging = _calculate_next_squad_staging(trig, current_staging, all_squad_names)
+    if new_staging is None:
+        return no_update, no_update
+
+    squad_items = build_var_squad_menu_items(squad_list, active_squad_name=new_staging)
+    return new_staging, squad_items
+
+
+@callback(
+    Output("filter-var-squad", "data", allow_duplicate=True),
+    Output("selected-var-squad-label", "children", allow_duplicate=True),
+    Output("menu-var-squad", "children", allow_duplicate=True),
+    Output("var-squad-staging-store", "data", allow_duplicate=True),
+    Output("filter-var-model", "data", allow_duplicate=True),
+    Output("selected-var-model-label", "children", allow_duplicate=True),
+    Output("menu-var-model", "children", allow_duplicate=True),
+    Output("var-model-staging-store", "data", allow_duplicate=True),
+    Output("session-active-model-store", "data", allow_duplicate=True),
+    Input({"type": "var-squad-action", "action": ALL}, "n_clicks"),
+    State("var-squad-staging-store", "data"),
+    State("filter-var-squad", "data"),
+    State("filter-var-model", "data"),
+    State("var-header-ad-switcher", "data"),
+    State("filter-var-domain", "data"),
+    prevent_initial_call=True,
+)
+def handle_var_squad_apply(action_clicks, staging_store, committed_squad, current_model, persona_key, domain):
+    has_action_click = any(c for c in (action_clicks or []) if c)
+    trig = callback_context.triggered_id
+    if not isinstance(trig, dict) or trig.get("action") != "apply" or not has_action_click:
+        return (no_update,) * 9
+
+    gbu_codes = _resolve_staging_gbu_codes(persona_key)
+    squad_rows = _safe_get_squads_by_gbu(gbu_codes)
+    default_gbu = gbu_codes[0] if gbu_codes else ""
+    squad_list = [
+        {
+            "squad_name": s["squad_name"],
+            "display_name": s["squad_name"].title(),
+            "gbu": s.get("gbu_code", default_gbu),
+            "gbu_short": (s.get("gbu_name", "")).split()[0].title() if s.get("gbu_name") else "",
+        }
+        for s in squad_rows
+    ]
+
+    selected_squads = _get_staging_squads_list(staging_store, committed_squad)
+    squad_pill_lbl = format_var_squad_pill_label(selected_squads, total_squads=len(squad_list))
+    squad_items = build_var_squad_menu_items(squad_list, active_squad_name=selected_squads)
+
+    selected_models, primary_id, model_items, model_pill_lbl = _resolve_var_model_selection(
+        selected_squads, gbu_codes, domain, current_model
+    )
+
+    primary_squad = selected_squads[0] if selected_squads else ""
+    primary_model = selected_models[0] if selected_models else ""
+    session_model_data = {
+        "model_id": primary_id,
+        "model_name": primary_model,
+        "squad_name": primary_squad,
+        "selected_models": selected_models,
+        "selected_squads": selected_squads,
+        "source": "variance",
+    }
+
+    return (
+        selected_squads,
+        squad_pill_lbl,
+        squad_items,
+        None,
+        selected_models,
+        model_pill_lbl,
+        model_items,
+        None,
+        session_model_data,
+    )
+
+
+# ─── 4. Multi-Model Dropdown Checkbox Staging & Apply ───────────────────────
+
+def _get_staging_models_list(staging_store: Any, committed_model: Any) -> List[str]:
+    if staging_store is not None:
+        return _normalize_model_list(staging_store)
+    return _normalize_model_list(committed_model)
+
+
+def _calculate_next_model_staging(trig: dict, current_staging: List[str], all_avail_names: List[str]) -> Optional[List[str]]:
+    trig_type = trig.get("type")
+    if trig_type == "var-model-select-item":
+        m_name = trig.get("name")
+        staging_set = {m.upper() for m in current_staging}
+        if m_name.upper() in staging_set:
+            staging_set.remove(m_name.upper())
+            return [m for m in all_avail_names if m.upper() in staging_set]
+        return current_staging + [m_name]
+
+    if trig_type == "var-model-action":
+        action = trig.get("action")
+        if action == "select-all":
+            if len(current_staging) == len(all_avail_names):
+                return []
+            return list(all_avail_names)
+        if action == "reset":
+            return []
+    return None
+
+
+def _resolve_available_staging_models(persona_key: Optional[str], domain: str, squad_name: Any) -> list:
+    gbu_codes = _resolve_staging_gbu_codes(persona_key)
+    squad_list = [squad_name] if isinstance(squad_name, str) else list(squad_name or [])
+    all_models = _get_models_for_squads(squad_list, gbu_codes)
+    flag_key = "has_shipment" if domain == "shipment" else "has_pos"
+    avail_models = [m for m in all_models if m.get(flag_key)]
+    return avail_models or all_models
+
+
+@callback(
+    Output("var-model-staging-store", "data", allow_duplicate=True),
+    Output("menu-var-model", "children", allow_duplicate=True),
+    Output("session-active-model-store", "data", allow_duplicate=True),
+    Input({"type": "var-model-select-item", "id": ALL, "name": ALL}, "n_clicks"),
+    Input({"type": "var-model-action", "action": ALL}, "n_clicks"),
+    State("var-model-staging-store", "data"),
+    State("filter-var-model", "data"),
+    State("var-header-ad-switcher", "data"),
+    State("filter-var-domain", "data"),
+    State("filter-var-squad", "data"),
+    prevent_initial_call=True,
+)
+def handle_var_model_staging(select_clicks, action_clicks, staging_store, committed_model, persona_key, domain, squad_name):
+    trig = callback_context.triggered_id
+    if not _is_staging_callback_active(select_clicks, action_clicks, trig):
+        return no_update, no_update, no_update
+
+    avail_models = _resolve_available_staging_models(persona_key, domain, squad_name)
+    all_avail_names = [m["model_name"] for m in avail_models if m.get("model_name")]
+
+    current_staging = _get_staging_models_list(staging_store, committed_model)
+    new_staging = _calculate_next_model_staging(trig, current_staging, all_avail_names)
+    if new_staging is None:
+        return no_update, no_update, no_update
+
+    model_items = build_var_model_menu_items(avail_models, active_model_name=new_staging)
+
+    session_data = no_update
+    if new_staging:
+        squad_list = [squad_name] if isinstance(squad_name, str) else list(squad_name or [])
+        primary_model = new_staging[0]
+        primary_squad = squad_list[0] if squad_list else ""
+        session_data = _build_model_apply_session_data(
+            primary_model,
+            primary_squad,
+            avail_models,
+            selected_models=new_staging,
+            selected_squads=squad_list,
+        )
+
+    return new_staging, model_items, session_data
+
+
+def _build_model_apply_session_data(
+    primary_model: str,
+    primary_squad: str,
+    avail_models: list[dict],
+    selected_models: Optional[list[str]] = None,
+    selected_squads: Optional[list[str]] = None,
+) -> dict:
+    primary_id = None
+    if primary_model:
+        matched = next((m for m in avail_models if m.get("model_name", "").upper() == primary_model.upper()), None)
+        if matched:
+            primary_id = matched.get("model_id")
+
+    s_mods = [str(m) for m in selected_models if m] if selected_models else ([primary_model] if primary_model else [])
+    s_sqs = [str(s) for s in selected_squads if s] if selected_squads else ([primary_squad] if primary_squad else [])
+
+    return {
+        "model_id": primary_id,
+        "model_name": primary_model,
+        "squad_name": primary_squad,
+        "selected_models": s_mods,
+        "selected_squads": s_sqs,
+        "source": "variance",
+    }
+
+
+@callback(
+    Output("filter-var-model", "data", allow_duplicate=True),
+    Output("selected-var-model-label", "children", allow_duplicate=True),
+    Output("session-active-model-store", "data", allow_duplicate=True),
+    Output("var-model-staging-store", "data", allow_duplicate=True),
+    Output("menu-var-model", "children", allow_duplicate=True),
+    Input({"type": "var-model-action", "action": ALL}, "n_clicks"),
+    State("var-model-staging-store", "data"),
+    State("filter-var-model", "data"),
+    State("filter-var-squad", "data"),
+    State("var-header-ad-switcher", "data"),
+    State("filter-var-domain", "data"),
+    prevent_initial_call=True,
+)
+def handle_var_model_apply(action_clicks, staging_store, committed_model, squad_name, persona_key, domain):
+    has_action_click = any(c for c in (action_clicks or []) if c)
+    trig = callback_context.triggered_id
+    if not isinstance(trig, dict) or trig.get("action") != "apply" or not has_action_click:
+        return (no_update,) * 5
+
+    avail_models = _resolve_available_staging_models(persona_key, domain, squad_name)
+    selected_models = _get_staging_models_list(staging_store, committed_model)
+    pill_label = format_var_model_pill_label(selected_models, total_models=len(avail_models))
+
+    squad_list = [squad_name] if isinstance(squad_name, str) else list(squad_name or [])
+    primary_model = selected_models[0] if selected_models else ""
+    primary_squad = squad_list[0] if squad_list else ""
+    session_model_data = _build_model_apply_session_data(
+        primary_model,
+        primary_squad,
+        avail_models,
+        selected_models=selected_models,
+        selected_squads=squad_list,
+    )
+    model_items = build_var_model_menu_items(avail_models, active_model_name=selected_models)
+
+    return (
+        selected_models,
+        pill_label,
+        session_model_data,
+        None,
+        model_items,
+    )
+
+
+# ─── 5. Domain Toggle Callback (Consumption vs Shipment in Left Dock) ───────
+
+@callback(
+    Output("card-var-consumption", "className"),
+    Output("card-var-shipment", "className"),
+    Output("card-var-consumption", "style"),
+    Output("card-var-shipment", "style"),
+    Output("filter-var-domain", "data"),
+    Output("menu-var-model", "children", allow_duplicate=True),
+    Output("selected-var-model-label", "children", allow_duplicate=True),
+    Output("filter-var-model", "data", allow_duplicate=True),
+    Input("card-var-consumption", "n_clicks"),
+    Input("card-var-shipment", "n_clicks"),
+    State("filter-var-domain", "data"),
+    State("var-header-ad-switcher", "data"),
+    State("filter-var-squad", "data"),
+    State("filter-var-model", "data"),
+    prevent_initial_call=True,
+)
+def handle_var_domain_toggle(n_cons, n_ship, current_domain, persona_key, squad_name, current_model):
+    trig = callback_context.triggered_id
+    active_domain = "shipment" if trig == "card-var-shipment" else "consumption"
+
+    c_cls = "val-tile-stacked active-domain" if active_domain == "consumption" else "val-tile-stacked inactive-domain"
+    s_cls = "val-tile-stacked active-domain" if active_domain == "shipment" else "val-tile-stacked inactive-domain"
+    c_stl = TILE_ACTIVE_STYLE if active_domain == "consumption" else TILE_INACTIVE_STYLE
+    s_stl = TILE_ACTIVE_STYLE if active_domain == "shipment" else TILE_INACTIVE_STYLE
+
+    persona = AD_PERSONAS.get(persona_key, AD_PERSONAS["COM-APP-NA-IBP-SELFCARE"])
+    mapping = get_ad_group_mapping([persona_key]) if persona_key else None
+    gbu_codes = mapping["gbu_codes"] if mapping and mapping.get("gbu_codes") else persona["gbus"]
+
+    flag_key = "has_shipment" if active_domain == "shipment" else "has_pos"
+    squad_list = [squad_name] if isinstance(squad_name, str) else list(squad_name or [])
+    all_models = _get_models_for_squads(squad_list or [GBU_PAIN_CARE], gbu_codes)
+    avail_models = [m for m in all_models if m.get(flag_key)]
+    display_pool = avail_models or all_models
+
+    clean_models = _normalize_model_list(current_model)
+    active_models, _ = _pick_active_models(clean_models, avail_models, all_models)
+    pill_lbl = format_var_model_pill_label(active_models, total_models=len(display_pool))
+    model_items = build_var_model_menu_items(
+        display_pool,
+        active_model_name=active_models,
+        has_squad=bool(squad_list),
+    )
+
+    return (
+        c_cls,
+        s_cls,
+        c_stl,
+        s_stl,
+        active_domain,
+        model_items,
+        pill_lbl,
+        active_models,
+    )
+
+
+# ─── 6. Automatic Data Load & Render Grid (IBP & BP) ────────────────────────
+
+def _resolve_clean_models(model: Any) -> list[str]:
+    if not model:
+        return []
+    if isinstance(model, str):
+        return [model.strip()] if model.strip() and model.strip() != _SELECT_MODEL else []
+    return [str(m).strip() for m in model if m and str(m).strip() != _SELECT_MODEL]
+
+
+@callback(
+    Output("var-grid-container", "children"),
+    Output("var-status-badge", "children"),
+    Output("ribbon-var-domain-title", "children"),
+    Output("ribbon-var-model-title", "children"),
+    Output("var-cache-store", "data"),
+    Input("filter-var-model", "data"),
+    Input("filter-var-domain", "data"),
+    Input("filter-var-squad", "data"),
+    Input("filter-var-mode", "data"),
+    State("var-cache-store", "data"),
+    prevent_initial_call=False,
+)
+def handle_var_auto_load_grid(model, domain, squad_name, mode, cache_store):
+    """
+    Automatically calculates and renders the Variance matrix table for IBP or BP.
+    """
+    domain = (domain or "consumption").lower()
+    mode = (mode or "IBP").upper()
+    domain_ribbon = f"{domain.upper()} VARIANCE ({mode})"
+
+    if model is None or squad_name is None:
+        return no_update, no_update, domain_ribbon, no_update, no_update
+
+    squad_list = _normalize_squad_list(squad_name)
+    if not squad_list:
+        empty_card = render_empty_selection_card("squad", domain)
+        status_msg = "Please select a squad from the Squad dropdown above."
+        return empty_card, status_msg, domain_ribbon, _SELECT_SQUAD, {"status": "empty_squad"}
+
+    clean_models = _resolve_clean_models(model)
+    if not clean_models:
+        empty_card = render_empty_selection_card("model", domain)
+        status_msg = "Please select a model above to view variance data."
+        return empty_card, status_msg, domain_ribbon, _SELECT_MODEL, {"status": "empty_model"}
+
+    model_disp = clean_models[0] if len(clean_models) == 1 else f"Consolidated ({len(clean_models)} Models)"
+    cache_key = f"{mode}:{domain.upper()}:{','.join(sorted(clean_models)).upper()}"
+
+    try:
+        if cache_key in _VAR_CACHE:
+            matrix_data = _VAR_CACHE[cache_key]
+        else:
+            if domain == "shipment":
+                matrix_data = compute_shipment_variance_matrix(clean_models, comparison_mode=mode)
+            else:
+                matrix_data = compute_consumption_variance_matrix(clean_models, comparison_mode=mode)
+            _VAR_CACHE[cache_key] = matrix_data
+
+        grid_elem = render_variance_matrix_table(matrix_data, domain=domain.upper(), model_name=model_disp)
+        baseline_txt = "Current Cycle vs Annual BP" if mode == "BP" else "Current Cycle vs Prior Cycle"
+        unit_txt = "Factory POS $ and GTS $ are in millions." if domain == "shipment" else "POS $ are in millions."
+        status_text = f"{baseline_txt} | {unit_txt}"
+        return grid_elem, status_text, domain_ribbon, model_disp, {"last_loaded": cache_key}
+
+    except Exception as err:
+        logger.error("Error computing variance matrix (%s) for models %s in domain %s: %s", mode, clean_models, domain, err)
+        err_elem = html.Div(html.P(f"Notice: {str(err)}", className="text-danger p-4"), className="summary-grid-card")
+        return err_elem, f"Error: {str(err)[:60]}...", domain_ribbon, model_disp, {"error": str(err)[:100]}
+
+
+# ─── 7. Two-Way State Persistence with Session Stores ───────────────────────
+
+@callback(
+    Output("session-active-model-store", "data", allow_duplicate=True),
+    Input("filter-var-model", "data"),
+    Input("filter-var-squad", "data"),
+    State("session-active-model-store", "data"),
+    prevent_initial_call=True,
+)
+def sync_variance_initial_model_to_session(current_model, current_squad, session_data):
+    clean_mods = _normalize_model_list(current_model)
+    clean_sqs = _normalize_squad_list(current_squad)
+    if not clean_mods and not clean_sqs:
+        return no_update
+
+    p_mod = clean_mods[0] if clean_mods else ""
+    p_sq = clean_sqs[0] if clean_sqs else ""
+    existing = session_data if isinstance(session_data, dict) else {}
+
+    return {
+        **existing,
+        "model_name": p_mod,
+        "squad_name": p_sq,
+        "selected_models": clean_mods,
+        "selected_squads": clean_sqs,
+        "source": "variance",
+    }
