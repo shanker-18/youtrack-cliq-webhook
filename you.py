@@ -1,20 +1,13 @@
 # pylint: disable=too-many-lines,too-many-locals,too-many-branches,broad-except
 """
-NA IBP Planning Application — Summary Dashboard Page
+NA IBP Planning Application — Variance Dashboard Page
 =====================================================
-Route: /summary
-Pure Python Dash Implementation aligned with Planning & Validation Design System:
-- Top Brand Accent Multi-Color Bar & Navigation Bar with Page Switcher (Planning <-> Validation <-> Summary)
-- AD Group Switcher on Navbar controlling GBU scope & user persona
-- Right Navbar Badges: Role Badge, User Email, and Sign Out
-- Left Sidebar: Compact 140px Dock with 4 Domain Tiles:
-  * Consumption
-  * Shipment
-  * GTS YoY
-  * GTS CoC (Change of Cycle)
-- Top Horizon Bar above Workbench: 2-pill layout ([Squad] grouped by GBU -> Peach [Model])
-- Zero Refresh Button: Automatic, fast cached loading upon model selection
-- Seamless two-way state persistence with Planning Workspace & Validation
+Route: /variance
+Pure Python Dash Implementation aligned with Planning, Validation & Summary Design System:
+- Top Brand Accent Multi-Color Bar & Navigation Bar with Page Switcher
+- Left Sidebar: Compact 140px Dock with 2 Domain Tiles (Consumption, Shipment)
+- Top Horizon Bar above Workbench: [Squad] -> Peach [Model] -> [Compare: IBP / BP]
+- Default comparison mode on load: IBP
 """
  
 import os
@@ -33,13 +26,11 @@ from repositories.hierarchy_repository import get_squads_by_gbu, get_models_by_s
 from repositories.security_repository import get_ad_group_mapping
 from callbacks.filter_callbacks import AD_PERSONAS
 from components.header import render_workbench_header
-from components.summary_grid import render_summary_matrix_table, render_summary_loading_skeleton
+from components.summary_grid import render_summary_loading_skeleton
  
-SUMMARY_ROUTE = "/summary"
+VARIANCE_ROUTE = "/variance"
  
-dash.register_page(__name__, path=SUMMARY_ROUTE, title="Summary Dashboard — NA IBP Planning")
- 
-# ─── Button & Tile Styles ─────────────────────────────────────────────────────
+dash.register_page(__name__, path=VARIANCE_ROUTE, title="Variance Dashboard — NA IBP Planning")
  
 _COLOR_TRUST_GREEN = "var(--trust-green, #019881)"
 _FONT_SIZE_SM_11_5 = "11.5px"
@@ -86,8 +77,66 @@ TILE_INACTIVE_STYLE = {
  
 # ─── Pure HTML Dropdown Menu Builders ─────────────────────────────────────────
  
+def build_var_mode_menu_items(active_mode: str = "IBP") -> list:
+    """Build pure HTML dropdown menu items for IBP vs BP baseline selection."""
+    active = (active_mode or "IBP").upper()
+    options = [
+        ("IBP", "IBP (Prior Cycle)", "Current Cycle - Prior Cycle"),
+        ("BP",  "BP (Annual Plan)",  "Current Cycle - Annual BP"),
+    ]
+    items = [
+        html.Div(
+            "Variance Baseline",
+            className="sidebar-dropdown-header",
+            style={
+                "padding": "6px 12px",
+                "fontSize": "10px",
+                "fontWeight": "700",
+                "color": _COLOR_TRUST_GREEN,
+                "textTransform": "uppercase",
+                "background": BG_GREEN_50,
+                "letterSpacing": "0.05em",
+                "borderBottom": "1px solid var(--green-100, #B0DFD8)",
+            },
+        )
+    ]
+    for mode_key, title, desc in options:
+        is_sel = (mode_key == active)
+        items.append(
+            html.Div(
+                className="sidebar-dropdown-item",
+                id={"type": "var-mode-select-item", "mode": mode_key},
+                n_clicks=0,
+                style={
+                    "padding": "8px 14px",
+                    "cursor": "pointer",
+                    "backgroundColor": "#F4FBF9" if is_sel else "#ffffff",
+                    "display": "flex",
+                    "alignItems": "center",
+                    "justifyContent": "space-between",
+                    "gap": "10px",
+                    "transition": "background 0.15s ease",
+                },
+                children=[
+                    html.Div([
+                        html.Div(
+                            title,
+                            style={
+                                "fontSize": "12.5px",
+                                "color": "#1A202C" if is_sel else "#4A5568",
+                                "fontWeight": "700" if is_sel else "500",
+                            },
+                        ),
+                        html.Div(desc, style={"fontSize": "10.5px", "color": "#6c757d"}),
+                    ]),
+                    html.I(className="bi bi-check2", style={"color": "#019881", "fontSize": "14px"}) if is_sel else html.Span(),
+                ],
+            )
+        )
+    return items
+ 
+ 
 def _render_ad_switcher_item(key: str, name: str, sub: str, is_active: bool) -> html.Div:
-    """Render a single AD switcher dropdown option item."""
     cls = "header-dropdown-item active" if is_active else "header-dropdown-item"
     children = [
         html.Div([
@@ -100,7 +149,7 @@ def _render_ad_switcher_item(key: str, name: str, sub: str, is_active: bool) -> 
         children.append(html.I(className="bi bi-check2"))
     return html.Div(
         className=cls,
-        id={"type": "sum-ad-select-item", "key": key},
+        id={"type": "var-ad-select-item", "key": key},
         n_clicks=0,
         children=children,
     )
@@ -125,8 +174,7 @@ def _build_ad_switcher_from_personas(active_key: str) -> list:
     return items
  
  
-def build_sum_ad_switcher_menu_items(active_key: str = "COM-APP-NA-IBP-SELFCARE") -> list:
-    """Build pure HTML AD switcher dropdown menu items dynamically from PostgreSQL."""
+def build_var_ad_switcher_menu_items(active_key: str = "COM-APP-NA-IBP-SELFCARE") -> list:
     curr_user = get_current_user() or {}
     user_groups = curr_user.get("all_ad_groups", [])
  
@@ -140,9 +188,7 @@ def build_sum_ad_switcher_menu_items(active_key: str = "COM-APP-NA-IBP-SELFCARE"
         db_mappings = None
  
     header_title = "Active AD Group" if user_groups else "Simulate AD Group"
-    items = [
-        html.Div(header_title, className="header-dropdown-header"),
-    ]
+    items = [html.Div(header_title, className="header-dropdown-header")]
     if db_mappings:
         items.extend(_build_ad_switcher_from_db(db_mappings, active_key))
     else:
@@ -150,8 +196,7 @@ def build_sum_ad_switcher_menu_items(active_key: str = "COM-APP-NA-IBP-SELFCARE"
     return items
  
  
-def format_sum_squad_pill_label(selected_squads: str | list[str], total_squads: int = 0) -> str:
-    """Format user-facing squad pill text based on selected squads count."""
+def format_var_squad_pill_label(selected_squads: str | list[str], total_squads: int = 0) -> str:
     if not selected_squads:
         return DEFAULT_SQUAD_LABEL
     if isinstance(selected_squads, str):
@@ -166,7 +211,7 @@ def format_sum_squad_pill_label(selected_squads: str | list[str], total_squads: 
     return f"{len(clean_squads)} Squads Selected"
  
  
-def _render_sum_squad_item(s: dict, is_checked: bool) -> html.Div:
+def _render_var_squad_item(s: dict, is_checked: bool) -> html.Div:
     s_name = s["squad_name"]
     disp_name = s.get("display_name", s_name.title())
     check_icon = ICON_CHECKBOX_CHECKED if is_checked else ICON_CHECKBOX_UNCHECKED
@@ -174,7 +219,7 @@ def _render_sum_squad_item(s: dict, is_checked: bool) -> html.Div:
  
     return html.Div(
         className="sidebar-dropdown-item",
-        id={"type": "sum-squad-select-item", "name": s_name, "disp": disp_name},
+        id={"type": "var-squad-select-item", "name": s_name, "disp": disp_name},
         n_clicks=0,
         style={
             "padding": "7px 14px",
@@ -200,7 +245,7 @@ def _render_sum_squad_item(s: dict, is_checked: bool) -> html.Div:
     )
  
  
-def _build_sum_squad_header(is_all_selected: bool, selected_count: int, total_count: int) -> html.Div:
+def _build_var_squad_header(is_all_selected: bool, selected_count: int, total_count: int) -> html.Div:
     return html.Div(
         className="d-flex align-items-center justify-content-between px-3 py-2 border-bottom user-select-none",
         style={
@@ -211,7 +256,7 @@ def _build_sum_squad_header(is_all_selected: bool, selected_count: int, total_co
         },
         children=[
             html.Div(
-                id={"type": "sum-squad-action", "action": "select-all"},
+                id={"type": "var-squad-action", "action": "select-all"},
                 className="d-flex align-items-center gap-2",
                 n_clicks=0,
                 style={"cursor": "pointer", "color": "#019881" if is_all_selected else "#495057"},
@@ -228,13 +273,13 @@ def _build_sum_squad_header(is_all_selected: bool, selected_count: int, total_co
     )
  
  
-def _build_sum_squad_footer(selected_count: int) -> html.Div:
+def _build_var_squad_footer(selected_count: int) -> html.Div:
     return html.Div(
         className="d-flex align-items-center justify-content-between px-3 py-2 border-top bg-light",
         children=[
             html.Span(
                 f"{selected_count} selected",
-                id="sum-squad-dropdown-count",
+                id="var-squad-dropdown-count",
                 style={"fontSize": _FONT_SIZE_SM_11_5, "color": "#495057", "fontWeight": "600"},
             ),
             html.Div(
@@ -242,14 +287,14 @@ def _build_sum_squad_footer(selected_count: int) -> html.Div:
                 children=[
                     html.Button(
                         "Reset",
-                        id={"type": "sum-squad-action", "action": "reset"},
+                        id={"type": "var-squad-action", "action": "reset"},
                         className="btn btn-sm btn-outline-secondary",
                         style={"fontSize": "11px", "padding": "2px 10px", "borderRadius": "4px", "fontWeight": "500"},
                         n_clicks=0,
                     ),
                     html.Button(
                         "Apply",
-                        id={"type": "sum-squad-action", "action": "apply"},
+                        id={"type": "var-squad-action", "action": "apply"},
                         className="btn btn-sm text-white",
                         style={
                             "fontSize": "11px",
@@ -267,15 +312,12 @@ def _build_sum_squad_footer(selected_count: int) -> html.Div:
     )
  
  
-def _build_sum_gbu_squad_rows(gbus: Dict[str, list], active_set: Set[str]) -> list:
+def _build_var_gbu_squad_rows(gbus: Dict[str, list], active_set: Set[str]) -> list:
     squad_rows = []
     for gbu_name, gbu_squads in gbus.items():
         squad_rows.append(
             html.Div(
-                children=[
-                    html.I(className="bi bi-diagram-3 me-1"),
-                    gbu_name,
-                ],
+                children=[html.I(className="bi bi-diagram-3 me-1"), gbu_name],
                 className="sidebar-dropdown-header",
                 style={
                     "padding": "5px 12px",
@@ -291,12 +333,11 @@ def _build_sum_gbu_squad_rows(gbus: Dict[str, list], active_set: Set[str]) -> li
         )
         for s in gbu_squads:
             is_checked = s.get("squad_name", "").upper() in active_set
-            squad_rows.append(_render_sum_squad_item(s, is_checked))
+            squad_rows.append(_render_var_squad_item(s, is_checked))
     return squad_rows
  
  
-def build_sum_squad_menu_items(squads: list, active_squad_name: str | list[str] = "BODY CARE") -> list:
-    """Build pure HTML multi-squad dropdown menu items grouped by GBU sections."""
+def build_var_squad_menu_items(squads: list, active_squad_name: str | list[str] = "BODY CARE") -> list:
     if not squads:
         return [html.Div("No squads available", className="p-3 text-center text-muted small")]
  
@@ -316,19 +357,18 @@ def build_sum_squad_menu_items(squads: list, active_squad_name: str | list[str] 
         gbu = s.get("gbu", "ALL")
         gbus.setdefault(gbu, []).append(s)
  
-    header_elem = _build_sum_squad_header(is_all_selected, selected_count, total_count)
+    header_elem = _build_var_squad_header(is_all_selected, selected_count, total_count)
     body_elem = html.Div(
-        id="sum-squad-dropdown-body",
+        id="var-squad-dropdown-body",
         className="val-squad-dropdown-body",
         style={"maxHeight": "260px", "overflowY": "auto", "padding": "4px 0"},
-        children=_build_sum_gbu_squad_rows(gbus, active_set),
+        children=_build_var_gbu_squad_rows(gbus, active_set),
     )
-    footer_elem = _build_sum_squad_footer(selected_count)
+    footer_elem = _build_var_squad_footer(selected_count)
     return [header_elem, body_elem, footer_elem]
  
  
-def format_sum_model_pill_label(selected_models: str | list[str], total_models: int = 0) -> str:
-    """Format user-facing pill text based on selected models count."""
+def format_var_model_pill_label(selected_models: str | list[str], total_models: int = 0) -> str:
     if not selected_models:
         return DEFAULT_MODEL_LABEL
     if isinstance(selected_models, str):
@@ -340,7 +380,7 @@ def format_sum_model_pill_label(selected_models: str | list[str], total_models: 
     return f"{len(selected_models)} Models Selected"
  
  
-def _render_sum_model_item(m: dict, is_checked: bool) -> html.Div:
+def _render_var_model_item(m: dict, is_checked: bool) -> html.Div:
     m_id = m.get("model_id") if m.get("model_id") is not None else 0
     m_name = m.get("model_name", str(m))
     check_icon = ICON_CHECKBOX_CHECKED if is_checked else ICON_CHECKBOX_UNCHECKED
@@ -348,7 +388,7 @@ def _render_sum_model_item(m: dict, is_checked: bool) -> html.Div:
  
     return html.Div(
         className="sidebar-dropdown-item",
-        id={"type": "sum-model-select-item", "id": m_id, "name": m_name},
+        id={"type": "var-model-select-item", "id": m_id, "name": m_name},
         n_clicks=0,
         style={
             "padding": "7px 14px",
@@ -374,7 +414,7 @@ def _render_sum_model_item(m: dict, is_checked: bool) -> html.Div:
     )
  
  
-def _build_sum_model_header(is_all_selected: bool, selected_count: int, total_count: int) -> html.Div:
+def _build_var_model_header(is_all_selected: bool, selected_count: int, total_count: int) -> html.Div:
     return html.Div(
         className="d-flex align-items-center justify-content-between px-3 py-2 border-bottom user-select-none",
         style={
@@ -385,7 +425,7 @@ def _build_sum_model_header(is_all_selected: bool, selected_count: int, total_co
         },
         children=[
             html.Div(
-                id={"type": "sum-model-action", "action": "select-all"},
+                id={"type": "var-model-action", "action": "select-all"},
                 className="d-flex align-items-center gap-2",
                 n_clicks=0,
                 style={"cursor": "pointer", "color": "#019881" if is_all_selected else "#495057"},
@@ -402,13 +442,13 @@ def _build_sum_model_header(is_all_selected: bool, selected_count: int, total_co
     )
  
  
-def _build_sum_model_footer(selected_count: int) -> html.Div:
+def _build_var_model_footer(selected_count: int) -> html.Div:
     return html.Div(
         className="d-flex align-items-center justify-content-between px-3 py-2 border-top bg-light",
         children=[
             html.Span(
                 f"{selected_count} selected",
-                id="sum-model-dropdown-count",
+                id="var-model-dropdown-count",
                 style={"fontSize": _FONT_SIZE_SM_11_5, "color": "#495057", "fontWeight": "600"},
             ),
             html.Div(
@@ -416,14 +456,14 @@ def _build_sum_model_footer(selected_count: int) -> html.Div:
                 children=[
                     html.Button(
                         "Reset",
-                        id={"type": "sum-model-action", "action": "reset"},
+                        id={"type": "var-model-action", "action": "reset"},
                         className="btn btn-sm btn-outline-secondary",
                         style={"fontSize": "11px", "padding": "2px 10px", "borderRadius": "4px", "fontWeight": "500"},
                         n_clicks=0,
                     ),
                     html.Button(
                         "Apply",
-                        id={"type": "sum-model-action", "action": "apply"},
+                        id={"type": "var-model-action", "action": "apply"},
                         className="btn btn-sm text-white",
                         style={
                             "fontSize": "11px",
@@ -441,7 +481,7 @@ def _build_sum_model_footer(selected_count: int) -> html.Div:
     )
  
  
-def _build_sum_squad_model_rows(models: list, active_set: Set[str]) -> list:
+def _build_var_squad_model_rows(models: list, active_set: Set[str]) -> list:
     squad_groups: Dict[str, list] = {}
     for m in models:
         sq = m.get("squad_name") or m.get("primary_need_state") or "Other"
@@ -454,10 +494,7 @@ def _build_sum_squad_model_rows(models: list, active_set: Set[str]) -> list:
         if has_squad_headers:
             model_rows.append(
                 html.Div(
-                    children=[
-                        html.I(className="bi bi-diagram-3 me-1"),
-                        sq_name.title(),
-                    ],
+                    children=[html.I(className="bi bi-diagram-3 me-1"), sq_name.title()],
                     className="sidebar-dropdown-header",
                     style={
                         "padding": "5px 12px",
@@ -475,16 +512,15 @@ def _build_sum_squad_model_rows(models: list, active_set: Set[str]) -> list:
         for m in sq_models:
             m_name = m.get("model_name", str(m))
             is_checked = m_name.upper() in active_set
-            model_rows.append(_render_sum_model_item(m, is_checked))
+            model_rows.append(_render_var_model_item(m, is_checked))
     return model_rows
  
  
-def build_sum_model_menu_items(
+def build_var_model_menu_items(
     models: list,
     active_model_name: str | list[str] = DEFAULT_BODY_CARE,
     has_squad: bool = True,
 ) -> list:
-    """Build pure HTML multi-model dropdown menu grouped by Squad with Select All, Checkboxes, and Apply."""
     if not models:
         empty_prompt = (
             "No models available for this domain"
@@ -504,30 +540,29 @@ def build_sum_model_menu_items(
     selected_count = sum(1 for m in models if m.get("model_name", "").upper() in active_set)
     is_all_selected = (selected_count == total_count) if total_count > 0 else False
  
-    header_elem = _build_sum_model_header(is_all_selected, selected_count, total_count)
+    header_elem = _build_var_model_header(is_all_selected, selected_count, total_count)
     body_elem = html.Div(
-        id="sum-model-dropdown-body",
+        id="var-model-dropdown-body",
         className="val-model-dropdown-body",
         style={"maxHeight": "240px", "overflowY": "auto", "padding": "4px 0"},
-        children=_build_sum_squad_model_rows(models, active_set),
+        children=_build_var_squad_model_rows(models, active_set),
     )
-    footer_elem = _build_sum_model_footer(selected_count)
+    footer_elem = _build_var_model_footer(selected_count)
     return [header_elem, body_elem, footer_elem]
  
  
 def render_empty_domain_alert(model_name: str, domain: str) -> html.Div:
-    """Render helpful alert card when a model has no records in the active domain."""
     return html.Div(
         className="p-5 bg-white rounded border text-center my-4",
         style={"boxShadow": "0 1px 3px rgba(0, 0, 0, 0.05)", "maxWidth": "720px", "margin": "40px auto"},
         children=[
             html.I(className="bi bi-exclamation-triangle text-warning fs-1 mb-3 d-block"),
-            html.H5(f"No {domain.title()} Data for '{model_name}'", className="fw-bold text-dark mb-2"),
+            html.H5(f"No {domain.title()} Variance Data for '{model_name}'", className="fw-bold text-dark mb-2"),
             html.P(
                 [
-                    f"The model '{model_name}' is not configured with {domain.title()} data in Snowflake.",
+                    f"The model '{model_name}' has no building block changes recorded.",
                     html.Br(),
-                    "Please select an available model from the Model dropdown above.",
+                    "Please select another model from the Model dropdown above.",
                 ],
                 className="text-muted mb-0",
                 style={"fontSize": "13px"},
@@ -537,16 +572,15 @@ def render_empty_domain_alert(model_name: str, domain: str) -> html.Div:
  
  
 def render_empty_selection_card(empty_type: str = "model", domain: str = "CONSUMPTION") -> html.Div:
-    """Render modern empty-state card when either no squad or no model is selected."""
     domain_title = (domain or "CONSUMPTION").title()
     if empty_type == "squad":
         icon_class = "bi bi-diagram-3 text-secondary fs-1 mb-3 d-block"
         title_text = "No Squad Selected"
-        desc_text = "Please select one or more squads above to view available models and summary data."
+        desc_text = "Please select one or more squads above to view available models and variance data."
     else:
         icon_class = "bi bi-grid-3x3 text-secondary fs-1 mb-3 d-block"
         title_text = "No Model Selected"
-        desc_text = f"Please select one or more models from the Model dropdown above to view {domain_title} data."
+        desc_text = f"Please select one or more models from the Model dropdown above to view {domain_title} Variance data."
  
     return html.Div(
         className="p-5 bg-white rounded border text-center my-4",
@@ -554,19 +588,14 @@ def render_empty_selection_card(empty_type: str = "model", domain: str = "CONSUM
         children=[
             html.I(className=icon_class),
             html.H5(title_text, className="fw-bold text-dark mb-2"),
-            html.P(
-                desc_text,
-                className="text-muted mb-0",
-                style={"fontSize": "13px"},
-            ),
+            html.P(desc_text, className="text-muted mb-0", style={"fontSize": "13px"}),
         ],
     )
  
  
 # ─── Page Layout ──────────────────────────────────────────────────────────────
  
-def _handle_summary_auth_redirect() -> Optional[dcc.Location]:
-    """Handle authentication check and redirection for Summary Dashboard."""
+def _handle_variance_auth_redirect() -> Optional[dcc.Location]:
     if not has_request_context():
         return None
  
@@ -575,26 +604,18 @@ def _handle_summary_auth_redirect() -> Optional[dcc.Location]:
             from auth.routes import establish_local_dev_session
             establish_local_dev_session()
         else:
-            target_path = SUMMARY_ROUTE
+            target_path = VARIANCE_ROUTE
             if request.query_string:
                 target_path = f"{request.path}?{request.query_string.decode('utf-8')}"
-            return dcc.Location(
-                href=f"/auth/login?next={target_path}",
-                id="summary-auth-redirect",
-                refresh=True,
-            )
+            return dcc.Location(href=f"/auth/login?next={target_path}", id="variance-auth-redirect", refresh=True)
  
     curr_user = get_current_user() or {}
     if not curr_user.get("ad_group"):
-        return dcc.Location(
-            href="/unauthorized",
-            id="summary-unauth-redirect",
-            refresh=True,
-        )
+        return dcc.Location(href="/unauthorized", id="variance-unauth-redirect", refresh=True)
     return None
  
  
-def _resolve_summary_user_identity(user: dict, persona: dict) -> Tuple[str, str]:
+def _resolve_variance_user_identity(user: dict, persona: dict) -> Tuple[str, str]:
     user_name = user.get("display_name", "")
     user_email = user.get("email", "")
     if not user_name and user_email:
@@ -639,6 +660,7 @@ def _get_initial_squads(gbu_codes: list) -> Tuple[list, str, str]:
     return squads, active_squad_name, active_squad_disp
  
  
+  
 def _get_initial_models(active_squad_name: str, gbu_codes: list) -> Tuple[list, str]:
     try:
         all_models = get_models_by_squad(active_squad_name, gbu_codes)
@@ -647,16 +669,13 @@ def _get_initial_models(active_squad_name: str, gbu_codes: list) -> Tuple[list, 
  
     cons_models = [m for m in all_models if m.get("has_pos")]
     candidate_models = cons_models or all_models
-    if candidate_models:
-        active_model_name = candidate_models[0]["model_name"]
-    else:
-        active_model_name = DEFAULT_BODY_CARE
+    active_model_name = candidate_models[0]["model_name"] if candidate_models else DEFAULT_BODY_CARE
     return candidate_models, active_model_name
  
  
 def layout():
     """Pure Python Dash layout evaluated dynamically per request."""
-    redirect = _handle_summary_auth_redirect()
+    redirect = _handle_variance_auth_redirect()
     if redirect is not None:
         return redirect
  
@@ -671,36 +690,38 @@ def layout():
         initial_persona_key = "COM-APP-NA-IBP-SELFCARE"
     persona = AD_PERSONAS.get(initial_persona_key, AD_PERSONAS["COM-APP-NA-IBP-SELFCARE"])
  
-    user_name, user_email = _resolve_summary_user_identity(user, persona)
+    user_name, user_email = _resolve_variance_user_identity(user, persona)
     gbu_codes = _get_initial_gbu_codes(initial_persona_key, persona)
     squads, active_squad_name, _ = _get_initial_squads(gbu_codes)
     candidate_models, active_model_name = _get_initial_models(active_squad_name, gbu_codes)
  
-    ad_items = build_sum_ad_switcher_menu_items(active_key=initial_persona_key)
-    squad_items = build_sum_squad_menu_items(squads, active_squad_name=active_squad_name)
-    model_items = build_sum_model_menu_items(candidate_models, active_model_name=active_model_name)
+    ad_items = build_var_ad_switcher_menu_items(active_key=initial_persona_key)
+    squad_items = build_var_squad_menu_items(squads, active_squad_name=active_squad_name)
+    model_items = build_var_model_menu_items(candidate_models, active_model_name=active_model_name)
+    mode_items = build_var_mode_menu_items(active_mode="IBP")
  
     return html.Div(
-        id="summary-page-root",
+        id="variance-page-root",
         className="d-flex flex-column",
         style={"minHeight": "100vh", "backgroundColor": "var(--b10, #FAFAFA)"},
         children=[
             # ── State Stores ──────────────────────────────────────────────────
-            dcc.Store(id="filter-sum-domain", data="consumption"),
-            dcc.Store(id="filter-sum-squad", data=[active_squad_name] if active_squad_name else []),
-            dcc.Store(id="sum-squad-staging-store", data=None),
-            dcc.Store(id="filter-sum-model", data=[active_model_name] if active_model_name else []),
-            dcc.Store(id="sum-model-staging-store", data=None),
-            dcc.Store(id="sum-header-ad-switcher", data=initial_persona_key),
-            dcc.Store(id="sum-open-menu-store", data=None),
-            dcc.Store(id="sum-cache-store", data={}),
+            dcc.Store(id="filter-var-domain", data="consumption"),
+            dcc.Store(id="filter-var-mode", data="IBP"),  # Default = IBP
+            dcc.Store(id="filter-var-squad", data=[active_squad_name] if active_squad_name else []),
+            dcc.Store(id="var-squad-staging-store", data=None),
+            dcc.Store(id="filter-var-model", data=[active_model_name] if active_model_name else []),
+            dcc.Store(id="var-model-staging-store", data=None),
+            dcc.Store(id="var-header-ad-switcher", data=initial_persona_key),
+            dcc.Store(id="var-open-menu-store", data=None),
+            dcc.Store(id="var-cache-store", data={}),
  
             # ── 1. Top Brand Accent Multi-Color Bar ───────────────────────────
             html.Div(className="accent"),
  
             # ── 2. Top Navigation Bar ─────────────────────────────────────────
             render_workbench_header(
-                page="summary",
+                page="variance",
                 user_name=user_name,
                 user_email=user_email,
                 role_label=persona["role_label"],
@@ -715,7 +736,7 @@ def layout():
                 children=[
                     # ── Left Compact Dock (140px Width) ──
                     html.Aside(
-                        id="sum-sidebar",
+                        id="var-sidebar",
                         className="planning-sidebar",
                         style={
                             "width": "140px",
@@ -727,7 +748,6 @@ def layout():
                             "gap": "10px",
                         },
                         children=[
-                            # Section: Dashboard Title
                             html.Div([
                                 html.Div(
                                     className="sidebar-section-title mb-2",
@@ -744,18 +764,15 @@ def layout():
                                         ),
                                     ],
                                 ),
- 
-                                # Stacked Vertical Tiles
                                 dcc.Loading(
-                                    id="sum-domain-loading",
+                                    id="var-domain-loading",
                                     type="dot",
                                     color="#00B097",
                                     children=html.Div(
                                         className="d-flex flex-column gap-2",
                                         children=[
-                                            # Consumption Tile
                                             html.Div(
-                                                id="card-sum-consumption",
+                                                id="card-var-consumption",
                                                 className="val-tile-stacked active-domain",
                                                 style=TILE_ACTIVE_STYLE,
                                                 n_clicks=0,
@@ -764,40 +781,14 @@ def layout():
                                                     html.Span("Consumption", className="val-tile-label", style={"fontWeight": "700", "fontSize": _FONT_SIZE_SM_11_5}),
                                                 ],
                                             ),
- 
-                                            # Shipment Tile
                                             html.Div(
-                                                id="card-sum-shipment",
+                                                id="card-var-shipment",
                                                 className=CLASS_TILE_INACTIVE,
                                                 style=TILE_INACTIVE_STYLE,
                                                 n_clicks=0,
                                                 children=[
                                                     html.I(className="bi bi-truck fs-5 mb-1"),
                                                     html.Span("Shipment", className="val-tile-label", style={"fontWeight": "700", "fontSize": _FONT_SIZE_SM_11_5}),
-                                                ],
-                                            ),
- 
-                                            # GTS YoY Tile
-                                            html.Div(
-                                                id="card-sum-gts",
-                                                className=CLASS_TILE_INACTIVE,
-                                                style=TILE_INACTIVE_STYLE,
-                                                n_clicks=0,
-                                                children=[
-                                                    html.I(className="bi bi-graph-up-arrow fs-5 mb-1"),
-                                                    html.Span("GTS YoY", className="val-tile-label", style={"fontWeight": "700", "fontSize": _FONT_SIZE_SM_11_5}),
-                                                ],
-                                            ),
- 
-                                            # GTS CoC Tile
-                                            html.Div(
-                                                id="card-sum-gtscoc",
-                                                className=CLASS_TILE_INACTIVE,
-                                                style=TILE_INACTIVE_STYLE,
-                                                n_clicks=0,
-                                                children=[
-                                                    html.I(className="bi bi-arrow-repeat fs-5 mb-1"),
-                                                    html.Span("GTS CoC", className="val-tile-label", style={"fontWeight": "700", "fontSize": _FONT_SIZE_SM_11_5}),
                                                 ],
                                             ),
                                         ],
@@ -809,10 +800,10 @@ def layout():
  
                     # ── Right Main Workbench Area ─────────────────────────────
                     html.Main(
-                        id="sum-workbench",
+                        id="var-workbench",
                         className="planning-main",
                         children=[
-                            # ── 1. Top Horizon Filter Bar (Squad -> Peach Model) ──
+                            # ── 1. Top Horizon Filter Bar (Squad -> Peach Model -> Compare IBP/BP) ──
                             html.Section(
                                 className="horizon-top-bar",
                                 children=[
@@ -822,7 +813,7 @@ def layout():
                                             # Need State / Squad Box
                                             html.Div(
                                                 className="horizon-box horizon-squad-box",
-                                                id="pill-sum-squad",
+                                                id="pill-var-squad",
                                                 title="Select Need State / Squad",
                                                 n_clicks=0,
                                                 children=[
@@ -835,13 +826,13 @@ def layout():
                                                         ],
                                                     ),
                                                     html.Span(
-                                                        format_sum_squad_pill_label([active_squad_name]),
+                                                        format_var_squad_pill_label([active_squad_name]),
                                                         className="box-value",
-                                                        id="selected-sum-squad-label",
+                                                        id="selected-var-squad-label",
                                                     ),
                                                     html.Div(
                                                         className="sidebar-dropdown-menu",
-                                                        id="menu-sum-squad",
+                                                        id="menu-var-squad",
                                                         children=squad_items,
                                                     ),
                                                 ],
@@ -850,7 +841,7 @@ def layout():
                                             # Model Box (Peach Background)
                                             html.Div(
                                                 className="horizon-box horizon-model-box",
-                                                id="pill-sum-model",
+                                                id="pill-var-model",
                                                 title=DEFAULT_MODEL_LABEL,
                                                 n_clicks=0,
                                                 children=[
@@ -863,14 +854,44 @@ def layout():
                                                         ],
                                                     ),
                                                     html.Span(
-                                                        format_sum_model_pill_label([active_model_name]),
+                                                        format_var_model_pill_label([active_model_name]),
                                                         className="box-value",
-                                                        id="selected-sum-model-label",
+                                                        id="selected-var-model-label",
                                                     ),
                                                     html.Div(
                                                         className="sidebar-dropdown-menu",
-                                                        id="menu-sum-model",
+                                                        id="menu-var-model",
                                                         children=model_items,
+                                                    ),
+                                                ],
+                                            ),
+ 
+                                            # Compare Mode Box (IBP / BP Selector)
+                                            html.Div(
+                                                className="horizon-box",
+                                                id="pill-var-mode",
+                                                title="Select Baseline (IBP vs BP)",
+                                                n_clicks=0,
+                                                style={"minWidth": "140px", "cursor": "pointer"},
+                                                children=[
+                                                    html.Div(
+                                                        className="box-label",
+                                                        children=[
+                                                            html.I(className="bi bi-layers me-1 text-success"),
+                                                            html.Span("Compare"),
+                                                            html.Span("\u25BC", className="caret ms-1"),
+                                                        ],
+                                                    ),
+                                                    html.Span(
+                                                        "IBP",
+                                                        className="box-value",
+                                                        id="selected-var-mode-label",
+                                                    ),
+                                                    html.Div(
+                                                        className="sidebar-dropdown-menu",
+                                                        id="menu-var-mode",
+                                                        style={"minWidth": "210px"},
+                                                        children=mode_items,
                                                     ),
                                                 ],
                                             ),
@@ -887,12 +908,12 @@ def layout():
                                         className="ribbon-left d-flex align-items-center gap-2",
                                         children=[
                                             html.Span("▶", className="ribbon-play-icon", style={"color": _COLOR_TRUST_GREEN, "fontSize": "11px"}),
-                                            html.Strong(id="ribbon-sum-domain-title", children="CONSUMPTION", style={"fontSize": _FONT_SIZE_SM_11_5, "letterSpacing": "0.04em"}),
+                                            html.Strong(id="ribbon-var-domain-title", children="CONSUMPTION VARIANCE (IBP)", style={"fontSize": _FONT_SIZE_SM_11_5, "letterSpacing": "0.04em"}),
                                             html.Span(" — "),
-                                            html.Strong(id="ribbon-sum-model-title", children=active_model_name, style={"fontSize": _FONT_SIZE_SM_11_5}),
+                                            html.Strong(id="ribbon-var-model-title", children=active_model_name, style={"fontSize": _FONT_SIZE_SM_11_5}),
                                             html.Span(
-                                                id="sum-status-badge",
-                                                children="POS $ are in millions.",
+                                                id="var-status-badge",
+                                                children="Current Cycle vs Prior Cycle | POS $ are in millions.",
                                                 style={"fontSize": _FONT_SIZE_SM_11_5, "color": "#495057", "fontWeight": "500", "fontStyle": "italic"},
                                             ),
                                         ],
@@ -901,7 +922,7 @@ def layout():
                                         className="ribbon-badges",
                                         children=[
                                             dbc.Badge(
-                                                id="sum-fiscal-badge",
+                                                id="var-fiscal-badge",
                                                 children=f"Fiscal: {curr_kv.kv_month_abbr} {display_kv_year}",
                                                 color="success",
                                                 className="border",
@@ -914,14 +935,14 @@ def layout():
  
                             # ── 3. Main Data Workbench Table Container ────────────────
                             dcc.Loading(
-                                id="sum-loading",
+                                id="var-loading",
                                 type="circle",
                                 color="#00B097",
                                 delay_show=0,
                                 delay_hide=150,
                                 overlay_style={"visibility": "visible", "opacity": 0.65, "backgroundColor": "rgba(255, 255, 255, 0.7)"},
                                 children=html.Div(
-                                    id="sum-grid-container",
+                                    id="var-grid-container",
                                     children=render_summary_loading_skeleton("CONSUMPTION"),
                                 ),
                             ),
@@ -938,15 +959,15 @@ def layout():
                         className="footer-left",
                         children=[
                             html.Span(
-                                id="sum-footer-status-indicator",
+                                id="var-footer-status-indicator",
                                 className="footer-status-indicator",
                                 children=[
-                                    html.Span(id="sum-footer-status-dot", className="status-dot status-dot-online"),
-                                    html.Span(id="sum-footer-status-text", children="System Online"),
+                                    html.Span(id="var-footer-status-dot", className="status-dot status-dot-online"),
+                                    html.Span(id="var-footer-status-text", children="System Online"),
                                 ],
                             ),
                             html.Span("|", className="footer-pipe text-muted", style={"opacity": "0.35", "margin": "0 8px"}),
-                            html.Span(id="sum-footer-db-status", children="Consolidated View Active", className="text-muted"),
+                            html.Span(id="var-footer-db-status", children="Consolidated View Active", className="text-muted"),
                         ],
                     ),
                     html.Div(
@@ -954,7 +975,7 @@ def layout():
                         children=[
                             html.Span(f"© {today_dt.year} Kenvue Inc.", className="text-muted small"),
                             html.Span("|", className="footer-pipe text-muted", style={"opacity": "0.35", "margin": "0 8px"}),
-                            html.Span("NA IBP Summary Dashboard v3.6", className="text-muted small"),
+                            html.Span("NA IBP Variance Dashboard v1.1", className="text-muted small"),
                         ],
                     ),
                 ],
