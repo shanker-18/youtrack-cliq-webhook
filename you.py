@@ -1,1181 +1,1461 @@
-# pylint: disable=too-many-lines,too-many-locals,too-many-branches,broad-except
+# pylint: disable=too-many-lines,too-many-return-statements
 """
-NA IBP Planning Application — Summary Dashboard Data Service
-============================================================
-Handles PostgreSQL connectivity (via ThreadedConnectionPool / get_db_cursor)
-and Snowflake connectivity (via RSA Private Key authentication) for all
-Summary Dashboards: Consumption Summary, Shipment Summary, GTS YoY, and GTS CoC.
- 
-Features:
+NA IBP Planning Application — Summary Dashboard Callbacks
+=========================================================
+Handles all interactive callbacks for the Summary Dashboard:
+- 4-Domain card toggling (Consumption, Shipment, GTS YoY, GTS CoC)
+- Cascading hierarchy in native Dash HTML (Squad -> Peach Model) governed by active AD Group
+- Pure HTML dropdown menu toggles via fast clientside callback (<1ms)
+- Automatic, fast Snowflake and PostgreSQL data load on model selection (Zero refresh button!)
+- In-memory server caching in _SUM_SNOWFLAKE_CACHE for instantaneous transitions
+- Seamless two-way state persistence with Planning Workspace & Validation via session stores
+- Helpful empty-state guidance when a model is not available in a toggled domain
 - Pure Python implementation (zero pandas dependency)
-- 100% Dynamic years and months using services.kv_calendar.KenvueCalendar
-- Parameterized queries supporting single or multi-model selections
-- Dynamic completeness validation for Snowflake actuals
-- Snapshots and cycle discovery for GTS Change of Cycle (CoC)
 """
  
 import os
-import re
-import datetime
-from typing import Optional, Dict, List, Tuple, Any, NamedTuple, Union
+import time
+from datetime import date
+from typing import Optional, Dict, Any, List, Tuple
 import psycopg2
+import snowflake.connector
+from dash import callback, clientside_callback, Output, Input, State, callback_context, no_update, html, ALL
+from dash.exceptions import MissingCallbackContextException
  
-from config import config
-from database.connection import get_db_cursor
-from services.kv_calendar import KenvueCalendar
-from services.validation_service import (
-    get_snowflake_connection,
-    normalize_text,
-    is_token_expired_error,
+from services.summary_calculations import (
+    compute_consumption_summary_matrix,
+    compute_shipment_summary_matrix,
+    compute_gts_summary_matrix,
+    compute_gtscoc_summary_matrix,
 )
+from services.kv_calendar import KenvueCalendar
+from services.validation_service import normalize_text
+from repositories.hierarchy_repository import (
+    get_squads_by_gbu,
+    get_models_by_squad,
+    get_model_by_id,
+    get_all_models,
+)
+from repositories.security_repository import get_ad_group_mapping
+from callbacks.filter_callbacks import AD_PERSONAS
+from components.summary_grid import render_summary_matrix_table
+from pages.summary import (
+    build_sum_ad_switcher_menu_items,
+    build_sum_squad_menu_items,
+    build_sum_model_menu_items,
+    format_sum_squad_pill_label,
+    format_sum_model_pill_label,
+    render_empty_domain_alert,
+    render_empty_selection_card,
+    TILE_ACTIVE_STYLE,
+    TILE_INACTIVE_STYLE,
+)
+ 
+from utils.constants import GBU_PAIN_CARE
 from utils.logger import get_logger
+from auth.session import get_current_user, set_user_session
  
 logger = get_logger(__name__)
  
-MONTH_NAME_MAP = {
-    "JAN": 1, "JANUARY": 1, "FEB": 2, "FEBRUARY": 2, "MAR": 3, "MARCH": 3,
-    "APR": 4, "APRIL": 4, "MAY": 5, "JUN": 6, "JUNE": 6,
-    "JUL": 7, "JULY": 7, "AUG": 8, "AUGUST": 8, "SEP": 9, "SEPTEMBER": 9,
-    "OCT": 10, "OCTOBER": 10, "NOV": 11, "NOVEMBER": 11, "DEC": 12, "DECEMBER": 12
-}
+_SELECT_MODEL = "Select Model"
+_SELECT_SQUAD = "Select Squad"
+_PREFIX_UNAVAILABLE = "UNAVAILABLE:"
  
  
-def _normalize_models(models: Any) -> list[str]:
-    """Safely normalizes input model(s) to a clean list of non-empty strings."""
+def _build_summary_user_identity_elem(persona_email: str) -> list:
+    """Build stacked user identity element (Name bold on top, Email underneath)."""
+    user = get_current_user() or {}
+    user_name = user.get("display_name", "")
+    user_email = user.get("email") or persona_email
+    if not user_name and user_email:
+        user_name = user_email.split("@")[0].replace(".", " ").title()
+    elif not user_name:
+        user_name = "User"
+    return [
+        html.Span(user_name, className="fw-bold text-dark lh-sm", style={"fontSize": "12px"}),
+        html.Span(user_email, className="text-muted lh-sm", style={"fontSize": "11px"}),
+    ]
+ 
+ 
+# Server-side in-memory cache for raw Summary matrix computations (30-min TTL + fiscal rollover key)
+_SUM_SNOWFLAKE_CACHE: Dict[str, Dict[str, Any]] = {}
+_SUM_SNOWFLAKE_CACHE_TS: Dict[str, float] = {}
+_SUM_CACHE_TTL_SECONDS = 1800.0
+ 
+ 
+def _get_sum_fiscal_context() -> tuple[str, str]:
+    """Return (cache_fiscal_tag, live_fiscal_badge_text) derived dynamically from KenvueCalendar."""
+    today_dt = date.today()
+    env_year = os.getenv("IBP_PLAN_YEAR")
+    try:
+        d_info = KenvueCalendar.get_date_info(today_dt)
+        plan_yr = int(env_year) if (env_year and env_year.isdigit()) else d_info.kv_year
+        fiscal_tag = f"{plan_yr}:{d_info.kv_mo_id}"
+        badge_text = f"Fiscal: {d_info.kv_month_abbr} {plan_yr}"
+        return fiscal_tag, badge_text
+    except Exception:
+        yr_str = env_year if (env_year and env_year.isdigit()) else today_dt.strftime("%Y")
+        return f"{yr_str}:{today_dt.strftime('%Y-%m')}", f"Fiscal: {today_dt.strftime('%b').upper()} {yr_str}"
+ 
+ 
+def _is_sum_cache_valid(cache_key: str) -> bool:
+    """Check whether cached Summary matrix entry exists and is within TTL."""
+    if cache_key not in _SUM_SNOWFLAKE_CACHE:
+        return False
+    ts = _SUM_SNOWFLAKE_CACHE_TS.get(cache_key, 0.0)
+    if (time.monotonic() - ts) > _SUM_CACHE_TTL_SECONDS:
+        _SUM_SNOWFLAKE_CACHE.pop(cache_key, None)
+        _SUM_SNOWFLAKE_CACHE_TS.pop(cache_key, None)
+        return False
+    return True
+ 
+ 
+def clear_summary_cache() -> None:
+    """Clears the server-side summary cache."""
+    _SUM_SNOWFLAKE_CACHE.clear()
+    _SUM_SNOWFLAKE_CACHE_TS.clear()
+ 
+ 
+# ─── 0. Pure HTML Dropdown Menu Open/Close State Manager (Clientside) ─────────
+ 
+clientside_callback(
+    """
+    function(n_ad, n_squad, n_model,
+             ad_clicks, squad_clicks, model_clicks, action_clicks, squad_action_clicks,
+             currentOpen) {
+ 
+        var MENU_MAP = {
+            "btn-sum-ad-group-switcher": { key: "ad",    menuId: "menu-sum-ad-switcher", baseCls: "header-dropdown-menu" },
+            "pill-sum-squad":            { key: "squad", menuId: "menu-sum-squad",       baseCls: "sidebar-dropdown-menu" },
+            "pill-sum-model":            { key: "model", menuId: "menu-sum-model",       baseCls: "sidebar-dropdown-menu" }
+        };
+ 
+        var ALL_MENUS = [
+            { id: "menu-sum-ad-switcher", baseCls: "header-dropdown-menu", key: "ad" },
+            { id: "menu-sum-squad",       baseCls: "sidebar-dropdown-menu", key: "squad" },
+            { id: "menu-sum-model",       baseCls: "sidebar-dropdown-menu", key: "model" }
+        ];
+ 
+        var ctx = window.dash_clientside.callback_context;
+        if (!ctx || !ctx.triggered || ctx.triggered.length === 0) {
+            return window.dash_clientside.no_update;
+        }
+ 
+        var clickTrigger = ctx.triggered.find(function(t) {
+            return t.value !== null && t.value !== undefined && t.value > 0;
+        });
+        if (!clickTrigger) {
+            return window.dash_clientside.no_update;
+        }
+ 
+        var triggeredId = clickTrigger.prop_id.split(".")[0];
+        var parsedId = null;
+        try { parsedId = JSON.parse(triggeredId); } catch(e) {}
+ 
+        var newOpenKey = null;
+ 
+        if (parsedId && typeof parsedId === "object" && parsedId.type) {
+            if (parsedId.type === "sum-model-select-item") {
+                newOpenKey = "model";
+                var mBodySel = document.getElementById("sum-model-dropdown-body");
+                if (mBodySel) { window._sumModelScroll = mBodySel.scrollTop; }
+            } else if (parsedId.type === "sum-model-action") {
+                if (parsedId.action === "apply") {
+                    newOpenKey = null;
+                    window._sumModelScroll = 0;
+                } else if (parsedId.action === "reset") {
+                    newOpenKey = "model";
+                    window._sumModelScroll = 0;
+                    var mBodyRst = document.getElementById("sum-model-dropdown-body");
+                    if (mBodyRst) { mBodyRst.scrollTop = 0; }
+                } else {
+                    newOpenKey = "model";
+                    var mBodyAct = document.getElementById("sum-model-dropdown-body");
+                    if (mBodyAct) { window._sumModelScroll = mBodyAct.scrollTop; }
+                }
+            } else if (parsedId.type === "sum-squad-select-item") {
+                newOpenKey = "squad";
+                var sBodySel = document.getElementById("sum-squad-dropdown-body");
+                if (sBodySel) { window._sumSquadScroll = sBodySel.scrollTop; }
+            } else if (parsedId.type === "sum-squad-action") {
+                if (parsedId.action === "apply") {
+                    newOpenKey = null;
+                    window._sumSquadScroll = 0;
+                } else if (parsedId.action === "reset") {
+                    newOpenKey = "squad";
+                    window._sumSquadScroll = 0;
+                    var sBodyRst = document.getElementById("sum-squad-dropdown-body");
+                    if (sBodyRst) { sBodyRst.scrollTop = 0; }
+                } else {
+                    newOpenKey = "squad";
+                    var sBodyAct = document.getElementById("sum-squad-dropdown-body");
+                    if (sBodyAct) { window._sumSquadScroll = sBodyAct.scrollTop; }
+                }
+            } else {
+                newOpenKey = null;
+            }
+        } else {
+            var entry = MENU_MAP[triggeredId];
+            if (entry) {
+                newOpenKey = (currentOpen === entry.key) ? null : entry.key;
+                if (newOpenKey === "squad" && currentOpen !== "squad") {
+                    window._sumSquadScroll = 0;
+                    var sBodyOpen = document.getElementById("sum-squad-dropdown-body");
+                    if (sBodyOpen) { sBodyOpen.scrollTop = 0; }
+                }
+                if (newOpenKey === "model" && currentOpen !== "model") {
+                    window._sumModelScroll = 0;
+                    var mBodyOpen = document.getElementById("sum-model-dropdown-body");
+                    if (mBodyOpen) { mBodyOpen.scrollTop = 0; }
+                }
+            }
+        }
+ 
+        ALL_MENUS.forEach(function(m) {
+            var el = document.getElementById(m.id);
+            if (!el) return;
+            var shouldShow = (newOpenKey === m.key);
+            el.className = shouldShow ? m.baseCls + " show" : m.baseCls;
+        });
+ 
+        return [
+            newOpenKey,
+            ALL_MENUS[0].baseCls + (newOpenKey === "ad"    ? " show" : ""),
+            ALL_MENUS[1].baseCls + (newOpenKey === "squad" ? " show" : ""),
+            ALL_MENUS[2].baseCls + (newOpenKey === "model" ? " show" : "")
+        ];
+    }
+    """,
+    Output("sum-open-menu-store", "data"),
+    Output("menu-sum-ad-switcher", "className"),
+    Output("menu-sum-squad", "className"),
+    Output("menu-sum-model", "className"),
+    Input("btn-sum-ad-group-switcher", "n_clicks"),
+    Input("pill-sum-squad", "n_clicks"),
+    Input("pill-sum-model", "n_clicks"),
+    Input({"type": "sum-ad-select-item", "key": ALL}, "n_clicks"),
+    Input({"type": "sum-squad-select-item", "name": ALL, "disp": ALL}, "n_clicks"),
+    Input({"type": "sum-model-select-item", "id": ALL, "name": ALL}, "n_clicks"),
+    Input({"type": "sum-model-action", "action": ALL}, "n_clicks"),
+    Input({"type": "sum-squad-action", "action": ALL}, "n_clicks"),
+    State("sum-open-menu-store", "data"),
+    prevent_initial_call=True,
+)
+ 
+ 
+def _normalize_squad_list(active_squads: str | list[str] | None) -> list[str]:
+    """Extract list of valid squad names excluding DEFAULT_SQUAD_LABEL."""
+    if not active_squads:
+        return []
+    if isinstance(active_squads, str):
+        return [active_squads] if active_squads != _SELECT_SQUAD else []
+    if isinstance(active_squads, (list, tuple, set)):
+        return [str(s) for s in active_squads if s and str(s) != _SELECT_SQUAD]
+    return []
+ 
+ 
+def _normalize_model_list(models: str | list[str] | None) -> list[str]:
+    """Extract list of valid model names excluding DEFAULT_MODEL_LABEL."""
     if not models:
         return []
     if isinstance(models, str):
-        s = models.strip()
-        return [s] if s else []
+        return [models] if models != _SELECT_MODEL else []
+    if isinstance(models, (list, tuple, set)):
+        return [str(m) for m in models if m and str(m) != _SELECT_MODEL]
+    return []
+ 
+ 
+def _pick_active_models(
+    avail_models: list[dict], curr_models_list: list[str]
+) -> tuple[list[str], int | None]:
+    """Pick preserved or default active models and primary model ID."""
+    avail_names_upper = {m["model_name"].upper(): m["model_name"] for m in avail_models if m.get("model_name")}
+    preserved = [avail_names_upper[m.upper()] for m in curr_models_list if m.upper() in avail_names_upper]
+    if preserved:
+        matched = next((m for m in avail_models if m["model_name"].upper() == preserved[0].upper()), None)
+        return preserved, matched.get("model_id") if matched else None
+    if avail_models:
+        return [avail_models[0]["model_name"]], avail_models[0].get("model_id")
+    return [], None
+ 
+ 
+def _safe_get_squads_by_gbu(gbu_codes: list) -> list:
+    """Fetch squads for authorized GBU(s) safely with fallback on DB error."""
     try:
-        return [str(m).strip() for m in models if m and str(m).strip()]
-    except (TypeError, ValueError):
+        return get_squads_by_gbu(gbu_codes)
+    except Exception as e:
+        logger.warning("Could not fetch squads for GBU %s: %s", gbu_codes, e)
         return []
  
  
-# ─── Constant Definitions ─────────────────────────────────────────────────────
- 
-MATCH_KEY_BASE_TREND = "BASE TREND"
-DRIVER_NET_INNOVATION = "Net Innovation"
-DRIVER_NET_PRICE = "Net Price"
-GROUP_IBP_OVERLAYS = "IBP Overlays"
- 
-# ─── Driver Definitions ───────────────────────────────────────────────────────
- 
-# Consumption & GTS YoY Driver Definitions: (Category Group, Display Name, DB Match Key)
-CONSUMPTION_DRIVER_ROW_DEFINITIONS = [
-    ("External",     "Base Trend",          MATCH_KEY_BASE_TREND),
-    ("External",     "Season",              "SEASON"),
-    ("External",     "Competition",         "COMPETITION"),
-    ("Distribution", "Distribution",        "DISTRIBUTION"),
-    ("Innovation",   DRIVER_NET_INNOVATION, "COMPOUND_NET_INNOVATION"),  # Innovation + Cannibalization
-    ("Innovation",   "Innovation",          "INNOVATION"),
-    ("Innovation",   "Cannibalization",     "CANNIBALIZATION"),
-    ("Innovation",   "Discontinuations",    "DISCONTINUATIONS"),
-    ("Innovation",   "Renovation",          "RENOVATION"),
-    ("Investment",   "Media",               "MEDIA"),
-    ("Investment",   "Trade",               "TRADE"),
-    ("Price",        DRIVER_NET_PRICE,      "COMPOUND_NET_PRICE"),       # Price + Elasticity
-    ("Price",        "Price",               "PRICE"),
-    ("Price",        "Elasticity",          "ELASTICITY"),
-    ("Other",        "Club",                "CLUB"),
-    ("Other",        "Other",               "OTHER"),
-]
- 
-# Shipment Driver Definitions: (Category Group, Display Name, DB Match Key)
-SHIPMENT_DRIVER_ROW_DEFINITIONS = [
-    ("Inventory",         "Distribution",       "DISTRIBUTION"),
-    ("Inventory",         "Innovation",         "INNOVATION"),
-    ("Inventory",         "Trade",              "TRADE"),
-    ("Inventory",         "Club",               "CLUB"),
-    ("Inventory",         "Retailer Inventory", "RETAILER_INVENTORY"),
-    ("Inventory",         "Other",              "OTHER"),
-    (GROUP_IBP_OVERLAYS,  "Supply Constraints", "SUPPLY_CONSTRAINTS"),
-    (GROUP_IBP_OVERLAYS,  "Liquidations",       "LIQUIDATIONS"),
-    (GROUP_IBP_OVERLAYS,  "Other",              "OVERLAYS_OTHER"),
-]
- 
-# GTS CoC Driver Definitions: (Category Group, Display Name, DB Match Key)
-GTS_COC_DRIVER_DEFINITIONS = [
-    ("External",     "Base Trend",          MATCH_KEY_BASE_TREND),
-    ("External",     "Season",              "SEASON"),
-    ("External",     "Competition",         "COMPETITION"),
-    ("Distribution", "Distribution",        "DISTRIBUTION"),
-    ("Innovation",   DRIVER_NET_INNOVATION, "COMPOUND_NET_INNOVATION"),
-    ("Innovation",   "Innovation",          "INNOVATION"),
-    ("Innovation",   "Cannibalization",     "CANNIBALIZATION"),
-    ("Innovation",   "Discontinuations",    "DISCONTINUATIONS"),
-    ("Innovation",   "Renovation",          "RENOVATION"),
-    ("Investment",   "Media",               "MEDIA"),
-    ("Investment",   "Trade",               "TRADE"),
-    ("Price",        DRIVER_NET_PRICE,      "COMPOUND_NET_PRICE"),
-    ("Price",        "Price",               "PRICE"),
-    ("Price",        "Elasticity",          "ELASTICITY"),
-    ("Other",        "Club",                "CLUB"),
-    ("Other",        "Other",               "OTHER"),
-]
- 
- 
-# ─── 1. Dynamic Fiscal Year & Month Parsing ───────────────────────────────────
- 
-def get_active_years() -> tuple[int, int]:
-    """
-    Dynamically determines (base_year, plan_year) using Kenvue 4-4-5 Fiscal Calendar.
-    - If IBP_PLAN_YEAR is set in environment, uses that override.
-    - Otherwise, derives active plan_year safely from KenvueCalendar.get_date_info.
-    base_year is always plan_year - 1.
-    """
-    env_year = os.getenv("IBP_PLAN_YEAR")
-    if env_year and env_year.isdigit():
-        plan_year = int(env_year)
-    else:
-        target_date = datetime.date.today()
-        plan_year = target_date.year
-        try:
-            today_info = KenvueCalendar.get_date_info(target_date)
-            if isinstance(today_info, dict):
-                plan_year = int(today_info.get("fiscal_year") or today_info.get("kv_year") or target_date.year)
-            elif hasattr(today_info, "fiscal_year"):
-                plan_year = int(today_info.fiscal_year)
-            elif hasattr(today_info, "kv_year"):
-                plan_year = int(today_info.kv_year)
-        except Exception:
-            try:
-                today_info = KenvueCalendar.get_date_info(target_date.strftime("%Y-%m-%d"))
-                if isinstance(today_info, dict):
-                    plan_year = int(today_info.get("fiscal_year") or today_info.get("kv_year") or target_date.year)
-            except Exception:
-                pass
- 
-    base_year = plan_year - 1
-    return base_year, plan_year
- 
- 
-def parse_month_num(val: Any) -> Optional[int]:
-    """Extracts month number (1..12) from dates, numbers, or month names."""
-    if val is None:
-        return None
-    if isinstance(val, (datetime.date, datetime.datetime)):
-        return val.month
-    s = str(val).strip().upper()
-    if s.isdigit():
-        n = int(s)
-        if 1 <= n <= 12:
-            return n
-    for k, v in MONTH_NAME_MAP.items():
-        if k in s:
-            return v
-    m_iso = re.search(r"[-/](\d{1,2})", s)
-    if m_iso:
-        n = int(m_iso.group(1))
-        if 1 <= n <= 12:
-            return n
-    return None
- 
- 
-# ─── 2. PostgreSQL Hierarchy Mapping ──────────────────────────────────────────
- 
-def load_squads_and_models() -> dict[str, list[str]]:
-    """Loads distinct squad (Need State) to model list mapping from PostgreSQL."""
-    sql = """
-    SELECT DISTINCT
-        COALESCE(chm.need_state, 'UNKNOWN') AS squad,
-        mm.model_name
-    FROM public.consumption_hierarchy_mapping chm
-    INNER JOIN public.master_models mm ON chm.model_id = mm.model_id
-    WHERE chm.is_active = TRUE AND mm.is_active = TRUE
-    ORDER BY squad, mm.model_name;
-    """
-    squad_map: dict[str, list[str]] = {}
-    try:
-        with get_db_cursor(commit=False) as cur:
-            cur.execute(sql)
-            rows = cur.fetchall()
-            for r in rows:
-                squad = str(r.get("squad") or "").strip().upper()
-                m_name = str(r.get("model_name") or "").strip()
-                if squad and squad not in ["ALL", "NONE", "UNKNOWN"] and m_name:
-                    squad_map.setdefault(squad, [])
-                    if m_name not in squad_map[squad]:
-                        squad_map[squad].append(m_name)
-    except Exception as e:
-        logger.error("Failed to load squads and models: %s", e)
- 
-    for models_list in squad_map.values():
-        models_list.sort()
-    return squad_map
- 
- 
-def load_consumption_model_rules(models: str | list[str]) -> list[dict[str, str]]:
-    """Loads Circana POS product hierarchy rules (C1..C5, B1..B2) for selected model(s)."""
-    model_list = _normalize_models(models)
-    if not model_list:
-        return []
- 
-    sql = """
-    SELECT
-        chm.brand_name,
-        chm.sub_brand_name,
-        chm.category,
-        chm.subcategory
-    FROM public.consumption_hierarchy_mapping chm
-    INNER JOIN public.master_models mm ON chm.model_id = mm.model_id
-    WHERE mm.model_name = ANY(%s) AND chm.is_active = TRUE;
-    """
-    rules = []
-    try:
-        with get_db_cursor(commit=False) as cur:
-            cur.execute(sql, (model_list,))
-            for r in cur.fetchall():
-                rules.append({
-                    "brand": normalize_text(r.get("brand_name")),
-                    "sub_brand": normalize_text(r.get("sub_brand_name")),
-                    "category": normalize_text(r.get("category")),
-                    "subcategory": normalize_text(r.get("subcategory")),
-                })
-    except Exception as e:
-        logger.error("Failed to load consumption model rules: %s", e)
-    return rules
- 
- 
-def load_shipment_model_rules(models: str | list[str]) -> list[dict[str, str]]:
-    """Loads Shipment GTS hierarchy rules (C1..C5, B1..B2) for selected model(s)."""
-    model_list = _normalize_models(models)
-    if not model_list:
-        return []
- 
-    sql = """
-    SELECT
-        g.code AS c1_business_segment,
-        shm.business_subsegment AS c2_business_subsegment,
-        shm.need_state AS c3_need_state,
-        shm.category AS c4_category,
-        shm.subcategory AS c5_subcategory,
-        shm.brand_name AS b1_brand,
-        shm.sub_brand_name AS b2_subbrand
-    FROM public.shipment_hierarchy_mapping shm
-    INNER JOIN public.master_models mm ON shm.model_id = mm.model_id
-    INNER JOIN public.gbus g ON shm.gbu_id = g.gbu_id
-    WHERE mm.model_name = ANY(%s) AND shm.is_active = TRUE;
-    """
-    rules = []
-    try:
-        with get_db_cursor(commit=False) as cur:
-            cur.execute(sql, (model_list,))
-            for r in cur.fetchall():
-                rule = {
-                    "C1_BUSINESS_SEGMENT": normalize_text(r.get("c1_business_segment")),
-                    "C2_BUSINESS_SUBSEGMENT": normalize_text(r.get("c2_business_subsegment")),
-                    "C3_NEED_STATE": normalize_text(r.get("c3_need_state")),
-                    "C4_CATEGORY": normalize_text(r.get("c4_category")),
-                    "C5_SUBCATEGORY": normalize_text(r.get("c5_subcategory")),
-                    "B1_BRAND": normalize_text(r.get("b1_brand")),
-                    "B2_SUBBRAND": normalize_text(r.get("b2_subbrand")),
-                }
-                if any(rule.values()):
-                    rules.append(rule)
-    except Exception as e:
-        logger.error("Failed to load shipment model rules: %s", e)
-    return rules
- 
- 
-# ─── 3. PostgreSQL Model Price Index Multipliers ──────────────────────────────
- 
-def _parse_price_index_rows(rows: list[dict[str, Any]]) -> dict[int, float]:
-    """Aggregates and averages monthly price index multipliers from query rows."""
-    monthly_indices: dict[int, list[float]] = {m: [] for m in range(1, 13)}
-    for r in rows:
-        m_num = int(r["month_num"])
-        raw_idx = r["price_index"]
-        if 1 <= m_num <= 12 and raw_idx is not None:
-            try:
-                val = float(raw_idx)
-                if val > 0:
-                    monthly_indices[m_num].append(val)
-            except (ValueError, TypeError):
-                pass
- 
-    final_indices = {}
-    for m in range(1, 13):
-        arr = monthly_indices[m]
-        final_indices[m] = (sum(arr) / len(arr)) if arr else 1.0
-    return final_indices
- 
- 
-def load_price_index_from_postgres(
-    models: str | list[str]
-) -> dict[int, float]:
-    """
-    Queries public.model_price_index in PostgreSQL for selected model(s).
-    Returns mapping: month_num (1..12) -> multiplier (float).
-    """
-    model_list = _normalize_models(models)
-    if not model_list:
-        return dict.fromkeys(range(1, 13), 1.0)
- 
-    sql = """
-    SELECT
-        mpi.month_num,
-        mpi.price_index
-    FROM public.model_price_index mpi
-    INNER JOIN public.master_models mm ON mpi.model_id = mm.model_id
-    WHERE mm.model_name = ANY(%s) AND mpi.is_active = TRUE;
-    """
-    rows = []
-    try:
-        with get_db_cursor(commit=False) as cur:
-            cur.execute(sql, (model_list,))
-            rows = cur.fetchall()
-    except Exception as e:
-        logger.warning("Notice querying model_price_index: %s", e)
- 
-    return _parse_price_index_rows(rows)
- 
- 
-# ─── 4. PostgreSQL Live Building Blocks ───────────────────────────────────────
- 
-def _accumulate_consumption_bb_rows(rows: list[dict[str, Any]]) -> dict[str, list[Optional[float]]]:
-    """Accumulates monthly planning values in millions for consumption building blocks."""
-    raw_bb: dict[str, list[Optional[float]]] = {}
-    for r in rows:
-        m_num = int(r["month_num"])
-        if 1 <= m_num <= 12:
-            m_idx = m_num - 1
-            norm_bb = normalize_text(r["building_block"])
-            val_m = float(r["value_in_thousands"] or 0.0) / 1000.0  # $K to $M
-            raw_bb.setdefault(norm_bb, [None] * 12)[m_idx] = (
-                (raw_bb.setdefault(norm_bb, [None] * 12)[m_idx] or 0.0) + val_m
-            )
-    return raw_bb
- 
- 
-def _extract_consumption_driver_val(
-    raw_bb: dict[str, list[Optional[float]]], pattern: str
-) -> list[Optional[float]]:
-    """Sums monthly building block values matching the given driver pattern."""
-    res: list[Optional[float]] = [None] * 12
-    for db_name, m_arr in raw_bb.items():
-        if pattern in db_name:
-            for i in range(12):
-                if m_arr[i] is not None:
-                    res[i] = (res[i] or 0.0) + m_arr[i]
-    return res
- 
- 
-def _combine_monthly_drivers(
-    a: list[Optional[float]], b: list[Optional[float]]
-) -> list[Optional[float]]:
-    """Adds two 12-month driver series together preserving None semantics."""
-    res: list[Optional[float]] = [None] * 12
-    for i in range(12):
-        if a[i] is not None or b[i] is not None:
-            res[i] = (a[i] or 0.0) + (b[i] or 0.0)
-    return res
- 
- 
-def load_live_consumption_building_blocks(
-    models: str | list[str], plan_year: int
-) -> dict[str, list[Optional[float]]]:
-    """
-    Loads Consumption Building Blocks aggregated across one or multiple models for plan_year.
-    Returns: Display Name -> [12 monthly values in Millions ($M)]
-    """
-    model_list = _normalize_models(models)
- 
-    if not model_list:
-        return {disp: [None] * 12 for _, disp, _ in CONSUMPTION_DRIVER_ROW_DEFINITIONS}
- 
-    sql = """
-    SELECT
-        cbb.name AS building_block,
-        EXTRACT(MONTH FROM cpv.period_month)::int AS month_num,
-        SUM(cpv.value_in_thousands) AS value_in_thousands
-    FROM public.consumption_planning_rows cpr
-    INNER JOIN public.consumption_building_blocks cbb
-        ON cpr.building_block_id = cbb.block_id
-    INNER JOIN public.consumption_planning_values cpv
-        ON cpr.row_id = cpv.row_id
-    INNER JOIN public.master_models mm
-        ON cpr.model_id = mm.model_id
-    WHERE
-        mm.model_name = ANY(%s)
-        AND cpr.is_deleted = FALSE
-        AND cbb.is_active = TRUE
-        AND mm.is_active = TRUE
-        AND EXTRACT(YEAR FROM cpv.period_month) = %s
-        AND (
-            cpr.snapshot_id IS NULL
-            OR cpr.snapshot_id = (
-                SELECT s.snapshot_id
-                FROM public.consumption_snapshots s
-                JOIN public.planning_cycles pc ON s.cycle_id = pc.cycle_id
-                WHERE (
-                    UPPER(COALESCE(pc.snapshot_type, '')) LIKE '%%CURRENT%%'
-                    OR (pc.is_active = TRUE AND UPPER(COALESCE(pc.snapshot_type, '')) != 'BP')
-                )
-                ORDER BY pc.planning_year_start DESC NULLS LAST, pc.cycle_month DESC NULLS LAST, s.snapshot_id DESC
-                LIMIT 1
-            )
-        )
-    GROUP BY cbb.name, month_num
-    ORDER BY cbb.name, month_num;
-    """
-    rows = []
-    try:
-        with get_db_cursor(commit=False) as cur:
-            cur.execute(sql, (model_list, plan_year))
-            rows = cur.fetchall()
-    except Exception as e:
-        logger.error("Failed to load consumption building blocks: %s", e)
- 
-    raw_bb = _accumulate_consumption_bb_rows(rows)
-    innov = _extract_consumption_driver_val(raw_bb, "INNOVATION")
-    cann = _extract_consumption_driver_val(raw_bb, "CANNIBALIZATION")
-    price = _extract_consumption_driver_val(raw_bb, "PRICE")
-    elast = _extract_consumption_driver_val(raw_bb, "ELASTICITY")
- 
-    compound_map = {
-        "COMPOUND_NET_INNOVATION": _combine_monthly_drivers(innov, cann),
-        "COMPOUND_NET_PRICE": _combine_monthly_drivers(price, elast),
-        "INNOVATION": innov,
-        "CANNIBALIZATION": cann,
-        "PRICE": price,
-        "ELASTICITY": elast,
-    }
- 
-    driver_data: dict[str, list[Optional[float]]] = {}
-    for _, disp_name, match_key in CONSUMPTION_DRIVER_ROW_DEFINITIONS:
-        if match_key in compound_map:
-            driver_data[disp_name] = compound_map[match_key]
-        else:
-            driver_data[disp_name] = _extract_consumption_driver_val(raw_bb, match_key)
- 
-    return driver_data
- 
- 
-def _clean_token(s: Any) -> str:
-    """Normalizes string into uppercase alphanumeric token for fuzzy driver matching."""
-    if s is None:
-        return ""
-    return re.sub(r"[^A-Z0-9]", "", str(s).upper())
- 
- 
-def _matches_shipment_driver(db_name: str, grp: str, disp_name: str, match_key: str) -> bool:
-    """Matches a PostgreSQL building block name to a defined dashboard driver."""
-    c_db = _clean_token(db_name)
-    c_disp = _clean_token(disp_name)
-    c_key = _clean_token(match_key)
-    if not c_db:
-        return False
-    if c_disp == "OTHER":
-        if "OVERLAY" in c_db or "IBP" in c_db:
-            return grp == GROUP_IBP_OVERLAYS
-        if "INVENT" in c_db:
-            return grp == "Inventory"
-        return grp == "Inventory" if "OVERLAY" not in c_key else grp == GROUP_IBP_OVERLAYS
-    for kw in ["LIQUIDAT", "SUPPLY", "RETAIL", "DISTRIB", "INNOVAT", "TRADE", "CLUB"]:
-        if kw in c_key and kw in c_db:
-            return True
-    return (c_key in c_db) or (c_disp in c_db) or (c_db in c_key) or (c_db in c_disp)
- 
- 
-def _accumulate_shipment_driver(
-    rows: list[dict[str, Any]],
-    month_cols: list[str],
-    grp: str,
-    disp_name: str,
-    match_key: str,
-) -> list[Optional[float]]:
-    """Accumulates monthly values across matching shipment rows for a single driver."""
-    matched = False
-    monthly_accum = [0.0] * 12
-    for r in rows:
-        db_bb_name = str(r["driver_building_block"] or "")
-        if _matches_shipment_driver(db_bb_name, grp, disp_name, match_key):
-            matched = True
-            for m_idx, col_name in enumerate(month_cols):
-                monthly_accum[m_idx] += float(r[col_name] or 0.0)
- 
-    return [round(v, 4) for v in monthly_accum] if matched else [None] * 12
- 
- 
-def load_live_shipment_building_blocks(
-    models: Union[str, List[str], None], plan_year: int
-) -> dict[Any, list[Optional[float]]]:
-    """
-    Queries live shipment building blocks from PostgreSQL for current cycle.
-    - If a model has building blocks: Returns entered and unentered months.
-    - If a model has NO building blocks: All driver rows remain completely blank (None).
-    """
-    model_list = _normalize_models(models)
- 
-    if not model_list:
-        empty_res = {}
-        for grp, disp, _ in SHIPMENT_DRIVER_ROW_DEFINITIONS:
-            empty_res[disp] = [None] * 12
-            empty_res[(grp, disp)] = [None] * 12
-            empty_res[f"{grp}_{disp}"] = [None] * 12
-        return empty_res
- 
-    sql = """
-    SELECT
-        sbb.name AS building_block,
-        EXTRACT(MONTH FROM spv.period_month)::int AS month_num,
-        ROUND(SUM(spv.value_in_thousands) / 1000.0, 4) AS value_in_millions
-    FROM public.shipment_planning_rows spr
-    INNER JOIN public.shipment_building_blocks sbb
-        ON spr.building_block_id = sbb.block_id
-    INNER JOIN public.shipment_planning_values spv
-        ON spr.row_id = spv.row_id
-    INNER JOIN public.master_models mm
-        ON spr.model_id = mm.model_id
-    WHERE
-        mm.model_name = ANY(%s)
-        AND spr.is_deleted = FALSE
-        AND sbb.is_active = TRUE
-        AND mm.is_active = TRUE
-        AND EXTRACT(YEAR FROM spv.period_month) = %s
-        AND (
-            spr.snapshot_id IS NULL
-            OR spr.snapshot_id = (
-                SELECT s.snapshot_id
-                FROM public.shipment_snapshots s
-                JOIN public.planning_cycles pc ON s.cycle_id = pc.cycle_id
-                WHERE (
-                    UPPER(COALESCE(pc.snapshot_type, '')) LIKE '%%CURRENT%%'
-                    OR (pc.is_active = TRUE AND UPPER(COALESCE(pc.snapshot_type, '')) != 'BP')
-                )
-                ORDER BY pc.planning_year_start DESC NULLS LAST, pc.cycle_month DESC NULLS LAST, s.snapshot_id DESC
-                LIMIT 1
-            )
-        )
-    GROUP BY mm.model_name, sbb.name, month_num
-    ORDER BY mm.model_name, sbb.name, month_num;
-    """
-    rows = []
-    try:
-        with get_db_cursor(commit=False) as cur:
-            cur.execute(sql, (model_list, plan_year))
-            rows = cur.fetchall()
-    except Exception as e:
-        logger.error("Failed to load live shipment building blocks: %s", e)
- 
-    driver_data: dict[Any, list[Optional[float]]] = {}
-    for grp, disp_name, match_key in SHIPMENT_DRIVER_ROW_DEFINITIONS:
-        matched = False
-        monthly_accum = [0.0] * 12
-        for r in rows:
-            db_bb_name = str(r.get("building_block") or r.get("driver_building_block") or "")
-            if _matches_shipment_driver(db_bb_name, grp, disp_name, match_key):
-                matched = True
-                m_num = int(r.get("month_num") or 0)
-                if 1 <= m_num <= 12:
-                    val = float(r.get("value_in_millions") if r.get("value_in_millions") is not None else (float(r.get("value_in_thousands") or 0.0) / 1000.0))
-                    monthly_accum[m_num - 1] += val
- 
-        final_vals = [round(v, 4) for v in monthly_accum] if matched else [None] * 12
-        driver_data[disp_name] = final_vals
-        driver_data[(grp, disp_name)] = final_vals
-        driver_data[f"{grp}_{disp_name}"] = final_vals
- 
-    return driver_data
- 
- 
-# ─── 5. Planning Cycles & Snapshots for GTS Change of Cycle (CoC) ─────────────
- 
-class CycleSnapshotInfo(NamedTuple):
-    curr_cs_id: Optional[int]
-    prior_cs_id: Optional[int]
-    curr_ss_id: Optional[int]
-    prior_ss_id: Optional[int]
-    active_cycle_month: Optional[int] = None
- 
- 
-def _query_cycle_snapshot(
-    cur: Any, table_name: str, plan_year: int, snapshot_type_filter: str, prior_to_id: Optional[int] = None
-) -> tuple[Optional[int], Optional[int]]:
-    """Queries single cycle snapshot id and cycle month number."""
-    if prior_to_id is not None:
-        sql = f"""
-            SELECT s.snapshot_id, pc.cycle_month
-            FROM public.{table_name} s
-            JOIN public.planning_cycles pc ON s.cycle_id = pc.cycle_id
-            WHERE s.snapshot_id < %s
-              AND (pc.planning_year_start <= %s OR pc.planning_year_start IS NULL)
-              AND UPPER(COALESCE(pc.snapshot_type, '')) != 'BP'
-            ORDER BY pc.planning_year_start DESC NULLS LAST, pc.cycle_month DESC NULLS LAST, s.snapshot_id DESC
-            LIMIT 1;
-        """
-        cur.execute(sql, (prior_to_id, plan_year))
-    else:
-        sql = f"""
-            SELECT s.snapshot_id, pc.cycle_month
-            FROM public.{table_name} s
-            JOIN public.planning_cycles pc ON s.cycle_id = pc.cycle_id
-            WHERE ({snapshot_type_filter})
-              AND (pc.planning_year_start <= %s OR pc.planning_year_start IS NULL)
-            ORDER BY pc.planning_year_start DESC NULLS LAST, pc.cycle_month DESC NULLS LAST, s.snapshot_id DESC
-            LIMIT 1;
-        """
-        cur.execute(sql, (plan_year,))
-    row = cur.fetchone()
-    if not row:
-        return None, None
-    snap_id = row.get("snapshot_id") if isinstance(row, dict) else row["snapshot_id"]
-    c_mo = row.get("cycle_month") if isinstance(row, dict) else None
-    m_num = parse_month_num(c_mo) if c_mo else None
-    return snap_id, m_num if (m_num and 1 <= m_num <= 12) else None
- 
- 
-def _resolve_snapshot_pair(
-    cur, table_name: str, plan_year: int, curr_filter: str, prior_filter: str
-) -> tuple[Optional[int], Optional[int], Optional[int]]:
-    """Resolves Current and Prior snapshot ID pair along with detected cycle month."""
-    curr_id, c_mo = _query_cycle_snapshot(cur, table_name, plan_year, curr_filter)
-    prior_id, _ = _query_cycle_snapshot(cur, table_name, plan_year, prior_filter)
-    if (not prior_id or prior_id == curr_id) and curr_id:
-        prior_id, _ = _query_cycle_snapshot(cur, table_name, plan_year, "", prior_to_id=curr_id)
-    return curr_id, prior_id, c_mo
- 
- 
-def _query_fallback_cycle_month(cur, plan_year: int) -> Optional[int]:
-    """Queries latest active cycle month from planning_cycles table."""
-    cur.execute("""
-        SELECT pc.cycle_month
-        FROM public.planning_cycles pc
-        WHERE (
-            UPPER(COALESCE(pc.snapshot_type, '')) LIKE '%%CURRENT%%'
-            OR (pc.is_active = TRUE AND UPPER(COALESCE(pc.snapshot_type, '')) != 'BP')
-        )
-          AND (pc.planning_year_start <= %s OR pc.planning_year_start IS NULL)
-        ORDER BY pc.planning_year_start DESC NULLS LAST, pc.cycle_month DESC NULLS LAST
-        LIMIT 1;
-    """, (plan_year,))
-    row = cur.fetchone()
-    if row and isinstance(row, dict) and row.get("cycle_month"):
-        m_num = parse_month_num(row["cycle_month"])
-        if m_num and 1 <= m_num <= 12:
-            return m_num
-    return None
- 
- 
-def get_cycle_snapshot_ids(plan_year: int) -> CycleSnapshotInfo:
-    """
-    Detects Current and Prior snapshot IDs for Consumption and Shipment scoped to plan_year.
-    Also discovers active_cycle_month (1..12) from planning_cycles.
-    """
-    curr_cs_id, prior_cs_id, curr_ss_id, prior_ss_id = None, None, None, None
-    active_cycle_month = None
- 
-    curr_filter = (
-        "UPPER(COALESCE(pc.snapshot_type, '')) LIKE '%%CURRENT%%' "
-        "OR (pc.is_active = TRUE AND UPPER(COALESCE(pc.snapshot_type, '')) != 'BP')"
-    )
-    prior_filter = (
-        "("
-        "UPPER(COALESCE(pc.snapshot_type, '')) LIKE '%%PRIOR%%' "
-        "OR UPPER(COALESCE(pc.snapshot_type, '')) LIKE '%%PREV%%' "
-        "OR UPPER(COALESCE(pc.snapshot_type, '')) LIKE '%%IBP-1%%'"
-        ") AND UPPER(COALESCE(pc.snapshot_type, '')) != 'BP'"
-    )
- 
-    try:
-        with get_db_cursor(commit=False) as cur:
-            curr_cs_id, prior_cs_id, c_mo = _resolve_snapshot_pair(
-                cur, "consumption_snapshots", plan_year, curr_filter, prior_filter
-            )
-            curr_ss_id, prior_ss_id, s_mo = _resolve_snapshot_pair(
-                cur, "shipment_snapshots", plan_year, curr_filter, prior_filter
-            )
-            active_cycle_month = c_mo or s_mo or _query_fallback_cycle_month(cur, plan_year)
-            if not active_cycle_month:
-                try:
-                    dt_info = KenvueCalendar.get_date_info(datetime.date.today())
-                    if isinstance(dt_info, dict):
-                        val = dt_info.get("fiscal_month") or dt_info.get("kv_month_num")
-                        if val:
-                            active_cycle_month = int(val)
-                    elif hasattr(dt_info, "kv_month_num") and dt_info.kv_month_num:
-                        active_cycle_month = int(dt_info.kv_month_num)
-                    elif hasattr(dt_info, "fiscal_month") and dt_info.fiscal_month:
-                        active_cycle_month = int(dt_info.fiscal_month)
-                except Exception:
-                    pass
-    except Exception as e:
-        logger.warning("Notice discovering cycle snapshot IDs: %s", e)
- 
-    return CycleSnapshotInfo(curr_cs_id, prior_cs_id, curr_ss_id, prior_ss_id, active_cycle_month)
- 
- 
-def _build_cycle_filter_clauses(
-    is_prior: bool,
-    curr_cs_id: Optional[int],
-    prior_cs_id: Optional[int],
-    curr_ss_id: Optional[int],
-    prior_ss_id: Optional[int],
-) -> tuple[str, str]:
-    """Builds SQL snapshot filter fragments for consumption and shipment planning rows."""
-    if not is_prior:
-        cpr_filter = f"""AND (
-            cpr.snapshot_id IS NULL
-            OR cpr.snapshot_id = {curr_cs_id}
-        )""" if curr_cs_id else """AND (
-            cpr.snapshot_id IS NULL
-            OR cpr.snapshot_id = (
-                SELECT s.snapshot_id
-                FROM public.consumption_snapshots s
-                JOIN public.planning_cycles pc ON s.cycle_id = pc.cycle_id
-                WHERE (
-                    UPPER(COALESCE(pc.snapshot_type, '')) LIKE '%%CURRENT%%'
-                    OR (pc.is_active = TRUE AND UPPER(COALESCE(pc.snapshot_type, '')) != 'BP')
-                )
-                ORDER BY pc.planning_year_start DESC NULLS LAST, pc.cycle_month DESC NULLS LAST, s.snapshot_id DESC
-                LIMIT 1
-            )
-        )"""
-        spr_filter = f"""AND (
-            spr.snapshot_id IS NULL
-            OR spr.snapshot_id = {curr_ss_id}
-        )""" if curr_ss_id else """AND (
-            spr.snapshot_id IS NULL
-            OR spr.snapshot_id = (
-                SELECT s.snapshot_id
-                FROM public.shipment_snapshots s
-                JOIN public.planning_cycles pc ON s.cycle_id = pc.cycle_id
-                WHERE (
-                    UPPER(COALESCE(pc.snapshot_type, '')) LIKE '%%CURRENT%%'
-                    OR (pc.is_active = TRUE AND UPPER(COALESCE(pc.snapshot_type, '')) != 'BP')
-                )
-                ORDER BY pc.planning_year_start DESC NULLS LAST, pc.cycle_month DESC NULLS LAST, s.snapshot_id DESC
-                LIMIT 1
-            )
-        )"""
-    else:
-        cpr_filter = f"AND cpr.snapshot_id = {prior_cs_id}" if prior_cs_id else """AND cpr.snapshot_id = (
-            SELECT s.snapshot_id
-            FROM public.consumption_snapshots s
-            JOIN public.planning_cycles pc ON s.cycle_id = pc.cycle_id
-            WHERE (UPPER(COALESCE(pc.snapshot_type, '')) LIKE '%%PRIOR%%'
-                   OR UPPER(COALESCE(pc.snapshot_type, '')) LIKE '%%PREV%%'
-                   OR UPPER(COALESCE(pc.snapshot_type, '')) LIKE '%%IBP-1%%')
-              AND UPPER(COALESCE(pc.snapshot_type, '')) != 'BP'
-            ORDER BY pc.planning_year_start DESC NULLS LAST, pc.cycle_month DESC NULLS LAST, s.snapshot_id DESC
-            LIMIT 1
-        )"""
-        spr_filter = f"AND spr.snapshot_id = {prior_ss_id}" if prior_ss_id else """AND spr.snapshot_id = (
-            SELECT s.snapshot_id
-            FROM public.shipment_snapshots s
-            JOIN public.planning_cycles pc ON s.cycle_id = pc.cycle_id
-            WHERE (UPPER(COALESCE(pc.snapshot_type, '')) LIKE '%%PRIOR%%'
-                   OR UPPER(COALESCE(pc.snapshot_type, '')) LIKE '%%PREV%%'
-                   OR UPPER(COALESCE(pc.snapshot_type, '')) LIKE '%%IBP-1%%')
-              AND UPPER(COALESCE(pc.snapshot_type, '')) != 'BP'
-            ORDER BY pc.planning_year_start DESC NULLS LAST, pc.cycle_month DESC NULLS LAST, s.snapshot_id DESC
-            LIMIT 1
-        )"""
-    return cpr_filter, spr_filter
- 
- 
-def _fetch_cycle_building_blocks(
-    models: list[str], plan_year: int, is_prior: bool = False
-) -> dict[str, dict[int, float]]:
-    """
-    Safely fetches raw monthly consumption building block values (in Thousands) from PostgreSQL.
-    Excludes zero-only rows at extraction time via HAVING ABS(SUM(...)) > 1e-9.
-    """
-    monthly_data: dict[str, dict[int, float]] = {}
-    if not models:
-        return monthly_data
- 
-    model_list = [str(m).strip() for m in models if m]
-    snap_info = get_cycle_snapshot_ids(plan_year)
- 
-    if is_prior and snap_info.prior_cs_id is None:
-        return monthly_data
- 
-    cpr_snap_filter, _ = _build_cycle_filter_clauses(
-        is_prior, snap_info.curr_cs_id, snap_info.prior_cs_id, snap_info.curr_ss_id, snap_info.prior_ss_id
-    )
- 
-    sql = f"""
-    -- Consumption Building Blocks only (exclude 0-only rows at extraction)
-    SELECT
-        cbb.name AS building_block,
-        EXTRACT(MONTH FROM cpv.period_month)::int AS month_num,
-        SUM(cpv.value_in_thousands) AS value_in_thousands
-    FROM public.consumption_planning_rows cpr
-    INNER JOIN public.consumption_building_blocks cbb
-        ON cpr.building_block_id = cbb.block_id
-    INNER JOIN public.consumption_planning_values cpv
-        ON cpr.row_id = cpv.row_id
-    INNER JOIN public.master_models mm
-        ON cpr.model_id = mm.model_id
-    WHERE
-        mm.model_name = ANY(%s)
-        AND cpr.is_deleted = FALSE
-        AND cbb.is_active = TRUE
-        AND mm.is_active = TRUE
-        AND EXTRACT(YEAR FROM cpv.period_month) = %s
-        {cpr_snap_filter}
-    GROUP BY cbb.name, month_num
-    HAVING ABS(SUM(cpv.value_in_thousands)) > 1e-9;
-    """
-    try:
-        with get_db_cursor(commit=False) as cur:
-            cur.execute(sql, (model_list, plan_year))
-            for r in cur.fetchall():
-                norm_name = normalize_text(r["building_block"])
-                m_num = int(r["month_num"])
-                val_m = float(r["value_in_thousands"] or 0.0) / 1000.0  # $K to $M
-                monthly_data.setdefault(norm_name, {})[m_num] = (
-                    monthly_data.setdefault(norm_name, {}).get(m_num, 0.0) + val_m
-                )
-    except Exception as e:
-        logger.warning("Notice querying cycle building blocks (%s): %s", "Prior" if is_prior else "Current", e)
- 
-    return monthly_data
- 
- 
-def _matches_coc_driver_name(db_bb_name: str, match_key: str) -> bool:
-    """Robust pattern matching between PostgreSQL block name and logical driver for GTS CoC."""
-    norm = normalize_text(db_bb_name)
-    rules = {
-        "INNOVATION": lambda n: "INNOVATION" in n and "NET" not in n and "CANNIBAL" not in n,
-        "CANNIBALIZATION": lambda n: "CANNIBAL" in n,
-        "PRICE": lambda n: "PRICE" in n and "NET" not in n and "ELAST" not in n,
-        "ELASTICITY": lambda n: "ELAST" in n,
-        "OTHER": lambda n: "OTHER" in n and "OVERLAY" not in n,
-        "RENOVATION": lambda n: "RENOVAT" in n,
-        "DISCONTINUATIONS": lambda n: "DISCONTINU" in n,
-        MATCH_KEY_BASE_TREND: lambda n: "BASE" in n and "TREND" in n,
-        "SEASON": lambda n: "SEASON" in n,
-        "COMPETITION": lambda n: "COMPET" in n,
-        "DISTRIBUTION": lambda n: "DISTRIBUT" in n,
-        "MEDIA": lambda n: "MEDIA" in n,
-        "TRADE": lambda n: "TRADE" in n,
-        "CLUB": lambda n: "CLUB" in n,
-    }
-    matcher = rules.get(match_key)
-    if matcher:
-        return matcher(norm)
-    return match_key in norm
- 
- 
-def _aggregate_driver_raw_monthly(
-    raw_data: dict[str, dict[int, float]], match_key: str
-) -> dict[int, float]:
-    """Aggregates raw monthly building block values matching a logical driver key."""
-    result: dict[int, float] = {}
-    for k, v in raw_data.items():
-        if _matches_coc_driver_name(k, match_key):
-            for m, val in v.items():
-                result[m] = result.get(m, 0.0) + val
-    return result
- 
- 
-def _compute_single_driver_coc(
-    match_key: str,
-    current_raw: dict[str, dict[int, float]],
-    prior_raw: dict[str, dict[int, float]],
-    price_factors: dict[int, float],
-) -> list[Optional[float]]:
-    """Calculates monthly CoC deltas for a single driver scaled by price factor."""
-    curr_dict = _aggregate_driver_raw_monthly(current_raw, match_key)
-    prior_dict = _aggregate_driver_raw_monthly(prior_raw, match_key)
- 
-    res: list[Optional[float]] = [None] * 12
-    for m in range(1, 13):
-        has_curr = m in curr_dict
-        has_prior = m in prior_dict
- 
-        if not has_curr and not has_prior:
-            res[m - 1] = None
-        else:
-            curr_val = curr_dict.get(m, 0.0)
-            prior_val = prior_dict.get(m, 0.0)
- 
-            # Both current and prior cycle values are 0 -> leave box empty
-            if abs(curr_val) < 1e-9 and abs(prior_val) < 1e-9:
-                res[m - 1] = None
-            else:
-                pf = price_factors.get(m, 1.0)
-                res[m - 1] = round((curr_val - prior_val) * pf, 4)
- 
-    return res
- 
- 
-def _sum_monthly_pair(arr1: list, arr2: list, round_digits: int = 4) -> list[Optional[float]]:
-    """Sums two 12-month lists element-wise with rounding and None preservation."""
-    has_any = any(v is not None for v in arr1) or any(v is not None for v in arr2)
-    if not has_any:
-        return [None] * 12
-    res: list[Optional[float]] = [None] * 12
-    for i in range(12):
-        v1 = arr1[i]
-        v2 = arr2[i]
-        if v1 is not None or v2 is not None:
-            res[i] = round((v1 or 0.0) + (v2 or 0.0), round_digits)
-        else:
-            res[i] = None
-    return res
- 
- 
-def load_coc_building_blocks(
-    models: str | list[str], plan_year: int, price_factors: dict[int, float]
-) -> dict[str, list[Optional[float]]]:
-    """
-    Computes CoC Building Blocks:
-        CoC Value[m] = (Current Cycle POS[m] - Previous Cycle POS[m]) * Price Factor[m]
-    """
-    model_list = _normalize_models(models)
- 
-    if not model_list:
-        return {disp: [None] * 12 for _, disp, _ in GTS_COC_DRIVER_DEFINITIONS}
- 
-    current_raw = _fetch_cycle_building_blocks(model_list, plan_year, is_prior=False)
-    prior_raw = _fetch_cycle_building_blocks(model_list, plan_year, is_prior=True)
- 
-    driver_data: dict[str, list[Optional[float]]] = {}
-    for _, disp_name, match_key in GTS_COC_DRIVER_DEFINITIONS:
-        if match_key.startswith("COMPOUND_"):
+def _get_models_for_squads(squad_names: List[str], gbu_codes: Optional[list]) -> List[Dict[str, Any]]:
+    """Fetch distinct models for a list of squads, attaching squad_name to each model dict."""
+    combined_models: List[Dict[str, Any]] = []
+    seen_ids = set()
+    for sq in squad_names:
+        if not sq or sq == _SELECT_SQUAD:
             continue
-        driver_data[disp_name] = _compute_single_driver_coc(match_key, current_raw, prior_raw, price_factors)
- 
-    # Net Innovation = Innovation CoC + Cannibalization CoC
-    driver_data[DRIVER_NET_INNOVATION] = _sum_monthly_pair(
-        driver_data.get("Innovation", [None] * 12),
-        driver_data.get("Cannibalization", [None] * 12),
-    )
- 
-    # Net Price = Price CoC + Elasticity CoC
-    driver_data[DRIVER_NET_PRICE] = _sum_monthly_pair(
-        driver_data.get("Price", [None] * 12),
-        driver_data.get("Elasticity", [None] * 12),
-    )
- 
-    return driver_data
- 
- 
-# ─── 6. Snowflake Ingestion (POS & GTS) ───────────────────────────────────────
- 
-def _build_snowflake_pos_filter(rules: list[dict[str, str]]) -> str:
-    """Builds SQL WHERE filter for Snowflake POS product hierarchy rules."""
-    rule_clauses = []
-    for r in rules:
-        conds = []
-        if r.get("brand"):
-            b_esc = r["brand"].replace("'", "''")
-            conds.append(f"UPPER(TRIM(dim_product.GLOBAL_GMC_B1_BRAND_DESC)) = '{b_esc}'")
-        if r.get("sub_brand"):
-            sb_esc = r["sub_brand"].replace("'", "''")
-            conds.append(f"UPPER(TRIM(dim_product.GLOBAL_GMC_B2_SUB_BRAND_DESC)) = '{sb_esc}'")
-        if r.get("category"):
-            c_esc = r["category"].replace("'", "''")
-            conds.append(f"UPPER(TRIM(dim_product.GLOBAL_GMC_C4_CATEGORY_DESC)) = '{c_esc}'")
-        if r.get("subcategory"):
-            sc_esc = r["subcategory"].replace("'", "''")
-            conds.append(f"UPPER(TRIM(dim_product.GLOBAL_GMC_C5_SUB_CATEGORY_DESC)) = '{sc_esc}'")
-        if conds:
-            rule_clauses.append("(" + " AND ".join(conds) + ")")
-    return ("AND (" + " OR\n        ".join(rule_clauses) + ")") if rule_clauses else ""
- 
- 
-def _aggregate_snowflake_pos_weeks(
-    rows: list[Any], base_year: int, plan_year: int
-) -> tuple[list[Optional[float]], list[Optional[float]]]:
-    """Aggregates weekly POS rows into 12-month base and plan actual arrays."""
-    val_base_agg = [0.0] * 12
-    val_plan_agg = [0.0] * 12
-    has_base = [False] * 12
-    plan_weeks: dict[int, set] = {m: set() for m in range(1, 13)}
- 
-    for r in rows:
-        d_str = str(r[0]).strip()
-        val = float(r[1] or 0.0)
         try:
-            dt = datetime.datetime.strptime(d_str[:10], "%Y-%m-%d").date()
-        except Exception:
-            continue
- 
-        d_info = KenvueCalendar.get_date_info(dt)
-        yr, m_nbr = d_info.kv_year, d_info.kv_month_num
-        if yr == base_year and 1 <= m_nbr <= 12:
-            val_base_agg[m_nbr - 1] += val
-            has_base[m_nbr - 1] = True
-        elif yr == plan_year and 1 <= m_nbr <= 12:
-            val_plan_agg[m_nbr - 1] += val
-            plan_weeks[m_nbr].add(dt)
- 
-    pos_base: list[Optional[float]] = [None] * 12
-    pos_plan_actual: list[Optional[float]] = [None] * 12
-    for i in range(12):
-        month_num = i + 1
-        if has_base[i]:
-            pos_base[i] = val_base_agg[i] / 1_000_000.0
- 
-        expected_weeks = KenvueCalendar.get_month_week_count(plan_year, month_num)
-        actual_weeks = len(plan_weeks[month_num])
-        if actual_weeks >= expected_weeks and actual_weeks > 0:
-            pos_plan_actual[i] = val_plan_agg[i] / 1_000_000.0
- 
-    return pos_base, pos_plan_actual
+            models = get_models_by_squad(sq, gbu_codes)
+        except Exception as e:
+            logger.warning("Could not fetch models for squad %s: %s", sq, e)
+            models = []
+        for m in models:
+            m_id = m.get("model_id")
+            if m_id not in seen_ids:
+                seen_ids.add(m_id)
+                m_copy = dict(m)
+                m_copy["squad_name"] = sq
+                combined_models.append(m_copy)
+    return combined_models
  
  
-def fetch_snowflake_monthly_pos(
-    rules: list[dict[str, str]], base_year: int, plan_year: int
-) -> tuple[list[Optional[float]], list[Optional[float]]]:
-    """
-    Fetches POS $ for dynamic base_year and plan_year from Snowflake GLBL_SYNDCTD_FACT_DATA.
-    Checks completeness against KenvueCalendar.get_month_week_count(plan_year, month_num).
-    """
-    pos_base: list[Optional[float]] = [None] * 12
-    pos_plan_actual: list[Optional[float]] = [None] * 12
-    if not rules:
-        return pos_base, pos_plan_actual
+def _resolve_sum_squad_selection(
+    gbu_codes: list, current_squad: str | list[str] | None
+) -> Tuple[List[str], str, Any]:
+    squad_rows = _safe_get_squads_by_gbu(gbu_codes)
+    squad_list = []
+    for s in squad_rows:
+        s_name = s["squad_name"]
+        gbu_c = s.get("gbu_code", gbu_codes[0] if gbu_codes else "")
+        gbu_n = s.get("gbu_name", gbu_c)
+        squad_list.append({
+            "squad_name": s_name,
+            "display_name": s_name.title(),
+            "gbu": gbu_c,
+            "gbu_short": gbu_n.split()[0].title() if gbu_n else "",
+        })
  
-    filter_sql = _build_snowflake_pos_filter(rules)
-    if not filter_sql:
-        return pos_base, pos_plan_actual
+    target_squads = [current_squad] if isinstance(current_squad, str) else list(current_squad or [])
+    clean_target = [str(s).upper() for s in target_squads if s and str(s) != _SELECT_SQUAD]
  
-    st_base, _ = KenvueCalendar.get_cycle_bounds(base_year, 1)
-    _, en_plan = KenvueCalendar.get_cycle_bounds(plan_year, 12)
-    start_date_str = str(st_base)
-    end_date_str = str(en_plan)
- 
-    c_db = config.SNOWFLAKE_VD_CONSUMPTION_DATABASE
-    c_sch = config.SNOWFLAKE_VD_CONSUMPTION_SCHEMA
- 
-    query = f"""
-    SELECT
-        dim_time.GLOBAL_DATE_SHORT_DESC AS WEEK_DATE,
-        SUM(fact.GLOBAL_VALUE_LC) AS POS_VALUE,
-        SUM(fact.GLOBAL_UNITS) AS POS_UNITS
-    FROM {c_db}.{c_sch}.GLBL_SYNDCTD_FACT_DATA fact
-    INNER JOIN {c_db}.{c_sch}.GLBL_SYNDCTD_DIM_MARKET dim_market
-        ON fact.market_id = dim_market.market_id
-        AND dim_market.DELIVERY_KEY = fact.DELIVERY_KEY
-    INNER JOIN {c_db}.{c_sch}.GLBL_SYNDCTD_DIM_TIME dim_time
-        ON fact.date_id = dim_time.date_id
-        AND fact.DELIVERY_KEY = dim_time.DELIVERY_KEY
-    INNER JOIN {c_db}.{c_sch}.GLBL_SYNDCTD_DIM_PRODUCT dim_product
-        ON fact.GLOBAL_PRODUCT_UTAG = dim_product.GLOBAL_PRODUCT_UTAG
-    WHERE
-        dim_market.GLOBAL_MARKET = 'UNITED STATES'
-        AND dim_market.GLOBAL_SUPPLIER = 'CIRCANA'
-        AND dim_time.GLOBAL_DATE_GRAIN_DESC = 'WEEKLY'
-        AND dim_product.LOCAL_MANUFACTURER IN ('KENVUE INC', 'KENVUE')
-        AND dim_market.SOURCE_RETAILER_SHORT_DESC = 'TOTAL US - MULTI OUTLET+'
-        AND TRY_TO_DATE(dim_time.GLOBAL_DATE_SHORT_DESC) BETWEEN '{start_date_str}' AND '{end_date_str}'
-        {filter_sql}
-    GROUP BY dim_time.GLOBAL_DATE_SHORT_DESC
-    ORDER BY TRY_TO_DATE(dim_time.GLOBAL_DATE_SHORT_DESC) ASC;
-    """
- 
-    try:
-        conn = get_snowflake_connection()
-        cur = conn.cursor()
-        cur.execute(query)
-        rows = cur.fetchall()
-        cur.close()
-        pos_base, pos_plan_actual = _aggregate_snowflake_pos_weeks(rows, base_year, plan_year)
-    except Exception as e:
-        logger.error("Snowflake monthly POS query error: %s", e)
- 
-    return pos_base, pos_plan_actual
- 
- 
-def _build_snowflake_gts_where(rules: list[dict[str, str]]) -> str:
-    """Constructs SQL WHERE clause across 7 hierarchy dimensions for shipment GTS query."""
-    row_conditions = []
-    ship_fields = [
-        "C1_BUSINESS_SEGMENT", "C2_BUSINESS_SUBSEGMENT", "C3_NEED_STATE",
-        "C4_CATEGORY", "C5_SUBCATEGORY", "B1_BRAND", "B2_SUBBRAND"
+    matched_squads = [
+        s["squad_name"] for s in squad_list
+        if s["squad_name"].upper() in clean_target
     ]
-    for r in rules:
-        field_conds = []
-        for f in ship_fields:
-            val = r.get(f, "").strip()
-            if val and val not in ["NAN", "NONE", "NULL", "EMPTY", "N/A", "<NA>"]:
-                val_esc = val.replace("'", "''")
-                field_conds.append(f"UPPER(TRIM(COALESCE({f}, ''))) = '{val_esc}'")
-        if field_conds:
-            row_conditions.append("(" + " AND ".join(field_conds) + ")")
-    return " OR\n        ".join(row_conditions)
+    if matched_squads:
+        active_squads = matched_squads
+    elif squad_list:
+        active_squads = [squad_list[0]["squad_name"]]
+    else:
+        active_squads = ["BABY CARE"]
+ 
+    squad_pill_lbl = format_sum_squad_pill_label(active_squads, len(squad_list))
+    squad_items = build_sum_squad_menu_items(squad_list, active_squad_name=active_squads)
+    return active_squads, squad_pill_lbl, squad_items
  
  
-def _aggregate_snowflake_gts_months(
-    rows: list[Any], base_year: int, plan_year: Optional[int]
-) -> tuple[list[Optional[float]], list[Optional[float]]]:
-    """Aggregates monthly GTS rows into base and plan actual arrays in millions."""
-    gts_base: list[Optional[float]] = [None] * 12
-    gts_plan_actual: list[Optional[float]] = [None] * 12
-    for yr_val, mo_val, amt_val, _ in rows:
-        yr = int(yr_val or 0)
-        mo = int(mo_val or 0)
-        if 1 <= mo <= 12:
-            m_idx = mo - 1
-            val_m = float(amt_val or 0.0) / 1_000_000.0  # Dollars to Millions ($M)
-            if yr == base_year:
-                gts_base[m_idx] = (gts_base[m_idx] or 0.0) + val_m
-            elif plan_year is not None and yr == plan_year:
-                gts_plan_actual[m_idx] = (gts_plan_actual[m_idx] or 0.0) + val_m
-    return gts_base, gts_plan_actual
+def _resolve_sum_model_selection(
+    active_squads: str | list[str],
+    gbu_codes: list,
+    domain: Optional[str],
+    current_model: str | list[str] | None,
+) -> Tuple[List[str], Optional[int], Any, str]:
+    domain = (domain or "CONSUMPTION").upper()
+    flag_key = "has_shipment" if domain in ["SHIPMENT", "GTS", "GTSCOC"] else "has_pos"
+ 
+    squad_list = _normalize_squad_list(active_squads)
+    all_models = _get_models_for_squads(squad_list, gbu_codes) if squad_list else []
+    avail_models = [m for m in all_models if m.get(flag_key)] or all_models
+    curr_models_list = _normalize_model_list(current_model)
+ 
+    selected_models, primary_id = _pick_active_models(avail_models, curr_models_list)
+ 
+    model_items = build_sum_model_menu_items(
+        avail_models,
+        active_model_name=selected_models,
+        has_squad=bool(squad_list),
+    )
+    model_pill_lbl = format_sum_model_pill_label(selected_models, total_models=len(avail_models))
+    return selected_models, primary_id, model_items, model_pill_lbl
  
  
-def fetch_snowflake_monthly_gts(
-    rules: list[dict[str, str]], base_year: int, plan_year: Optional[int] = None
-) -> tuple[list[Optional[float]], list[Optional[float]]]:
-    """
-    Queries VW_FACT_F360_SHIPMENTS in Snowflake.
-    Returns:
-      gts_base: 12 months of base_year GTS $ in Millions ($M)
-      gts_plan_actual: 12 months of plan_year GTS $ in Millions ($M)
-    """
-    gts_base: list[Optional[float]] = [None] * 12
-    gts_plan_actual: list[Optional[float]] = [None] * 12
-    if not rules:
-        return gts_base, gts_plan_actual
+# ─── 1. AD Persona Switcher in Summary Dashboard ─────────────────────────────
  
-    where_clause = _build_snowflake_gts_where(rules)
-    if not where_clause:
-        return gts_base, gts_plan_actual
+@callback(
+    Output("sum-header-ad-switcher", "data"),
+    Output("sum-header-ad-badge", "children"),
+    Output("sum-header-role-badge", "children"),
+    Output("sum-header-role-badge", "color"),
+    Output("sum-header-user-email", "children"),
+    Output("menu-sum-ad-switcher", "children"),
+    Output("menu-sum-squad", "children", allow_duplicate=True),
+    Output("selected-sum-squad-label", "children", allow_duplicate=True),
+    Output("filter-sum-squad", "data", allow_duplicate=True),
+    Output("menu-sum-model", "children", allow_duplicate=True),
+    Output("selected-sum-model-label", "children", allow_duplicate=True),
+    Output("filter-sum-model", "data", allow_duplicate=True),
+    Output("session-active-ad-group-store", "data", allow_duplicate=True),
+    Output("sum-model-staging-store", "data", allow_duplicate=True),
+    Output("sum-squad-staging-store", "data", allow_duplicate=True),
+    Output("session-active-model-store", "data", allow_duplicate=True),
+    Input({"type": "sum-ad-select-item", "key": ALL}, "n_clicks"),
+    State("sum-header-ad-switcher", "data"),
+    State("filter-sum-domain", "data"),
+    State("filter-sum-squad", "data"),
+    State("filter-sum-model", "data"),
+    prevent_initial_call=True,
+)
+def handle_sum_ad_persona_selection(n_clicks, current_key, domain, current_squad, current_model):
+    """Update active AD persona in Summary Dashboard and cascade authorized squads & models."""
+    trig = callback_context.triggered_id
+    if not isinstance(trig, dict) or not any(n_clicks):
+        return (no_update,) * 16
  
-    year_filter = (
-        f"YEAR IN ({base_year}, {plan_year})"
-        if plan_year is not None else
-        f"YEAR = {base_year}"
+    key = trig.get("key", "COM-APP-NA-IBP-SELFCARE")
+    if current_key and key == current_key:
+        return (no_update,) * 16
+ 
+    curr_user = get_current_user()
+    user_groups = curr_user.get("all_ad_groups", []) if curr_user else []
+    if user_groups and key not in user_groups:
+        return (no_update,) * 16
+ 
+    persona = AD_PERSONAS.get(key, AD_PERSONAS["COM-APP-NA-IBP-SELFCARE"])
+    mapping = get_ad_group_mapping([key])
+    gbu_codes = mapping["gbu_codes"] if mapping and mapping.get("gbu_codes") else persona["gbus"]
+ 
+    ad_items = build_sum_ad_switcher_menu_items(active_key=key)
+    active_squads, active_squad_disp, squad_items = _resolve_sum_squad_selection(gbu_codes, current_squad)
+    active_models, _, model_items, active_pill_lbl = _resolve_sum_model_selection(
+        active_squads, gbu_codes, domain, current_model
     )
  
-    s_db = config.SNOWFLAKE_VD_SHIPMENT_DATABASE
-    s_sch = config.SNOWFLAKE_VD_SHIPMENT_SCHEMA
-    s_view = config.SNOWFLAKE_VD_SHIPMENT_VIEW
+    user_email_elem = _build_summary_user_identity_elem(persona["email"])
+    session_ad_data = {"persona_key": key, "source": "summary"}
+    curr_user = get_current_user()
+    if curr_user:
+        curr_user["ad_group"] = key
+        set_user_session(curr_user)
  
-    query = f"""
-    SELECT
-        YEAR,
-        MONTHNUMBER,
-        SUM(GTS_AMT) AS GTS_AMT,
-        SUM(GTS_QTY) AS GTS_QTY
-    FROM {s_db}.{s_sch}.{s_view}
-    WHERE
-        ({where_clause})
-        AND {year_filter}
-    GROUP BY
-        YEAR,
-        MONTHNUMBER
-    ORDER BY
-        YEAR,
-        MONTHNUMBER;
+    p_squad = active_squads[0] if active_squads else ""
+    p_model = active_models[0] if active_models else ""
+    session_model_data = {
+        "model_id": None,
+        "model_name": p_model,
+        "squad_name": p_squad,
+        "selected_models": active_models,
+        "selected_squads": active_squads,
+        "source": "summary",
+    }
+ 
+    return (
+        key,
+        persona["name"],
+        persona["role_label"],
+        persona["role_color"],
+        user_email_elem,
+        ad_items,
+        squad_items,
+        active_squad_disp,
+        active_squads,
+        model_items,
+        active_pill_lbl,
+        active_models,
+        session_ad_data,
+        None,
+        None,
+        session_model_data,
+    )
+ 
+ 
+# ─── 2. Multi-Squad Selection Callbacks (Staging & Apply) ─────────────────────
+ 
+def _get_staging_squads_list(staging_store: Any, committed_squad: Any) -> List[str]:
+    """Extract current active staging squads list from store or committed squad."""
+    if staging_store is not None:
+        if isinstance(staging_store, (list, tuple, set)):
+            return [str(s) for s in staging_store if s and str(s) != _SELECT_SQUAD]
+        if staging_store and str(staging_store) != _SELECT_SQUAD:
+            return [str(staging_store)]
+        return []
+    if committed_squad:
+        if isinstance(committed_squad, (list, tuple, set)):
+            return [str(s) for s in committed_squad if s and str(s) != _SELECT_SQUAD]
+        if str(committed_squad) != _SELECT_SQUAD:
+            return [str(committed_squad)]
+    return []
+ 
+ 
+def _calculate_next_squad_staging(
+    trig: dict,
+    current_staging: list[str],
+    all_squad_names: list[str],
+) -> list[str] | None:
+    """Compute new squad staging list based on menu action or item click."""
+    action = trig.get("action")
+    if action == "reset":
+        return []
+ 
+    current_staging_set = {s.upper() for s in current_staging}
+    if action == "select-all":
+        is_all = all_squad_names and all(name.upper() in current_staging_set for name in all_squad_names)
+        return [] if is_all else list(all_squad_names)
+ 
+    if trig.get("type") == "sum-squad-select-item":
+        clicked_name = trig.get("name")
+        if clicked_name:
+            if clicked_name.upper() in current_staging_set:
+                return [s for s in current_staging if s.upper() != clicked_name.upper()]
+            return current_staging + [clicked_name]
+ 
+    return None
+ 
+ 
+def _is_staging_callback_active(select_clicks: Any, action_clicks: Any, trig: Any) -> bool:
+    """Validate that the callback was triggered by a valid staging click action."""
+    has_select_click = any(c for c in (select_clicks or []) if c)
+    has_action_click = any(c for c in (action_clicks or []) if c)
+    if not has_select_click and not has_action_click:
+        return False
+    if not isinstance(trig, dict) or trig.get("action") == "apply":
+        return False
+    return True
+ 
+ 
+def _resolve_staging_gbu_codes(persona_key: Optional[str]) -> list:
+    """Resolve GBU codes for active persona from DB mapping or fallback config."""
+    persona = AD_PERSONAS.get(persona_key, AD_PERSONAS["COM-APP-NA-IBP-SELFCARE"])
+    mapping = get_ad_group_mapping([persona_key]) if persona_key else None
+    if mapping and mapping.get("gbu_codes"):
+        return mapping["gbu_codes"]
+    return persona["gbus"]
+ 
+ 
+@callback(
+    Output("sum-squad-staging-store", "data", allow_duplicate=True),
+    Output("menu-sum-squad", "children", allow_duplicate=True),
+    Input({"type": "sum-squad-select-item", "name": ALL, "disp": ALL}, "n_clicks"),
+    Input({"type": "sum-squad-action", "action": ALL}, "n_clicks"),
+    State("sum-squad-staging-store", "data"),
+    State("filter-sum-squad", "data"),
+    State("sum-header-ad-switcher", "data"),
+    prevent_initial_call=True,
+)
+def handle_sum_squad_staging(select_clicks, action_clicks, staging_store, committed_squad, persona_key):
+    """Handle checkbox toggling, Select All, and Reset within the multi-squad dropdown menu."""
+    trig = callback_context.triggered_id
+    if not _is_staging_callback_active(select_clicks, action_clicks, trig):
+        return no_update, no_update
+ 
+    gbu_codes = _resolve_staging_gbu_codes(persona_key)
+    squad_rows = _safe_get_squads_by_gbu(gbu_codes)
+    default_gbu = gbu_codes[0] if gbu_codes else ""
+    squad_list = [
+        {
+            "squad_name": s["squad_name"],
+            "display_name": s["squad_name"].title(),
+            "gbu": s.get("gbu_code", default_gbu),
+            "gbu_short": (s.get("gbu_name", "")).split()[0].title() if s.get("gbu_name") else "",
+        }
+        for s in squad_rows
+    ]
+    all_squad_names = [s["squad_name"] for s in squad_list]
+ 
+    current_staging = _get_staging_squads_list(staging_store, committed_squad)
+    new_staging = _calculate_next_squad_staging(trig, current_staging, all_squad_names)
+    if new_staging is None:
+        return no_update, no_update
+ 
+    squad_items = build_sum_squad_menu_items(squad_list, active_squad_name=new_staging)
+    return new_staging, squad_items
+ 
+ 
+@callback(
+    Output("filter-sum-squad", "data", allow_duplicate=True),
+    Output("selected-sum-squad-label", "children", allow_duplicate=True),
+    Output("menu-sum-squad", "children", allow_duplicate=True),
+    Output("sum-squad-staging-store", "data", allow_duplicate=True),
+    Output("filter-sum-model", "data", allow_duplicate=True),
+    Output("selected-sum-model-label", "children", allow_duplicate=True),
+    Output("menu-sum-model", "children", allow_duplicate=True),
+    Output("sum-model-staging-store", "data", allow_duplicate=True),
+    Output("session-active-model-store", "data", allow_duplicate=True),
+    Input({"type": "sum-squad-action", "action": ALL}, "n_clicks"),
+    State("sum-squad-staging-store", "data"),
+    State("filter-sum-squad", "data"),
+    State("filter-sum-model", "data"),
+    State("sum-header-ad-switcher", "data"),
+    State("filter-sum-domain", "data"),
+    prevent_initial_call=True,
+)
+def handle_sum_squad_apply(action_clicks, staging_store, committed_squad, current_model, persona_key, domain):
+    """Commit multi-squad selection, cascade to model options, and sync primary model to session store."""
+    has_action_click = any(c for c in (action_clicks or []) if c)
+    trig = callback_context.triggered_id
+    if not isinstance(trig, dict) or trig.get("action") != "apply" or not has_action_click:
+        return (no_update,) * 9
+ 
+    gbu_codes = _resolve_staging_gbu_codes(persona_key)
+    squad_rows = _safe_get_squads_by_gbu(gbu_codes)
+    default_gbu = gbu_codes[0] if gbu_codes else ""
+    squad_list = [
+        {
+            "squad_name": s["squad_name"],
+            "display_name": s["squad_name"].title(),
+            "gbu": s.get("gbu_code", default_gbu),
+            "gbu_short": (s.get("gbu_name", "")).split()[0].title() if s.get("gbu_name") else "",
+        }
+        for s in squad_rows
+    ]
+ 
+    selected_squads = _get_staging_squads_list(staging_store, committed_squad)
+    squad_pill_lbl = format_sum_squad_pill_label(selected_squads, total_squads=len(squad_list))
+    squad_items = build_sum_squad_menu_items(squad_list, active_squad_name=selected_squads)
+ 
+    selected_models, primary_id, model_items, model_pill_lbl = _resolve_sum_model_selection(
+        selected_squads, gbu_codes, domain, current_model
+    )
+ 
+    primary_squad = selected_squads[0] if selected_squads else ""
+    primary_model = selected_models[0] if selected_models else ""
+    session_model_data = {
+        "model_id": primary_id,
+        "model_name": primary_model,
+        "squad_name": primary_squad,
+        "selected_models": selected_models,
+        "selected_squads": selected_squads,
+        "source": "summary",
+    }
+ 
+    return (
+        selected_squads,
+        squad_pill_lbl,
+        squad_items,
+        None,
+        selected_models,
+        model_pill_lbl,
+        model_items,
+        None,
+        session_model_data,
+    )
+ 
+ 
+# ─── 3. Multi-Model Selection Callbacks (Staging & Apply) ─────────────────────
+ 
+def _get_staging_models_list(staging_store: Any, committed_model: Any) -> List[str]:
+    """Extract current active staging models list from store or committed model."""
+    if staging_store is not None:
+        if isinstance(staging_store, (list, tuple, set)):
+            return [str(m) for m in staging_store if m and str(m) != _SELECT_MODEL]
+        if staging_store and str(staging_store) != _SELECT_MODEL:
+            return [str(staging_store)]
+        return []
+    if committed_model:
+        if isinstance(committed_model, (list, tuple, set)):
+            return [str(m) for m in committed_model if m and str(m) != _SELECT_MODEL]
+        if str(committed_model) != _SELECT_MODEL:
+            return [str(committed_model)]
+    return []
+ 
+ 
+def _calculate_next_model_staging(
+    trig: dict,
+    current_staging: list[str],
+    all_avail_names: list[str],
+) -> list[str] | None:
+    """Compute new model staging list based on menu action or item click."""
+    action = trig.get("action")
+    if action == "reset":
+        return []
+ 
+    current_staging_set = {m.upper() for m in current_staging}
+    if action == "select-all":
+        is_all = all_avail_names and all(name.upper() in current_staging_set for name in all_avail_names)
+        return [] if is_all else list(all_avail_names)
+ 
+    if trig.get("type") == "sum-model-select-item":
+        clicked_name = trig.get("name")
+        if clicked_name:
+            if clicked_name.upper() in current_staging_set:
+                return [m for m in current_staging if m.upper() != clicked_name.upper()]
+            return current_staging + [clicked_name]
+ 
+    return None
+ 
+ 
+def _resolve_available_staging_models(
+    persona_key: Optional[str], domain: Optional[str], squad_name: Any
+) -> list[dict]:
+    """Resolve list of active models filtered by domain for staging dropdown."""
+    gbu_codes = _resolve_staging_gbu_codes(persona_key)
+    dom_upper = (domain or "CONSUMPTION").upper()
+    flag_key = "has_shipment" if dom_upper in ["SHIPMENT", "GTS", "GTSCOC"] else "has_pos"
+    squad_list = [squad_name] if isinstance(squad_name, str) else list(squad_name or [])
+    all_models = _get_models_for_squads(squad_list or [GBU_PAIN_CARE], gbu_codes)
+    return [m for m in all_models if m.get(flag_key)] or all_models
+ 
+ 
+@callback(
+    Output("sum-model-staging-store", "data", allow_duplicate=True),
+    Output("menu-sum-model", "children", allow_duplicate=True),
+    Output("session-active-model-store", "data", allow_duplicate=True),
+    Input({"type": "sum-model-select-item", "id": ALL, "name": ALL}, "n_clicks"),
+    Input({"type": "sum-model-action", "action": ALL}, "n_clicks"),
+    State("sum-model-staging-store", "data"),
+    State("filter-sum-model", "data"),
+    State("sum-header-ad-switcher", "data"),
+    State("filter-sum-domain", "data"),
+    State("filter-sum-squad", "data"),
+    prevent_initial_call=True,
+)
+def handle_sum_model_staging(select_clicks, action_clicks, staging_store, committed_model, persona_key, domain, squad_name):
+    """Handle checkbox toggling, Select All, and Reset within the multi-model dropdown menu."""
+    trig = callback_context.triggered_id
+    if not _is_staging_callback_active(select_clicks, action_clicks, trig):
+        return no_update, no_update, no_update
+ 
+    avail_models = _resolve_available_staging_models(persona_key, domain, squad_name)
+    all_avail_names = [m["model_name"] for m in avail_models if m.get("model_name")]
+ 
+    current_staging = _get_staging_models_list(staging_store, committed_model)
+    new_staging = _calculate_next_model_staging(trig, current_staging, all_avail_names)
+    if new_staging is None:
+        return no_update, no_update, no_update
+ 
+    model_items = build_sum_model_menu_items(avail_models, active_model_name=new_staging)
+ 
+    session_data = no_update
+    if new_staging:
+        squad_list = [squad_name] if isinstance(squad_name, str) else list(squad_name or [])
+        primary_model = new_staging[0]
+        primary_squad = squad_list[0] if squad_list else ""
+        session_data = _build_model_apply_session_data(
+            primary_model,
+            primary_squad,
+            avail_models,
+            selected_models=new_staging,
+            selected_squads=squad_list,
+        )
+ 
+    return new_staging, model_items, session_data
+ 
+ 
+def _build_model_apply_session_data(
+    primary_model: str,
+    primary_squad: str,
+    avail_models: list[dict],
+    selected_models: Optional[list[str]] = None,
+    selected_squads: Optional[list[str]] = None,
+) -> dict:
+    """Build session store payload for model sync across dashboards."""
+    primary_id = None
+    if primary_model:
+        matched = next((m for m in avail_models if m.get("model_name", "").upper() == primary_model.upper()), None)
+        if matched:
+            primary_id = matched.get("model_id")
+ 
+    s_mods = [str(m) for m in selected_models if m] if selected_models else ([primary_model] if primary_model else [])
+    s_sqs = [str(s) for s in selected_squads if s] if selected_squads else ([primary_squad] if primary_squad else [])
+ 
+    return {
+        "model_id": primary_id,
+        "model_name": primary_model,
+        "squad_name": primary_squad,
+        "selected_models": s_mods,
+        "selected_squads": s_sqs,
+        "source": "summary",
+    }
+ 
+ 
+@callback(
+    Output("filter-sum-model", "data", allow_duplicate=True),
+    Output("selected-sum-model-label", "children", allow_duplicate=True),
+    Output("session-active-model-store", "data", allow_duplicate=True),
+    Output("sum-model-staging-store", "data", allow_duplicate=True),
+    Output("menu-sum-model", "children", allow_duplicate=True),
+    Input({"type": "sum-model-action", "action": ALL}, "n_clicks"),
+    State("sum-model-staging-store", "data"),
+    State("filter-sum-model", "data"),
+    State("filter-sum-squad", "data"),
+    State("sum-header-ad-switcher", "data"),
+    State("filter-sum-domain", "data"),
+    prevent_initial_call=True,
+)
+def handle_sum_model_apply(action_clicks, staging_store, committed_model, squad_name, persona_key, domain):
+    """Finalize multi-model selection on Apply click and synchronize primary model to session store."""
+    has_action_click = any(c for c in (action_clicks or []) if c)
+    trig = callback_context.triggered_id
+    if not isinstance(trig, dict) or trig.get("action") != "apply" or not has_action_click:
+        return (no_update,) * 5
+ 
+    avail_models = _resolve_available_staging_models(persona_key, domain, squad_name)
+    selected_models = _get_staging_models_list(staging_store, committed_model)
+    pill_label = format_sum_model_pill_label(selected_models, total_models=len(avail_models))
+ 
+    squad_list = [squad_name] if isinstance(squad_name, str) else list(squad_name or [])
+    primary_model = selected_models[0] if selected_models else ""
+    primary_squad = squad_list[0] if squad_list else ""
+    session_model_data = _build_model_apply_session_data(
+        primary_model,
+        primary_squad,
+        avail_models,
+        selected_models=selected_models,
+        selected_squads=squad_list,
+    )
+    model_items = build_sum_model_menu_items(avail_models, active_model_name=selected_models)
+ 
+    return selected_models, pill_label, session_model_data, None, model_items
+ 
+ 
+# ─── 4. Domain Card Toggle (Consumption vs Shipment vs GTS YoY vs GTS CoC) ───
+ 
+def _resolve_sum_domain_trigger(n_ship: Any, n_gts: Any, n_coc: Any) -> str:
+    try:
+        if callback_context.triggered:
+            return callback_context.triggered[0]["prop_id"].split(".")[0]
+    except (IndexError, KeyError, AttributeError, MissingCallbackContextException):
+        pass
+    if n_coc:
+        return "card-sum-gtscoc"
+    if n_gts:
+        return "card-sum-gts"
+    if n_ship:
+        return "card-sum-shipment"
+    return "card-sum-consumption"
+ 
+ 
+def _clean_toggle_model_input(current_model: Any) -> str | list[str]:
+    """Clean current model name removing UNAVAILABLE: prefix if present."""
+    if isinstance(current_model, str):
+        return current_model.replace(_PREFIX_UNAVAILABLE, "") if current_model else ""
+    if isinstance(current_model, (list, tuple, set)):
+        return [str(m).replace(_PREFIX_UNAVAILABLE, "") for m in current_model if m]
+    return ""
+ 
+ 
+def _resolve_sum_toggle_model(
+    clean_model: str | list[str],
+    avail_models: list,
+    all_models: list,
+    has_squad: bool = True,
+) -> Tuple[str | list[str], str, Any]:
+    if isinstance(clean_model, str):
+        is_model_available = any(
+            m["model_name"].upper() == clean_model.upper() for m in avail_models
+        )
+        if is_model_available:
+            new_model_data = clean_model
+            new_model_label = clean_model
+            model_items = build_sum_model_menu_items(
+                avail_models or all_models,
+                active_model_name=[clean_model],
+                has_squad=has_squad,
+            )
+        else:
+            new_model_data = f"{_PREFIX_UNAVAILABLE}{clean_model}" if clean_model else _SELECT_MODEL
+            new_model_label = _SELECT_MODEL
+            model_items = build_sum_model_menu_items(
+                avail_models or all_models,
+                active_model_name=[],
+                has_squad=has_squad,
+            )
+        return new_model_data, new_model_label, model_items
+ 
+    clean_list = [str(m).strip() for m in clean_model if m]
+    avail_names_set = {m["model_name"].upper() for m in avail_models}
+    valid_selected = [m for m in clean_list if m.upper() in avail_names_set]
+ 
+    if valid_selected:
+        new_model_data = valid_selected
+        new_model_label = format_sum_model_pill_label(valid_selected, len(avail_models))
+        model_items = build_sum_model_menu_items(
+            avail_models or all_models,
+            active_model_name=valid_selected,
+            has_squad=has_squad,
+        )
+    elif avail_models:
+        fallback = avail_models[0]["model_name"]
+        new_model_data = [fallback]
+        new_model_label = fallback
+        model_items = build_sum_model_menu_items(
+            avail_models or all_models,
+            active_model_name=[fallback],
+            has_squad=has_squad,
+        )
+    else:
+        new_model_data = _SELECT_MODEL
+        new_model_label = _SELECT_MODEL
+        model_items = build_sum_model_menu_items(
+            avail_models or all_models,
+            active_model_name=[],
+            has_squad=has_squad,
+        )
+ 
+    return new_model_data, new_model_label, model_items
+ 
+ 
+def _resolve_domain_from_trigger(trig: str) -> Tuple[str, str]:
+    """Maps card trigger ID to active domain and domain title."""
+    mapping = {
+        "card-sum-gtscoc": ("gtscoc", "GTS CHANGE OF CYCLE (CoC)"),
+        "card-sum-gts": ("gts", "GTS YOY"),
+        "card-sum-shipment": ("shipment", "SHIPMENT"),
+    }
+    return mapping.get(trig, ("consumption", "CONSUMPTION"))
+ 
+ 
+def _resolve_domain_tile_styles(active_domain: str) -> Tuple[str, str, str, str, dict, dict, dict, dict]:
+    """Generates class and style dicts for all 4 domain toggle tiles."""
+    domains = ["consumption", "shipment", "gts", "gtscoc"]
+    classes = [
+        "val-tile-stacked active-domain" if d == active_domain else "val-tile-stacked inactive-domain"
+        for d in domains
+    ]
+    styles = [
+        TILE_ACTIVE_STYLE if d == active_domain else TILE_INACTIVE_STYLE
+        for d in domains
+    ]
+    return (
+        classes[0], classes[1], classes[2], classes[3],
+        styles[0], styles[1], styles[2], styles[3]
+    )
+ 
+ 
+@callback(
+    Output("card-sum-consumption", "className"),
+    Output("card-sum-shipment", "className"),
+    Output("card-sum-gts", "className"),
+    Output("card-sum-gtscoc", "className"),
+    Output("card-sum-consumption", "style"),
+    Output("card-sum-shipment", "style"),
+    Output("card-sum-gts", "style"),
+    Output("card-sum-gtscoc", "style"),
+    Output("filter-sum-domain", "data"),
+    Output("menu-sum-model", "children", allow_duplicate=True),
+    Output("selected-sum-model-label", "children", allow_duplicate=True),
+    Output("filter-sum-model", "data", allow_duplicate=True),
+    Output("ribbon-sum-domain-title", "children"),
+    Input("card-sum-consumption", "n_clicks"),
+    Input("card-sum-shipment", "n_clicks"),
+    Input("card-sum-gts", "n_clicks"),
+    Input("card-sum-gtscoc", "n_clicks"),
+    State("filter-sum-domain", "data"),
+    State("sum-header-ad-switcher", "data"),
+    State("filter-sum-squad", "data"),
+    State("filter-sum-model", "data"),
+    prevent_initial_call=True,
+)
+def handle_sum_domain_toggle(n_cons, n_ship, n_gts, n_coc, current_domain, persona_key, squad_name, current_model):
     """
+    Toggle between 4 domains: Consumption, Shipment, GTS YoY, and GTS CoC.
+    Preserves model if supported by domain or presents empty state guidance.
+    """
+    _ = (n_cons, current_domain)
+    trig = _resolve_sum_domain_trigger(n_ship, n_gts, n_coc)
+    active_domain, domain_title = _resolve_domain_from_trigger(trig)
+    c_cls, s_cls, g_cls, coc_cls, c_stl, s_stl, g_stl, coc_stl = _resolve_domain_tile_styles(active_domain)
+ 
+    persona = AD_PERSONAS.get(persona_key, AD_PERSONAS["COM-APP-NA-IBP-SELFCARE"])
+    mapping = get_ad_group_mapping([persona_key]) if persona_key else None
+    gbu_codes = mapping["gbu_codes"] if mapping and mapping.get("gbu_codes") else persona["gbus"]
+ 
+    flag_key = "has_shipment" if active_domain in ["shipment", "gts", "gtscoc"] else "has_pos"
+    squad_list = [squad_name] if isinstance(squad_name, str) else list(squad_name or [])
+    all_models = _get_models_for_squads(squad_list or [GBU_PAIN_CARE], gbu_codes)
+    avail_models = [m for m in all_models if m.get(flag_key)]
+ 
+    clean_model = _clean_toggle_model_input(current_model)
+    has_squad = bool([s for s in squad_list if s and s != _SELECT_SQUAD])
+    new_model_data, new_model_label, model_items = _resolve_sum_toggle_model(
+        clean_model, avail_models, all_models, has_squad=has_squad
+    )
+ 
+    return (
+        c_cls,
+        s_cls,
+        g_cls,
+        coc_cls,
+        c_stl,
+        s_stl,
+        g_stl,
+        coc_stl,
+        active_domain,
+        model_items,
+        new_model_label,
+        new_model_data,
+        domain_title,
+    )
+ 
+ 
+# ─── 5. Auto-Load Data & Render Matrix Table (Zero Refresh Button!) ───────────
+ 
+def _resolve_clean_models(model: Any) -> list[str]:
+    """Extract clean valid model names from model input."""
+    if isinstance(model, (list, tuple, set)):
+        model_list = [str(m) for m in model if m]
+    elif isinstance(model, str):
+        model_list = [model] if model else []
+    else:
+        model_list = []
+ 
+    return [
+        m for m in model_list
+        if normalize_text(m) not in [_SELECT_MODEL.upper(), "ALL", "NONE", ""]
+    ]
+ 
+ 
+def _compute_ribbon_title(clean_models: list[str], squad_list: list[str], domain: str) -> str:
+    """Determine header ribbon title for single or multi-model consolidated views."""
+    if len(clean_models) == 1:
+        return clean_models[0]
+ 
+    flag_key = "has_shipment" if (domain or "").lower() in ["shipment", "gts", "gtscoc"] else "has_pos"
+    try:
+        all_squad_models = _get_models_for_squads(squad_list, None) if squad_list else []
+        avail_models = [m for m in all_squad_models if m.get(flag_key)] or all_squad_models
+        total_avail = len(avail_models)
+    except (psycopg2.Error, KeyError, IndexError, ValueError):
+        total_avail = 0
+ 
+    if 0 < total_avail <= len(clean_models):
+        return f"Consolidated (All {len(clean_models)} Models)"
+    return f"Consolidated ({len(clean_models)} Models)"
+ 
+ 
+def _compute_summary_matrix_for_domain(domain: str, clean_models: list) -> dict:
+    """Dispatches matrix calculation to the appropriate domain engine."""
+    dispatch = {
+        "consumption": compute_consumption_summary_matrix,
+        "shipment": compute_shipment_summary_matrix,
+        "gts": compute_gts_summary_matrix,
+        "gtscoc": compute_gtscoc_summary_matrix,
+    }
+    func = dispatch.get(domain, compute_consumption_summary_matrix)
+    return func(clean_models)
+ 
+ 
+def _resolve_summary_status_text(domain: str) -> str:
+    """Returns domain unit notice."""
+    notices = {
+        "consumption": "POS $ are in millions.",
+        "shipment": "Factory POS $ and GTS $ are in millions.",
+        "gts": "GTS $ are in millions.",
+        "gtscoc": "",
+    }
+    return notices.get(domain, "")
+ 
+ 
+def _render_summary_calc_error(err: Exception) -> html.Div:
+    """Renders formatted notice card on calculation or database failure."""
+    return html.Div(
+        html.Div([
+            html.H6("Calculation / Database Connection Notice", style={"color": "#D9534F", "fontWeight": "700"}),
+            html.P(str(err), style={"color": "#721c24", "fontSize": "13px"}),
+        ], style={
+            "textAlign": "center", "padding": "32px", "backgroundColor": "#f8d7da",
+            "borderRadius": "10px", "border": "1px solid #f5c6cb"
+        }),
+        style={"padding": "16px"}
+    )
+ 
+ 
+@callback(
+    Output("sum-grid-container", "children"),
+    Output("sum-status-badge", "children"),
+    Output("ribbon-sum-model-title", "children"),
+    Output("sum-cache-store", "data"),
+    Output("sum-fiscal-badge", "children"),
+    Input("filter-sum-model", "data"),
+    Input("filter-sum-domain", "data"),
+    Input("filter-sum-squad", "data"),
+    State("sum-cache-store", "data"),
+    prevent_initial_call=False,
+)
+def handle_sum_auto_load_grid(model, domain, squad_name, cache_store):
+    """
+    Automatically queries Snowflake & PostgreSQL and renders the summary matrix table.
+    Supports single-model and multi-model consolidated calculations across all 4 domains:
+    1. Consumption Summary
+    2. Shipment Summary
+    3. GTS YoY Summary
+    4. GTS CoC Summary
+    """
+    domain = (domain or "consumption").lower()
+ 
+    if model is None or squad_name is None:
+        return no_update, no_update, no_update, no_update, no_update
+ 
+    fiscal_tag, fiscal_badge = _get_sum_fiscal_context()
+ 
+    squad_list = _normalize_squad_list(squad_name)
+    if not squad_list:
+        empty_card = render_empty_selection_card("squad", domain)
+        status_msg = "Please select a squad from the Squad dropdown above."
+        return empty_card, status_msg, _SELECT_SQUAD, {"status": "empty_squad"}, fiscal_badge
+ 
+    if isinstance(model, str) and model.startswith(_PREFIX_UNAVAILABLE):
+        unavailable_model = model.replace(_PREFIX_UNAVAILABLE, "").strip()
+        alert_card = render_empty_domain_alert(unavailable_model, domain)
+        status_msg = f"No {domain.title()} records mapped for '{unavailable_model}'"
+        return alert_card, status_msg, _SELECT_MODEL, {"status": "unavailable", "model": unavailable_model}, fiscal_badge
+ 
+    clean_models = _resolve_clean_models(model)
+    if not clean_models:
+        empty_card = render_empty_selection_card("model", domain)
+        status_msg = "Please select a model above to view summary data."
+        return empty_card, status_msg, _SELECT_MODEL, {"status": "empty_model"}, fiscal_badge
+ 
+    cache_key = f"{domain.upper()}:{fiscal_tag}:{','.join(sorted(clean_models)).upper()}"
+    ribbon_title = _compute_ribbon_title(clean_models, squad_list, domain)
+    model_disp = clean_models[0] if len(clean_models) == 1 else f"Consolidated ({len(clean_models)} Models)"
  
     try:
-        conn = get_snowflake_connection()
-        cur = conn.cursor()
-        cur.execute(query)
-        rows = cur.fetchall()
-        cur.close()
-        gts_base, gts_plan_actual = _aggregate_snowflake_gts_months(rows, base_year, plan_year)
-    except Exception as e:
-        logger.error("Snowflake shipment GTS query error: %s", e)
+        is_cached = False
+        if _is_sum_cache_valid(cache_key):
+            matrix_data = _SUM_SNOWFLAKE_CACHE[cache_key]
+            is_cached = True
+        else:
+            matrix_data = _compute_summary_matrix_for_domain(domain, clean_models)
+            _SUM_SNOWFLAKE_CACHE[cache_key] = matrix_data
+            _SUM_SNOWFLAKE_CACHE_TS[cache_key] = time.monotonic()
  
-    return gts_base, gts_plan_actual
+        grid_elem = render_summary_matrix_table(matrix_data, domain=domain.upper(), model_name=model_disp)
+        status_text = _resolve_summary_status_text(domain)
+        return grid_elem, status_text, ribbon_title, {"last_loaded": cache_key, "cached": is_cached}, fiscal_badge
+ 
+    except Exception as err:
+        logger.error("Error computing summary matrix for models %s in domain %s: %s", clean_models, domain, err)
+        err_elem = _render_summary_calc_error(err)
+        return err_elem, f"Notice: {str(err)[:60]}...", ribbon_title, {"error": str(err)[:100]}, fiscal_badge
+ 
+ 
+# ─── 6. Cross-Page Session Synchronization ────────────────────────────────────
+ 
+def _resolve_summary_sync_squad(
+    target_squad: Any,
+    target_model: Any,
+    gbu_codes: list,
+    squad_list: list,
+) -> Tuple[List[str], str, Any]:
+    target_squad_names = []
+    if isinstance(target_squad, (list, tuple, set)):
+        target_squad_names = [str(s).upper() for s in target_squad if s]
+    elif target_squad:
+        target_squad_names = [str(target_squad).upper()]
+ 
+    if not target_squad_names and target_model:
+        t_mod = target_model[0] if isinstance(target_model, (list, tuple, set)) and target_model else target_model
+        if t_mod:
+            try:
+                all_m = get_all_models(gbu_codes)
+            except Exception as e:
+                logger.warning("Could not fetch all models for GBU %s: %s", gbu_codes, e)
+                all_m = []
+            matched_m = next((m for m in all_m if m["model_name"].upper() == str(t_mod).upper()), None)
+            if matched_m and matched_m.get("primary_need_state"):
+                target_squad_names = [matched_m["primary_need_state"].upper()]
+ 
+    matched_squads = [
+        s["squad_name"] for s in squad_list
+        if s["squad_name"].upper() in target_squad_names
+    ]
+    if matched_squads:
+        active_squads = matched_squads
+    elif squad_list:
+        active_squads = [squad_list[0]["squad_name"]]
+    else:
+        active_squads = ["BABY CARE"]
+ 
+    squad_pill_lbl = format_sum_squad_pill_label(active_squads, len(squad_list))
+    squad_items = build_sum_squad_menu_items(squad_list, active_squad_name=active_squads)
+    return active_squads, squad_pill_lbl, squad_items
+ 
+ 
+def _pick_sync_model_state(
+    target_str: str,
+    avail_models: list[dict],
+    all_models: list[dict],
+) -> tuple[str, str]:
+    """Resolve active model identifier and display label during synchronization."""
+    if target_str:
+        matched = next((m for m in avail_models if m["model_name"].upper() == target_str.upper()), None)
+        if matched:
+            return matched["model_name"], matched["model_name"]
+        if any(m["model_name"].upper() == target_str.upper() for m in all_models):
+            return f"{_PREFIX_UNAVAILABLE}{target_str}", _SELECT_MODEL
+ 
+    fallback = avail_models[0]["model_name"] if avail_models else _SELECT_MODEL
+    return fallback, fallback
+ 
+ 
+def _resolve_summary_sync_model(
+    target_model: Any,
+    active_squad: str | list[str],
+    gbu_codes: list,
+    domain: str,
+) -> Tuple[List[str], str, Any]:
+    dom_upper = (domain or "CONSUMPTION").upper()
+    flag_key = "has_shipment" if dom_upper in ["SHIPMENT", "GTS", "GTSCOC"] else "has_pos"
+    squad_list = [active_squad] if isinstance(active_squad, str) else list(active_squad or [])
+    all_models = _get_models_for_squads(squad_list, gbu_codes)
+    avail_models = [m for m in all_models if m.get(flag_key)]
+ 
+    target_model_names = []
+    if isinstance(target_model, (list, tuple, set)):
+        target_model_names = [str(m).upper() for m in target_model if m]
+    elif target_model:
+        target_model_names = [str(target_model).upper()]
+ 
+    pool = avail_models or all_models
+    matched_models = [
+        m["model_name"] for m in pool
+        if m["model_name"].upper() in target_model_names
+    ]
+    matched_in_all = [
+        m["model_name"] for m in all_models
+        if m["model_name"].upper() in target_model_names
+    ]
+    if matched_models:
+        active_models = matched_models
+    elif matched_in_all:
+        active_models = matched_in_all
+    elif pool:
+        active_models = [pool[0]["model_name"]]
+    else:
+        active_models = []
+ 
+    active_model_lbl = format_sum_model_pill_label(active_models, len(pool))
+    has_squad = bool([s for s in squad_list if s and s != _SELECT_SQUAD])
+    model_items = build_sum_model_menu_items(
+        all_models if (not matched_models and matched_in_all) else pool,
+        active_model_name=active_models,
+        has_squad=has_squad,
+    )
+    active_model_res: Any = (
+        active_models[0]
+        if (len(active_models) == 1 and (isinstance(target_model, str) or len(target_model_names) <= 1))
+        else active_models
+    )
+    return active_model_res, active_model_lbl, model_items
+ 
+ 
+def _resolve_sync_persona_and_gbus(session_ad: Any, current_ad: Any) -> Tuple[str, Dict[str, Any], List[str]]:
+    new_ad = session_ad.get("persona_key") if session_ad and isinstance(session_ad, dict) else current_ad
+    new_ad = new_ad or "COM-APP-NA-IBP-SELFCARE"
+    persona = AD_PERSONAS.get(new_ad, AD_PERSONAS["COM-APP-NA-IBP-SELFCARE"])
+    mapping = get_ad_group_mapping([new_ad]) if new_ad else None
+    gbu_codes = mapping["gbu_codes"] if mapping and mapping.get("gbu_codes") else persona["gbus"]
+    return new_ad, persona, gbu_codes
+ 
+ 
+def _build_summary_squad_list(gbu_codes: List[str]) -> List[Dict[str, str]]:
+    squad_rows = _safe_get_squads_by_gbu(gbu_codes)
+    squad_list = []
+    default_gbu = gbu_codes[0] if gbu_codes else ""
+    for s in squad_rows:
+        s_name = s["squad_name"]
+        gbu_c = s.get("gbu_code", default_gbu)
+        gbu_n = s.get("gbu_name", gbu_c)
+        squad_list.append({
+            "squad_name": s_name,
+            "display_name": s_name.title(),
+            "gbu": gbu_c,
+            "gbu_short": gbu_n.split()[0].title() if gbu_n else "",
+        })
+    return squad_list
+ 
+ 
+def _is_summary_sync_needed(
+    current_ad: Any,
+    new_ad: Any,
+    current_squad: Any,
+    target_squads: Any,
+    current_model: Any,
+    target_models: Any,
+) -> bool:
+    """Checks whether any filter on summary dashboard differs from target session state."""
+    if current_ad and new_ad and current_ad != new_ad:
+        return True
+ 
+    curr_sq_set = {s.upper() for s in _normalize_squad_list(current_squad)}
+    target_sq_set = {s.upper() for s in _normalize_squad_list(target_squads)}
+    if curr_sq_set != target_sq_set:
+        return True
+ 
+    curr_mod_set = {m.upper() for m in _normalize_model_list(current_model)}
+    target_mod_set = {m.upper() for m in _normalize_model_list(target_models)}
+    if curr_mod_set != target_mod_set:
+        return True
+ 
+    return False
+ 
+ 
+def _is_summary_sync_suppressed(
+    trig_id: Any,
+    is_model_self: bool,
+    is_ad_self: bool,
+    ad_changed: bool,
+    session_model: Any = None,
+    current_squad: Any = None,
+    current_model: Any = None,
+) -> bool:
+    """Checks whether session sync to summary dashboard should be suppressed to avoid self-updates."""
+    if ad_changed or trig_id == "url":
+        return False
+    if is_model_self:
+        if trig_id == "session-active-model-store":
+            return True
+        if trig_id is None:
+            if session_model and (current_squad is not None or current_model is not None):
+                target_squad, target_model = _extract_sync_target_squad_and_model(
+                    session_model, current_squad, current_model
+                )
+                curr_sq_set = {s.upper() for s in _normalize_squad_list(current_squad)}
+                target_sq_set = {s.upper() for s in _normalize_squad_list(target_squad)}
+                curr_mod_set = {m.upper() for m in _normalize_model_list(current_model)}
+                target_mod_set = {m.upper() for m in _normalize_model_list(target_model)}
+ 
+                return bool(curr_sq_set == target_sq_set and target_mod_set and target_mod_set.issubset(curr_mod_set))
+            return True
+    return bool(is_ad_self and (trig_id == "session-active-ad-group-store" or trig_id is None))
+ 
+ 
+def _extract_sync_target_squad_and_model(
+    session_model: Any, current_squad: Any, current_model: Any
+) -> tuple[Any, Any]:
+    """Extracts target squad and model from session store or current filter state."""
+    if isinstance(session_model, dict):
+        s_sqs = session_model.get("selected_squads")
+        target_squads = s_sqs if s_sqs else ([session_model.get("squad_name")] if session_model.get("squad_name") else current_squad)
+        s_mods = session_model.get("selected_models")
+        target_models = s_mods if s_mods else ([session_model.get("model_name")] if session_model.get("model_name") else current_model)
+        return (target_squads, target_models)
+    return current_squad, current_model
+ 
+ 
+def _update_user_ad_group_if_needed(curr_user: Any, new_ad: Any):
+    """Updates user session store if AD group changed."""
+    if curr_user and new_ad and curr_user.get("ad_group") != new_ad:
+        curr_user["ad_group"] = new_ad
+        set_user_session(curr_user)
+ 
+ 
+def _is_session_source(session_obj: Any, src_name: str) -> bool:
+    """Checks whether a session store object originated from a specific source."""
+    return bool(isinstance(session_obj, dict) and session_obj.get("source") == src_name)
+ 
+ 
+@callback(
+    Output("session-active-model-store", "data", allow_duplicate=True),
+    Input("filter-sum-model", "data"),
+    State("filter-sum-squad", "data"),
+    State("session-active-model-store", "data"),
+    prevent_initial_call="initial_duplicate",
+)
+def sync_summary_initial_model_to_session(current_model, current_squad, session_data):
+    """Seed session-active-model-store on initial load if empty."""
+    if session_data:
+        return no_update
+    clean_models = _resolve_clean_models(current_model)
+    clean_squads = _normalize_squad_list(current_squad)
+    if not clean_models:
+        return no_update
+    p_model = clean_models[0]
+    p_squad = clean_squads[0] if clean_squads else ""
+    return {
+        "model_id": None,
+        "model_name": p_model,
+        "squad_name": p_squad,
+        "selected_models": clean_models,
+        "selected_squads": clean_squads,
+        "source": "summary",
+    }
+ 
+ 
+@callback(
+    Output("sum-header-ad-switcher", "data", allow_duplicate=True),
+    Output("sum-header-ad-badge", "children", allow_duplicate=True),
+    Output("sum-header-role-badge", "children", allow_duplicate=True),
+    Output("sum-header-role-badge", "color", allow_duplicate=True),
+    Output("sum-header-user-email", "children", allow_duplicate=True),
+    Output("menu-sum-ad-switcher", "children", allow_duplicate=True),
+    Output("filter-sum-squad", "data", allow_duplicate=True),
+    Output("selected-sum-squad-label", "children", allow_duplicate=True),
+    Output("menu-sum-squad", "children", allow_duplicate=True),
+    Output("filter-sum-model", "data", allow_duplicate=True),
+    Output("selected-sum-model-label", "children", allow_duplicate=True),
+    Output("menu-sum-model", "children", allow_duplicate=True),
+    Output("sum-model-staging-store", "data", allow_duplicate=True),
+    Output("sum-squad-staging-store", "data", allow_duplicate=True),
+    Input("url", "pathname"),
+    Input("session-active-model-store", "data"),
+    Input("session-active-ad-group-store", "data"),
+    State("sum-header-ad-switcher", "data"),
+    State("filter-sum-squad", "data"),
+    State("filter-sum-model", "data"),
+    State("filter-sum-domain", "data"),
+    prevent_initial_call="initial_duplicate",
+)
+def sync_session_to_summary(pathname, session_model, session_ad, current_ad, current_squad, current_model, domain):
+    """
+    Synchronize model and AD group from Planning Workspace or Validation to Summary Dashboard
+    whenever navigating between pages or when session stores change.
+    """
+    if not pathname or not pathname.startswith("/summary"):
+        return (no_update,) * 14
+ 
+    if not session_model and not session_ad:
+        return (no_update,) * 14
+ 
+    new_ad, persona, gbu_codes = _resolve_sync_persona_and_gbus(session_ad, current_ad)
+    ad_changed = bool(current_ad and new_ad and current_ad != new_ad)
+    is_model_self = _is_session_source(session_model, "summary")
+    is_ad_self = _is_session_source(session_ad, "summary")
+ 
+    try:
+        trig_id = callback_context.triggered_id if callback_context.triggered else None
+    except (MissingCallbackContextException, Exception):
+        trig_id = None
+ 
+    if _is_summary_sync_suppressed(
+        trig_id,
+        is_model_self,
+        is_ad_self,
+        ad_changed,
+        session_model=session_model,
+        current_squad=current_squad,
+        current_model=current_model,
+    ):
+        return (no_update,) * 14
+ 
+    target_squad, target_model = _extract_sync_target_squad_and_model(
+        session_model, current_squad, current_model
+    )
+ 
+    # When navigating via url, always sync: State values may be stale (from previous
+    # visit) before layout dcc.Stores reinitialize, so the equality check is unreliable.
+    if trig_id != "url" and not _is_summary_sync_needed(
+        current_ad, new_ad, current_squad, target_squad, current_model, target_model
+    ):
+        return (no_update,) * 14
+ 
+    ad_items = build_sum_ad_switcher_menu_items(active_key=new_ad)
+    squad_list = _build_summary_squad_list(gbu_codes)
+ 
+    active_squad, active_squad_disp, squad_items = _resolve_summary_sync_squad(
+        target_squad, target_model, gbu_codes, squad_list
+    )
+    active_model, active_model_lbl, model_items = _resolve_summary_sync_model(
+        target_model, active_squad, gbu_codes, domain
+    )
+ 
+    user_email_elem = _build_summary_user_identity_elem(persona["email"])
+    _update_user_ad_group_if_needed(get_current_user(), new_ad)
+ 
+    return (
+        new_ad,
+        persona["name"],
+        persona["role_label"],
+        persona["role_color"],
+        user_email_elem,
+        ad_items,
+        active_squad,
+        active_squad_disp,
+        squad_items,
+        active_model,
+        active_model_lbl,
+        model_items,
+        None,
+        None,
+    )
