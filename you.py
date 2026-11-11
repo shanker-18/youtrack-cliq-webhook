@@ -1,984 +1,961 @@
-# pylint: disable=too-many-lines,too-many-locals,too-many-branches,broad-except
 """
-NA IBP Planning Application — Variance Dashboard Page
-=====================================================
-Route: /variance
-Pure Python Dash Implementation aligned with Planning, Validation & Summary Design System:
-- Top Brand Accent Multi-Color Bar & Navigation Bar with Page Switcher
-- Left Sidebar: Compact 140px Dock with 2 Domain Tiles (Consumption, Shipment)
-- Top Horizon Bar above Workbench: [Squad] -> Peach [Model] -> [Compare: IBP / BP]
-- Default comparison mode on load: IBP
+NA IBP Planning Application — Variance Dashboard Data Service
+=============================================================
+Handles PostgreSQL connectivity (via get_db_cursor) and snapshot discovery
+for the Variance Dashboard:
+1. Consumption Variance (POS Building Blocks delta)
+2. Shipment Variance (Shipment Building Blocks delta)
+ 
+Comparison Modes:
+- IBP (Default): Current Cycle Building Block[m] - Prior Cycle (IBP-1) Building Block[m]
+- BP:            Current Cycle Building Block[m] - Annual BP Baseline Building Block[m]
 """
  
 import os
-from datetime import date
-from typing import Optional, Dict, List, Any, Tuple, Set
-from flask import has_request_context, request
-import psycopg2
-import dash
-from dash import html, dcc
-import dash_bootstrap_components as dbc
+import re
+import datetime
+from typing import Optional, Dict, List, Any, NamedTuple
  
-from auth.session import get_current_user, is_authenticated
-from config import config
+from database.connection import get_db_cursor
 from services.kv_calendar import KenvueCalendar
-from repositories.hierarchy_repository import get_squads_by_gbu, get_models_by_squad
-from repositories.security_repository import get_ad_group_mapping
-from callbacks.filter_callbacks import AD_PERSONAS
-from components.header import render_workbench_header
-from components.summary_grid import render_summary_loading_skeleton
+from services.validation_service import normalize_text
+from utils.logger import get_logger
  
-VARIANCE_ROUTE = "/variance"
+logger = get_logger(__name__)
  
-dash.register_page(__name__, path=VARIANCE_ROUTE, title="Variance Dashboard — NA IBP Planning")
- 
-_COLOR_TRUST_GREEN = "var(--trust-green, #019881)"
-_FONT_SIZE_SM_11_5 = "11.5px"
-DEFAULT_SQUAD_LABEL = "Select Squad"
-DEFAULT_MODEL_LABEL = "Select Model"
-DEFAULT_BODY_CARE = "Body Care"
-CLASS_TILE_INACTIVE = "val-tile-stacked inactive-domain"
-BG_GREEN_50 = "var(--green-50, #E6F5F2)"
-ICON_CHECKBOX_UNCHECKED = "bi bi-square"
-ICON_CHECKBOX_CHECKED = "bi bi-check-square-fill"
- 
-TILE_BASE_STYLE = {
-    "display": "flex",
-    "flexDirection": "column",
-    "alignItems": "center",
-    "justifyContent": "center",
-    "padding": "10px 4px",
-    "borderRadius": "8px",
-    "cursor": "pointer",
-    "userSelect": "none",
-    "transition": "all 0.15s ease",
-    "minHeight": "62px",
-    "width": "100%",
-    "textAlign": "center",
-    "fontFamily": "'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif",
+MONTH_NAME_MAP = {
+    "JAN": 1, "JANUARY": 1, "FEB": 2, "FEBRUARY": 2, "MAR": 3, "MARCH": 3,
+    "APR": 4, "APRIL": 4, "MAY": 5, "JUN": 6, "JUNE": 6,
+    "JUL": 7, "JULY": 7, "AUG": 8, "AUGUST": 8, "SEP": 9, "SEPTEMBER": 9,
+    "OCT": 10, "OCTOBER": 10, "NOV": 11, "NOVEMBER": 11, "DEC": 12, "DECEMBER": 12
 }
  
-TILE_ACTIVE_STYLE = {
-    **TILE_BASE_STYLE,
-    "backgroundColor": _COLOR_TRUST_GREEN,
-    "color": "#ffffff",
-    "border": f"1.5px solid {_COLOR_TRUST_GREEN}",
-    "boxShadow": "0 2px 8px rgba(1, 152, 129, 0.25)",
-}
+DRIVER_BASE_TREND = "Base Trend"
+DRIVER_OTHER = "Other"
+MATCH_KEY_BASE_TREND = "BASE TREND"
+DRIVER_NET_INNOVATION = "Net Innovation"
+DRIVER_NET_PRICE = "Net Price"
+GROUP_IBP_OVERLAYS = "IBP Overlays"
  
-TILE_INACTIVE_STYLE = {
-    **TILE_BASE_STYLE,
-    "backgroundColor": "#ffffff",
-    "color": "var(--b700, #424242)",
-    "border": "1.5px solid var(--b40, #E0E0E0)",
-    "boxShadow": "none",
-}
+CONSUMPTION_VARIANCE_DRIVER_DEFINITIONS = [
+    ("External",     DRIVER_BASE_TREND,     MATCH_KEY_BASE_TREND),
+    ("External",     "Season",              "SEASON"),
+    ("External",     "Competition",         "COMPETITION"),
+    ("Distribution", "Distribution",        "DISTRIBUTION"),
+    ("Innovation",   DRIVER_NET_INNOVATION, "COMPOUND_NET_INNOVATION"),
+    ("Innovation",   "Innovation",          "INNOVATION"),
+    ("Innovation",   "Cannibalization",     "CANNIBALIZATION"),
+    ("Innovation",   "Discontinuations",    "DISCONTINUATIONS"),
+    ("Innovation",   "Renovation",          "RENOVATION"),
+    ("Investment",   "Media",               "MEDIA"),
+    ("Investment",   "Trade",               "TRADE"),
+    ("Price",        DRIVER_NET_PRICE,      "COMPOUND_NET_PRICE"),
+    ("Price",        "Price",               "PRICE"),
+    ("Price",        "Elasticity",          "ELASTICITY"),
+    ("Other",        "Club",                "CLUB"),
+    ("Other",        DRIVER_OTHER,          "OTHER"),
+]
  
- 
-# ─── Pure HTML Dropdown Menu Builders ─────────────────────────────────────────
- 
-def build_var_mode_menu_items(active_mode: str = "IBP") -> list:
-    """Build pure HTML dropdown menu items for IBP vs BP baseline selection."""
-    active = (active_mode or "IBP").upper()
-    options = [
-        ("IBP", "IBP (Prior Cycle)", "Current Cycle - Prior Cycle"),
-        ("BP",  "BP (Annual Plan)",  "Current Cycle - Annual BP"),
-    ]
-    items = [
-        html.Div(
-            "Variance Baseline",
-            className="sidebar-dropdown-header",
-            style={
-                "padding": "6px 12px",
-                "fontSize": "10px",
-                "fontWeight": "700",
-                "color": _COLOR_TRUST_GREEN,
-                "textTransform": "uppercase",
-                "background": BG_GREEN_50,
-                "letterSpacing": "0.05em",
-                "borderBottom": "1px solid var(--green-100, #B0DFD8)",
-            },
-        )
-    ]
-    for mode_key, title, desc in options:
-        is_sel = (mode_key == active)
-        items.append(
-            html.Div(
-                className="sidebar-dropdown-item",
-                id={"type": "var-mode-select-item", "mode": mode_key},
-                n_clicks=0,
-                style={
-                    "padding": "8px 14px",
-                    "cursor": "pointer",
-                    "backgroundColor": "#F4FBF9" if is_sel else "#ffffff",
-                    "display": "flex",
-                    "alignItems": "center",
-                    "justifyContent": "space-between",
-                    "gap": "10px",
-                    "transition": "background 0.15s ease",
-                },
-                children=[
-                    html.Div([
-                        html.Div(
-                            title,
-                            style={
-                                "fontSize": "12.5px",
-                                "color": "#1A202C" if is_sel else "#4A5568",
-                                "fontWeight": "700" if is_sel else "500",
-                            },
-                        ),
-                        html.Div(desc, style={"fontSize": "10.5px", "color": "#6c757d"}),
-                    ]),
-                    html.I(className="bi bi-check2", style={"color": "#019881", "fontSize": "14px"}) if is_sel else html.Span(),
-                ],
-            )
-        )
-    return items
+SHIPMENT_VARIANCE_DRIVER_DEFINITIONS = [
+    ("Inventory",         "Distribution",       "DISTRIBUTION"),
+    ("Inventory",         "Innovation",         "INNOVATION"),
+    ("Inventory",         "Trade",              "TRADE"),
+    ("Inventory",         "Club",               "CLUB"),
+    ("Inventory",         "Retailer Inventory", "RETAILER_INVENTORY"),
+    ("Inventory",         DRIVER_OTHER,         "OTHER"),
+    (GROUP_IBP_OVERLAYS,  "Supply Constraints", "SUPPLY_CONSTRAINTS"),
+    (GROUP_IBP_OVERLAYS,  "Liquidations",       "LIQUIDATIONS"),
+    (GROUP_IBP_OVERLAYS,  DRIVER_OTHER,         "OVERLAYS_OTHER"),
+]
  
  
-def _render_ad_switcher_item(key: str, name: str, sub: str, is_active: bool) -> html.Div:
-    cls = "header-dropdown-item active" if is_active else "header-dropdown-item"
-    children = [
-        html.Div([
-            html.Strong(name),
-            html.Br(),
-            html.Small(sub, className="text-muted"),
-        ])
-    ]
-    if is_active:
-        children.append(html.I(className="bi bi-check2"))
-    return html.Div(
-        className=cls,
-        id={"type": "var-ad-select-item", "key": key},
-        n_clicks=0,
-        children=children,
-    )
- 
- 
-def _build_ad_switcher_from_db(db_mappings: list, active_key: str) -> list:
-    items = []
-    for m in db_mappings:
-        group_key = m["ad_group_name"]
-        perm = m.get("permission", "EDIT")
-        name = m.get("display_name") or group_key
-        sub = f"Role: {perm.title()}"
-        items.append(_render_ad_switcher_item(group_key, name, sub, group_key == active_key))
-    return items
- 
- 
-def _build_ad_switcher_from_personas(active_key: str) -> list:
-    items = []
-    for key, p in AD_PERSONAS.items():
-        sub = f"{p['role_label']} ({p['gbu_label']})"
-        items.append(_render_ad_switcher_item(key, p["name"], sub, key == active_key))
-    return items
- 
- 
-def build_var_ad_switcher_menu_items(active_key: str = "COM-APP-NA-IBP-SELFCARE") -> list:
-    curr_user = get_current_user() or {}
-    user_groups = curr_user.get("all_ad_groups", [])
- 
-    try:
-        from repositories.security_repository import get_all_ad_group_mappings, get_user_ad_group_mappings
-        if user_groups:
-            db_mappings = get_user_ad_group_mappings(user_groups)
-        else:
-            db_mappings = get_all_ad_group_mappings()
-    except (psycopg2.Error, KeyError, ValueError):
-        db_mappings = None
- 
-    header_title = "Active AD Group" if user_groups else "Simulate AD Group"
-    items = [html.Div(header_title, className="header-dropdown-header")]
-    if db_mappings:
-        items.extend(_build_ad_switcher_from_db(db_mappings, active_key))
+def get_active_years() -> tuple[int, int]:
+    """Dynamically determines (base_year, plan_year) using Kenvue 4-4-5 Fiscal Calendar."""
+    env_year = os.getenv("IBP_PLAN_YEAR")
+    if env_year and env_year.isdigit():
+        plan_year = int(env_year)
     else:
-        items.extend(_build_ad_switcher_from_personas(active_key))
-    return items
+        today_info = KenvueCalendar.get_date_info(datetime.date.today())
+        plan_year = today_info.kv_year
+    base_year = plan_year - 1
+    return base_year, plan_year
  
  
-def format_var_squad_pill_label(selected_squads: str | list[str], total_squads: int = 0) -> str:
-    if not selected_squads:
-        return DEFAULT_SQUAD_LABEL
-    if isinstance(selected_squads, str):
-        return selected_squads.title()
-    clean_squads = [str(s) for s in selected_squads if s and str(s) != DEFAULT_SQUAD_LABEL]
-    if not clean_squads:
-        return DEFAULT_SQUAD_LABEL
-    if len(clean_squads) == 1:
-        return clean_squads[0].title()
-    if 0 < total_squads <= len(clean_squads):
-        return f"All Squads ({total_squads})"
-    return f"{len(clean_squads)} Squads Selected"
- 
- 
-def _render_var_squad_item(s: dict, is_checked: bool) -> html.Div:
-    s_name = s["squad_name"]
-    disp_name = s.get("display_name", s_name.title())
-    check_icon = ICON_CHECKBOX_CHECKED if is_checked else ICON_CHECKBOX_UNCHECKED
-    check_color = "#019881" if is_checked else "#adb5bd"
- 
-    return html.Div(
-        className="sidebar-dropdown-item",
-        id={"type": "var-squad-select-item", "name": s_name, "disp": disp_name},
-        n_clicks=0,
-        style={
-            "padding": "7px 14px",
-            "cursor": "pointer",
-            "backgroundColor": "#F4FBF9" if is_checked else "#ffffff",
-            "display": "flex",
-            "alignItems": "center",
-            "justifyContent": "flex-start",
-            "gap": "10px",
-            "transition": "background 0.15s ease",
-        },
-        children=[
-            html.I(className=check_icon, style={"color": check_color, "fontSize": "14px"}),
-            html.Span(
-                disp_name,
-                style={
-                    "fontSize": "12.5px",
-                    "color": "#1A202C" if is_checked else "#4A5568",
-                    "fontWeight": "600" if is_checked else "400",
-                },
-            ),
-        ],
-    )
- 
- 
-def _build_var_squad_header(is_all_selected: bool, selected_count: int, total_count: int) -> html.Div:
-    return html.Div(
-        className="d-flex align-items-center justify-content-between px-3 py-2 border-bottom user-select-none",
-        style={
-            "background": BG_GREEN_50,
-            "fontSize": _FONT_SIZE_SM_11_5,
-            "fontWeight": "600",
-            "color": "var(--green-800, #004D40)",
-        },
-        children=[
-            html.Div(
-                id={"type": "var-squad-action", "action": "select-all"},
-                className="d-flex align-items-center gap-2",
-                n_clicks=0,
-                style={"cursor": "pointer", "color": "#019881" if is_all_selected else "#495057"},
-                children=[
-                    html.I(
-                        className=ICON_CHECKBOX_CHECKED if is_all_selected else ICON_CHECKBOX_UNCHECKED,
-                        style={"color": "#019881" if is_all_selected else "#adb5bd", "fontSize": "13px"},
-                    ),
-                    html.Span("Select All"),
-                ],
-            ),
-            html.Span(f"{selected_count}/{total_count} selected", style={"color": "#6c757d", "fontSize": "11px", "fontWeight": "500"}),
-        ],
-    )
- 
- 
-def _build_var_squad_footer(selected_count: int) -> html.Div:
-    return html.Div(
-        className="d-flex align-items-center justify-content-between px-3 py-2 border-top bg-light",
-        children=[
-            html.Span(
-                f"{selected_count} selected",
-                id="var-squad-dropdown-count",
-                style={"fontSize": _FONT_SIZE_SM_11_5, "color": "#495057", "fontWeight": "600"},
-            ),
-            html.Div(
-                className="d-flex gap-2",
-                children=[
-                    html.Button(
-                        "Reset",
-                        id={"type": "var-squad-action", "action": "reset"},
-                        className="btn btn-sm btn-outline-secondary",
-                        style={"fontSize": "11px", "padding": "2px 10px", "borderRadius": "4px", "fontWeight": "500"},
-                        n_clicks=0,
-                    ),
-                    html.Button(
-                        "Apply",
-                        id={"type": "var-squad-action", "action": "apply"},
-                        className="btn btn-sm text-white",
-                        style={
-                            "fontSize": "11px",
-                            "padding": "2px 16px",
-                            "backgroundColor": "#019881",
-                            "borderColor": "#019881",
-                            "fontWeight": "600",
-                            "borderRadius": "4px",
-                        },
-                        n_clicks=0,
-                    ),
-                ],
-            ),
-        ],
-    )
- 
- 
-def _build_var_gbu_squad_rows(gbus: Dict[str, list], active_set: Set[str]) -> list:
-    squad_rows = []
-    for gbu_name, gbu_squads in gbus.items():
-        squad_rows.append(
-            html.Div(
-                children=[html.I(className="bi bi-diagram-3 me-1"), gbu_name],
-                className="sidebar-dropdown-header",
-                style={
-                    "padding": "5px 12px",
-                    "fontSize": "10px",
-                    "fontWeight": "700",
-                    "color": _COLOR_TRUST_GREEN,
-                    "textTransform": "uppercase",
-                    "background": BG_GREEN_50,
-                    "letterSpacing": "0.05em",
-                    "borderBottom": "1px solid var(--green-100, #B0DFD8)",
-                },
-            )
-        )
-        for s in gbu_squads:
-            is_checked = s.get("squad_name", "").upper() in active_set
-            squad_rows.append(_render_var_squad_item(s, is_checked))
-    return squad_rows
- 
- 
-def build_var_squad_menu_items(squads: list, active_squad_name: str | list[str] = "BODY CARE") -> list:
-    if not squads:
-        return [html.Div("No squads available", className="p-3 text-center text-muted small")]
- 
-    total_count = len(squads)
-    if isinstance(active_squad_name, str):
-        active_set = {active_squad_name.upper()} if active_squad_name and active_squad_name != DEFAULT_SQUAD_LABEL else set()
-    elif isinstance(active_squad_name, (list, tuple, set)):
-        active_set = {str(s).upper() for s in active_squad_name if s and str(s) != DEFAULT_SQUAD_LABEL}
-    else:
-        active_set = set()
- 
-    selected_count = sum(1 for s in squads if s.get("squad_name", "").upper() in active_set)
-    is_all_selected = (selected_count == total_count) if total_count > 0 else False
- 
-    gbus: Dict[str, list] = {}
-    for s in squads:
-        gbu = s.get("gbu", "ALL")
-        gbus.setdefault(gbu, []).append(s)
- 
-    header_elem = _build_var_squad_header(is_all_selected, selected_count, total_count)
-    body_elem = html.Div(
-        id="var-squad-dropdown-body",
-        className="val-squad-dropdown-body",
-        style={"maxHeight": "260px", "overflowY": "auto", "padding": "4px 0"},
-        children=_build_var_gbu_squad_rows(gbus, active_set),
-    )
-    footer_elem = _build_var_squad_footer(selected_count)
-    return [header_elem, body_elem, footer_elem]
- 
- 
-def format_var_model_pill_label(selected_models: str | list[str], total_models: int = 0) -> str:
-    if not selected_models:
-        return DEFAULT_MODEL_LABEL
-    if isinstance(selected_models, str):
-        return selected_models
-    if len(selected_models) == 1:
-        return selected_models[0]
-    if 0 < total_models <= len(selected_models):
-        return f"All Models ({total_models})"
-    return f"{len(selected_models)} Models Selected"
- 
- 
-def _render_var_model_item(m: dict, is_checked: bool) -> html.Div:
-    m_id = m.get("model_id") if m.get("model_id") is not None else 0
-    m_name = m.get("model_name", str(m))
-    check_icon = ICON_CHECKBOX_CHECKED if is_checked else ICON_CHECKBOX_UNCHECKED
-    check_color = "#019881" if is_checked else "#adb5bd"
- 
-    return html.Div(
-        className="sidebar-dropdown-item",
-        id={"type": "var-model-select-item", "id": m_id, "name": m_name},
-        n_clicks=0,
-        style={
-            "padding": "7px 14px",
-            "cursor": "pointer",
-            "backgroundColor": "#F4FBF9" if is_checked else "#ffffff",
-            "display": "flex",
-            "alignItems": "center",
-            "justifyContent": "flex-start",
-            "gap": "10px",
-            "transition": "background 0.15s ease",
-        },
-        children=[
-            html.I(className=check_icon, style={"color": check_color, "fontSize": "14px"}),
-            html.Span(
-                m_name,
-                style={
-                    "fontSize": "12.5px",
-                    "color": "#1A202C" if is_checked else "#4A5568",
-                    "fontWeight": "600" if is_checked else "400",
-                },
-            ),
-        ],
-    )
- 
- 
-def _build_var_model_header(is_all_selected: bool, selected_count: int, total_count: int) -> html.Div:
-    return html.Div(
-        className="d-flex align-items-center justify-content-between px-3 py-2 border-bottom user-select-none",
-        style={
-            "background": BG_GREEN_50,
-            "fontSize": _FONT_SIZE_SM_11_5,
-            "fontWeight": "600",
-            "color": "var(--green-800, #004D40)",
-        },
-        children=[
-            html.Div(
-                id={"type": "var-model-action", "action": "select-all"},
-                className="d-flex align-items-center gap-2",
-                n_clicks=0,
-                style={"cursor": "pointer", "color": "#019881" if is_all_selected else "#495057"},
-                children=[
-                    html.I(
-                        className=ICON_CHECKBOX_CHECKED if is_all_selected else ICON_CHECKBOX_UNCHECKED,
-                        style={"color": "#019881" if is_all_selected else "#adb5bd", "fontSize": "13px"},
-                    ),
-                    html.Span("Select All"),
-                ],
-            ),
-            html.Span(f"{selected_count}/{total_count} selected", style={"color": "#6c757d", "fontSize": "11px", "fontWeight": "500"}),
-        ],
-    )
- 
- 
-def _build_var_model_footer(selected_count: int) -> html.Div:
-    return html.Div(
-        className="d-flex align-items-center justify-content-between px-3 py-2 border-top bg-light",
-        children=[
-            html.Span(
-                f"{selected_count} selected",
-                id="var-model-dropdown-count",
-                style={"fontSize": _FONT_SIZE_SM_11_5, "color": "#495057", "fontWeight": "600"},
-            ),
-            html.Div(
-                className="d-flex gap-2",
-                children=[
-                    html.Button(
-                        "Reset",
-                        id={"type": "var-model-action", "action": "reset"},
-                        className="btn btn-sm btn-outline-secondary",
-                        style={"fontSize": "11px", "padding": "2px 10px", "borderRadius": "4px", "fontWeight": "500"},
-                        n_clicks=0,
-                    ),
-                    html.Button(
-                        "Apply",
-                        id={"type": "var-model-action", "action": "apply"},
-                        className="btn btn-sm text-white",
-                        style={
-                            "fontSize": "11px",
-                            "padding": "2px 16px",
-                            "backgroundColor": "#019881",
-                            "borderColor": "#019881",
-                            "fontWeight": "600",
-                            "borderRadius": "4px",
-                        },
-                        n_clicks=0,
-                    ),
-                ],
-            ),
-        ],
-    )
- 
- 
-def _build_var_squad_model_rows(models: list, active_set: Set[str]) -> list:
-    squad_groups: Dict[str, list] = {}
-    for m in models:
-        sq = m.get("squad_name") or m.get("primary_need_state") or "Other"
-        squad_groups.setdefault(sq, []).append(m)
- 
-    has_squad_headers = len(squad_groups) > 1 or (len(squad_groups) == 1 and "Other" not in squad_groups)
-    model_rows = []
- 
-    for sq_name, sq_models in squad_groups.items():
-        if has_squad_headers:
-            model_rows.append(
-                html.Div(
-                    children=[html.I(className="bi bi-diagram-3 me-1"), sq_name.title()],
-                    className="sidebar-dropdown-header",
-                    style={
-                        "padding": "5px 12px",
-                        "fontSize": "10px",
-                        "fontWeight": "700",
-                        "color": _COLOR_TRUST_GREEN,
-                        "textTransform": "uppercase",
-                        "background": BG_GREEN_50,
-                        "letterSpacing": "0.05em",
-                        "borderBottom": "1px solid var(--green-100, #B0DFD8)",
-                    },
-                )
-            )
- 
-        for m in sq_models:
-            m_name = m.get("model_name", str(m))
-            is_checked = m_name.upper() in active_set
-            model_rows.append(_render_var_model_item(m, is_checked))
-    return model_rows
- 
- 
-def build_var_model_menu_items(
-    models: list,
-    active_model_name: str | list[str] = DEFAULT_BODY_CARE,
-    has_squad: bool = True,
-) -> list:
-    if not models:
-        empty_prompt = (
-            "No models available for this domain"
-            if has_squad
-            else "Please select a squad first to view available models."
-        )
-        return [html.Div(empty_prompt, className="p-3 text-center text-muted small")]
- 
-    total_count = len(models)
-    if isinstance(active_model_name, str):
-        active_set = {active_model_name.upper()} if active_model_name and active_model_name != DEFAULT_MODEL_LABEL else set()
-    elif isinstance(active_model_name, (list, tuple, set)):
-        active_set = {str(m).upper() for m in active_model_name if m and str(m) != DEFAULT_MODEL_LABEL}
-    else:
-        active_set = set()
- 
-    selected_count = sum(1 for m in models if m.get("model_name", "").upper() in active_set)
-    is_all_selected = (selected_count == total_count) if total_count > 0 else False
- 
-    header_elem = _build_var_model_header(is_all_selected, selected_count, total_count)
-    body_elem = html.Div(
-        id="var-model-dropdown-body",
-        className="val-model-dropdown-body",
-        style={"maxHeight": "240px", "overflowY": "auto", "padding": "4px 0"},
-        children=_build_var_squad_model_rows(models, active_set),
-    )
-    footer_elem = _build_var_model_footer(selected_count)
-    return [header_elem, body_elem, footer_elem]
- 
- 
-def render_empty_domain_alert(model_name: str, domain: str) -> html.Div:
-    return html.Div(
-        className="p-5 bg-white rounded border text-center my-4",
-        style={"boxShadow": "0 1px 3px rgba(0, 0, 0, 0.05)", "maxWidth": "720px", "margin": "40px auto"},
-        children=[
-            html.I(className="bi bi-exclamation-triangle text-warning fs-1 mb-3 d-block"),
-            html.H5(f"No {domain.title()} Variance Data for '{model_name}'", className="fw-bold text-dark mb-2"),
-            html.P(
-                [
-                    f"The model '{model_name}' has no building block changes recorded.",
-                    html.Br(),
-                    "Please select another model from the Model dropdown above.",
-                ],
-                className="text-muted mb-0",
-                style={"fontSize": "13px"},
-            ),
-        ],
-    )
- 
- 
-def render_empty_selection_card(empty_type: str = "model", domain: str = "CONSUMPTION") -> html.Div:
-    domain_title = (domain or "CONSUMPTION").title()
-    if empty_type == "squad":
-        icon_class = "bi bi-diagram-3 text-secondary fs-1 mb-3 d-block"
-        title_text = "No Squad Selected"
-        desc_text = "Please select one or more squads above to view available models and variance data."
-    else:
-        icon_class = "bi bi-grid-3x3 text-secondary fs-1 mb-3 d-block"
-        title_text = "No Model Selected"
-        desc_text = f"Please select one or more models from the Model dropdown above to view {domain_title} Variance data."
- 
-    return html.Div(
-        className="p-5 bg-white rounded border text-center my-4",
-        style={"boxShadow": "0 1px 3px rgba(0, 0, 0, 0.05)", "maxWidth": "720px", "margin": "40px auto"},
-        children=[
-            html.I(className=icon_class),
-            html.H5(title_text, className="fw-bold text-dark mb-2"),
-            html.P(desc_text, className="text-muted mb-0", style={"fontSize": "13px"}),
-        ],
-    )
- 
- 
-# ─── Page Layout ──────────────────────────────────────────────────────────────
- 
-def _handle_variance_auth_redirect() -> Optional[dcc.Location]:
-    if not has_request_context():
+def parse_month_num(val: Any) -> Optional[int]:
+    """Extracts month number (1..12) from dates, numbers, or month names."""
+    if val is None:
         return None
- 
-    if not is_authenticated():
-        if config.FLASK_ENV == "development":
-            from auth.routes import establish_local_dev_session
-            establish_local_dev_session()
-        else:
-            target_path = VARIANCE_ROUTE
-            if request.query_string:
-                target_path = f"{request.path}?{request.query_string.decode('utf-8')}"
-            return dcc.Location(href=f"/auth/login?next={target_path}", id="variance-auth-redirect", refresh=True)
- 
-    curr_user = get_current_user() or {}
-    if not curr_user.get("ad_group"):
-        return dcc.Location(href="/unauthorized", id="variance-unauth-redirect", refresh=True)
+    if isinstance(val, (datetime.date, datetime.datetime)):
+        return val.month
+    s = str(val).strip().upper()
+    if s.isdigit():
+        n = int(s)
+        if 1 <= n <= 12:
+            return n
+    for k, v in MONTH_NAME_MAP.items():
+        if k in s:
+            return v
+    m_iso = re.search(r"[-/](\d{1,2})", s)
+    if m_iso:
+        n = int(m_iso.group(1))
+        if 1 <= n <= 12:
+            return n
     return None
  
  
-def _resolve_variance_user_identity(user: dict, persona: dict) -> Tuple[str, str]:
-    user_name = user.get("display_name", "")
-    user_email = user.get("email", "")
-    if not user_name and user_email:
-        user_name = user_email.split("@")[0].replace(".", " ").title()
-    elif not user_name:
-        user_name = "User"
-    if not user_email:
-        user_email = persona["email"]
-    return user_name, user_email
+class CycleSnapshotInfo(NamedTuple):
+    curr_cs_id: Optional[int]
+    prior_cs_id: Optional[int]
+    curr_ss_id: Optional[int]
+    prior_ss_id: Optional[int]
+    bp_cs_id: Optional[int] = None
+    bp_ss_id: Optional[int] = None
+    active_cycle_month: Optional[int] = None
  
  
-def _get_initial_gbu_codes(initial_persona_key: str, persona: dict) -> list:
-    try:
-        mapping = get_ad_group_mapping([initial_persona_key])
-        if mapping and mapping.get("gbu_codes"):
-            return mapping["gbu_codes"]
-    except (psycopg2.Error, KeyError, IndexError, ValueError):
-        pass
-    return persona.get("gbus", [])
+def _query_cycle_snapshot(
+    cur: Any, table_name: str, year: int, snapshot_type_filter: str, prior_to_id: Optional[int] = None
+) -> tuple[Optional[int], Optional[int]]:
+    if prior_to_id is not None:
+        sql = f"""
+            SELECT s.snapshot_id, pc.cycle_month
+            FROM public.{table_name} s
+            JOIN public.planning_cycles pc ON s.cycle_id = pc.cycle_id
+            WHERE s.snapshot_id < %s
+              AND UPPER(COALESCE(pc.snapshot_type, '')) != 'BP'
+              AND (pc.planning_year_start <= %s OR pc.planning_year_start IS NULL)
+            ORDER BY pc.planning_year_start DESC NULLS LAST, pc.cycle_month DESC NULLS LAST, s.snapshot_id DESC
+            LIMIT 1;
+        """
+        cur.execute(sql, (prior_to_id, year))
+    else:
+        sql = f"""
+            SELECT s.snapshot_id, pc.cycle_month
+            FROM public.{table_name} s
+            JOIN public.planning_cycles pc ON s.cycle_id = pc.cycle_id
+            WHERE ({snapshot_type_filter})
+              AND (pc.planning_year_start <= %s OR pc.planning_year_start IS NULL)
+            ORDER BY pc.planning_year_start DESC NULLS LAST, pc.cycle_month DESC NULLS LAST, s.snapshot_id DESC
+            LIMIT 1;
+        """
+        cur.execute(sql, (year,))
+    row = cur.fetchone()
+    if not row:
+        return None, None
+    snap_id = row.get("snapshot_id") if isinstance(row, dict) else row["snapshot_id"]
+    c_mo = row.get("cycle_month") if isinstance(row, dict) else None
+    m_num = parse_month_num(c_mo) if c_mo else None
+    return snap_id, m_num if (m_num and 1 <= m_num <= 12) else None
  
  
-def _get_initial_squads(gbu_codes: list) -> Tuple[list, str, str]:
-    try:
-        squad_rows = get_squads_by_gbu(gbu_codes)
-    except (psycopg2.Error, KeyError, IndexError, ValueError):
-        squad_rows = []
- 
-    squads = []
-    fallback_gbu = gbu_codes[0] if gbu_codes else ""
-    for s in squad_rows:
-        s_name = s["squad_name"]
-        gbu_c = s.get("gbu_code", fallback_gbu)
-        gbu_n = s.get("gbu_name", gbu_c)
-        squads.append({
-            "squad_name": s_name,
-            "display_name": s_name.title(),
-            "gbu": gbu_c,
-            "gbu_short": gbu_n.split()[0].title() if gbu_n else "",
-        })
-    active_squad_name = squads[0]["squad_name"] if squads else "BODY CARE"
-    active_squad_disp = squads[0]["display_name"] if squads else DEFAULT_BODY_CARE
-    return squads, active_squad_name, active_squad_disp
- 
- 
-  
-def _get_initial_models(active_squad_name: str, gbu_codes: list) -> Tuple[list, str]:
-    try:
-        all_models = get_models_by_squad(active_squad_name, gbu_codes)
-    except (psycopg2.Error, KeyError, IndexError, ValueError):
-        all_models = []
- 
-    cons_models = [m for m in all_models if m.get("has_pos")]
-    candidate_models = cons_models or all_models
-    active_model_name = candidate_models[0]["model_name"] if candidate_models else DEFAULT_BODY_CARE
-    return candidate_models, active_model_name
+def _query_bp_snapshot(cur: Any, snap_table: str, rows_table: str, vals_table: str, year: int) -> Optional[int]:
+    """Finds the BP snapshot ID that holds BP values for the requested year."""
+    sql = f"""
+        SELECT s.snapshot_id
+        FROM public.{snap_table} s
+        JOIN public.planning_cycles pc ON s.cycle_id = pc.cycle_id
+        WHERE UPPER(COALESCE(pc.snapshot_type, '')) = 'BP'
+          AND EXISTS (
+              SELECT 1
+              FROM public.{rows_table} r
+              JOIN public.{vals_table} v ON v.row_id = r.row_id
+              WHERE r.snapshot_id = s.snapshot_id
+                AND r.is_deleted = FALSE
+                AND EXTRACT(YEAR FROM v.period_month) = %s
+          )
+        ORDER BY pc.planning_year_start DESC NULLS LAST, s.snapshot_id DESC
+        LIMIT 1;
+    """
+    cur.execute(sql, (year,))
+    row = cur.fetchone()
+    if not row:
+        return None
+    return row.get("snapshot_id") if isinstance(row, dict) else row["snapshot_id"]
  
  
-def layout():
-    """Pure Python Dash layout evaluated dynamically per request."""
-    redirect = _handle_variance_auth_redirect()
-    if redirect is not None:
-        return redirect
+def _resolve_snapshot_pair(
+    cur, table_name: str, year: int, curr_filter: str, prior_filter: str
+) -> tuple[Optional[int], Optional[int], Optional[int]]:
+    curr_id, c_mo = _query_cycle_snapshot(cur, table_name, year, curr_filter)
+    prior_id, _ = _query_cycle_snapshot(cur, table_name, year, prior_filter)
+    if (not prior_id or prior_id == curr_id) and curr_id:
+        prior_id, _ = _query_cycle_snapshot(cur, table_name, year, "", prior_to_id=curr_id)
+    return curr_id, prior_id, c_mo
  
-    user = get_current_user() or {}
-    today_dt = date.today()
-    curr_kv = KenvueCalendar.get_date_info(today_dt)
-    env_year = os.getenv("IBP_PLAN_YEAR")
-    display_kv_year = int(env_year) if (env_year and env_year.isdigit()) else curr_kv.kv_year
  
-    initial_persona_key = user.get("ad_group") or "COM-APP-NA-IBP-SELFCARE"
-    if initial_persona_key not in AD_PERSONAS:
-        initial_persona_key = "COM-APP-NA-IBP-SELFCARE"
-    persona = AD_PERSONAS.get(initial_persona_key, AD_PERSONAS["COM-APP-NA-IBP-SELFCARE"])
+def get_cycle_snapshot_ids(year: int) -> CycleSnapshotInfo:
+    """Detects Current, Prior (IBP-1), and BP snapshot IDs scoped to year."""
+    curr_cs_id, prior_cs_id, curr_ss_id, prior_ss_id = None, None, None, None
+    bp_cs_id, bp_ss_id = None, None
+    active_cycle_month = None
  
-    user_name, user_email = _resolve_variance_user_identity(user, persona)
-    gbu_codes = _get_initial_gbu_codes(initial_persona_key, persona)
-    squads, active_squad_name, _ = _get_initial_squads(gbu_codes)
-    candidate_models, active_model_name = _get_initial_models(active_squad_name, gbu_codes)
- 
-    ad_items = build_var_ad_switcher_menu_items(active_key=initial_persona_key)
-    squad_items = build_var_squad_menu_items(squads, active_squad_name=active_squad_name)
-    model_items = build_var_model_menu_items(candidate_models, active_model_name=active_model_name)
-    mode_items = build_var_mode_menu_items(active_mode="IBP")
- 
-    return html.Div(
-        id="variance-page-root",
-        className="d-flex flex-column",
-        style={"minHeight": "100vh", "backgroundColor": "var(--b10, #FAFAFA)"},
-        children=[
-            # ── State Stores ──────────────────────────────────────────────────
-            dcc.Store(id="filter-var-domain", data="consumption"),
-            dcc.Store(id="filter-var-mode", data="IBP"),  # Default = IBP
-            dcc.Store(id="filter-var-squad", data=[active_squad_name] if active_squad_name else []),
-            dcc.Store(id="var-squad-staging-store", data=None),
-            dcc.Store(id="filter-var-model", data=[active_model_name] if active_model_name else []),
-            dcc.Store(id="var-model-staging-store", data=None),
-            dcc.Store(id="var-header-ad-switcher", data=initial_persona_key),
-            dcc.Store(id="var-open-menu-store", data=None),
-            dcc.Store(id="var-cache-store", data={}),
- 
-            # ── 1. Top Brand Accent Multi-Color Bar ───────────────────────────
-            html.Div(className="accent"),
- 
-            # ── 2. Top Navigation Bar ─────────────────────────────────────────
-            render_workbench_header(
-                page="variance",
-                user_name=user_name,
-                user_email=user_email,
-                role_label=persona["role_label"],
-                role_color=persona["role_color"],
-                ad_items=ad_items,
-                initial_ad_badge_text=persona["name"],
-            ),
- 
-            # ── 3. Main Workspace Layout (Sidebar + Workbench) ────────────────
-            html.Div(
-                className="app-workspace",
-                children=[
-                    # ── Left Compact Dock (140px Width) ──
-                    html.Aside(
-                        id="var-sidebar",
-                        className="planning-sidebar",
-                        style={
-                            "width": "140px",
-                            "minWidth": "140px",
-                            "maxWidth": "140px",
-                            "padding": "16px 10px 16px 14px",
-                            "display": "flex",
-                            "flexDirection": "column",
-                            "gap": "10px",
-                        },
-                        children=[
-                            html.Div([
-                                html.Div(
-                                    className="sidebar-section-title mb-2",
-                                    style={"justifyContent": "center"},
-                                    children=[
-                                        html.Span(
-                                            "DASHBOARD",
-                                            style={
-                                                "fontSize": "11px",
-                                                "fontWeight": "700",
-                                                "letterSpacing": "0.06em",
-                                                "color": "var(--b700, #1C1C1C)",
-                                            },
-                                        ),
-                                    ],
-                                ),
-                                dcc.Loading(
-                                    id="var-domain-loading",
-                                    type="dot",
-                                    color="#00B097",
-                                    children=html.Div(
-                                        className="d-flex flex-column gap-2",
-                                        children=[
-                                            html.Div(
-                                                id="card-var-consumption",
-                                                className="val-tile-stacked active-domain",
-                                                style=TILE_ACTIVE_STYLE,
-                                                n_clicks=0,
-                                                children=[
-                                                    html.I(className="bi bi-cart3 fs-5 mb-1"),
-                                                    html.Span("Consumption", className="val-tile-label", style={"fontWeight": "700", "fontSize": _FONT_SIZE_SM_11_5}),
-                                                ],
-                                            ),
-                                            html.Div(
-                                                id="card-var-shipment",
-                                                className=CLASS_TILE_INACTIVE,
-                                                style=TILE_INACTIVE_STYLE,
-                                                n_clicks=0,
-                                                children=[
-                                                    html.I(className="bi bi-truck fs-5 mb-1"),
-                                                    html.Span("Shipment", className="val-tile-label", style={"fontWeight": "700", "fontSize": _FONT_SIZE_SM_11_5}),
-                                                ],
-                                            ),
-                                        ],
-                                    ),
-                                ),
-                            ]),
-                        ],
-                    ),
- 
-                    # ── Right Main Workbench Area ─────────────────────────────
-                    html.Main(
-                        id="var-workbench",
-                        className="planning-main",
-                        children=[
-                            # ── 1. Top Horizon Filter Bar (Squad -> Peach Model -> Compare IBP/BP) ──
-                            html.Section(
-                                className="horizon-top-bar",
-                                children=[
-                                    html.Div(
-                                        className="horizon-left-group",
-                                        children=[
-                                            # Need State / Squad Box
-                                            html.Div(
-                                                className="horizon-box horizon-squad-box",
-                                                id="pill-var-squad",
-                                                title="Select Need State / Squad",
-                                                n_clicks=0,
-                                                children=[
-                                                    html.Div(
-                                                        className="box-label",
-                                                        children=[
-                                                            html.I(className="bi bi-diagram-3 me-1 text-primary"),
-                                                            html.Span("Squad"),
-                                                            html.Span("\u25BC", className="caret ms-1"),
-                                                        ],
-                                                    ),
-                                                    html.Span(
-                                                        format_var_squad_pill_label([active_squad_name]),
-                                                        className="box-value",
-                                                        id="selected-var-squad-label",
-                                                    ),
-                                                    html.Div(
-                                                        className="sidebar-dropdown-menu",
-                                                        id="menu-var-squad",
-                                                        children=squad_items,
-                                                    ),
-                                                ],
-                                            ),
- 
-                                            # Model Box (Peach Background)
-                                            html.Div(
-                                                className="horizon-box horizon-model-box",
-                                                id="pill-var-model",
-                                                title=DEFAULT_MODEL_LABEL,
-                                                n_clicks=0,
-                                                children=[
-                                                    html.Div(
-                                                        className="box-label",
-                                                        children=[
-                                                            html.I(className="bi bi-box-seam me-1 text-danger"),
-                                                            html.Span("Model"),
-                                                            html.Span("\u25BC", className="caret ms-1"),
-                                                        ],
-                                                    ),
-                                                    html.Span(
-                                                        format_var_model_pill_label([active_model_name]),
-                                                        className="box-value",
-                                                        id="selected-var-model-label",
-                                                    ),
-                                                    html.Div(
-                                                        className="sidebar-dropdown-menu",
-                                                        id="menu-var-model",
-                                                        children=model_items,
-                                                    ),
-                                                ],
-                                            ),
- 
-                                            # Compare Mode Box (IBP / BP Selector)
-                                            html.Div(
-                                                className="horizon-box",
-                                                id="pill-var-mode",
-                                                title="Select Baseline (IBP vs BP)",
-                                                n_clicks=0,
-                                                style={"minWidth": "140px", "cursor": "pointer"},
-                                                children=[
-                                                    html.Div(
-                                                        className="box-label",
-                                                        children=[
-                                                            html.I(className="bi bi-layers me-1 text-success"),
-                                                            html.Span("Compare"),
-                                                            html.Span("\u25BC", className="caret ms-1"),
-                                                        ],
-                                                    ),
-                                                    html.Span(
-                                                        "IBP",
-                                                        className="box-value",
-                                                        id="selected-var-mode-label",
-                                                    ),
-                                                    html.Div(
-                                                        className="sidebar-dropdown-menu",
-                                                        id="menu-var-mode",
-                                                        style={"minWidth": "210px"},
-                                                        children=mode_items,
-                                                    ),
-                                                ],
-                                            ),
-                                        ],
-                                    ),
-                                ],
-                            ),
- 
-                            # ── 2. Authoritative Context Ribbon ───────────────────────
-                            html.Div(
-                                className="planning-context-ribbon",
-                                children=[
-                                    html.Div(
-                                        className="ribbon-left d-flex align-items-center gap-2",
-                                        children=[
-                                            html.Span("▶", className="ribbon-play-icon", style={"color": _COLOR_TRUST_GREEN, "fontSize": "11px"}),
-                                            html.Strong(id="ribbon-var-domain-title", children="CONSUMPTION VARIANCE (IBP)", style={"fontSize": _FONT_SIZE_SM_11_5, "letterSpacing": "0.04em"}),
-                                            html.Span(" — "),
-                                            html.Strong(id="ribbon-var-model-title", children=active_model_name, style={"fontSize": _FONT_SIZE_SM_11_5}),
-                                            html.Span(
-                                                id="var-status-badge",
-                                                children="Current Cycle vs Prior Cycle | POS $ are in millions.",
-                                                style={"fontSize": _FONT_SIZE_SM_11_5, "color": "#495057", "fontWeight": "500", "fontStyle": "italic"},
-                                            ),
-                                        ],
-                                    ),
-                                    html.Div(
-                                        className="ribbon-badges",
-                                        children=[
-                                            dbc.Badge(
-                                                id="var-fiscal-badge",
-                                                children=f"Fiscal: {curr_kv.kv_month_abbr} {display_kv_year}",
-                                                color="success",
-                                                className="border",
-                                                style={"fontSize": "11px", "borderRadius": "20px", "padding": "4px 12px", "backgroundColor": _COLOR_TRUST_GREEN},
-                                            ),
-                                        ],
-                                    ),
-                                ],
-                            ),
- 
-                            # ── 3. Main Data Workbench Table Container ────────────────
-                            dcc.Loading(
-                                id="var-loading",
-                                type="circle",
-                                color="#00B097",
-                                delay_show=0,
-                                delay_hide=150,
-                                overlay_style={"visibility": "visible", "opacity": 0.65, "backgroundColor": "rgba(255, 255, 255, 0.7)"},
-                                children=html.Div(
-                                    id="var-grid-container",
-                                    children=render_summary_loading_skeleton("CONSUMPTION"),
-                                ),
-                            ),
-                        ],
-                    ),
-                ],
-            ),
- 
-            # ── 4. Global Footer ──────────────────────────────────────────────
-            html.Footer(
-                className="global-footer",
-                children=[
-                    html.Div(
-                        className="footer-left",
-                        children=[
-                            html.Span(
-                                id="var-footer-status-indicator",
-                                className="footer-status-indicator",
-                                children=[
-                                    html.Span(id="var-footer-status-dot", className="status-dot status-dot-online"),
-                                    html.Span(id="var-footer-status-text", children="System Online"),
-                                ],
-                            ),
-                            html.Span("|", className="footer-pipe text-muted", style={"opacity": "0.35", "margin": "0 8px"}),
-                            html.Span(id="var-footer-db-status", children="Consolidated View Active", className="text-muted"),
-                        ],
-                    ),
-                    html.Div(
-                        className="footer-right d-flex align-items-center",
-                        children=[
-                            html.Span(f"© {today_dt.year} Kenvue Inc.", className="text-muted small"),
-                            html.Span("|", className="footer-pipe text-muted", style={"opacity": "0.35", "margin": "0 8px"}),
-                            html.Span("NA IBP Variance Dashboard v1.1", className="text-muted small"),
-                        ],
-                    ),
-                ],
-            ),
-        ],
+    curr_filter = "(UPPER(COALESCE(pc.snapshot_type, '')) LIKE '%%CURRENT%%' OR (pc.is_active = TRUE AND UPPER(COALESCE(pc.snapshot_type, '')) != 'BP'))"
+    prior_filter = (
+        "("
+        "UPPER(COALESCE(pc.snapshot_type, '')) LIKE '%%PRIOR%%' "
+        "OR UPPER(COALESCE(pc.snapshot_type, '')) LIKE '%%PREV%%' "
+        "OR UPPER(COALESCE(pc.snapshot_type, '')) LIKE '%%IBP-1%%'"
+        ") AND UPPER(COALESCE(pc.snapshot_type, '')) != 'BP'"
     )
+ 
+    try:
+        with get_db_cursor(commit=False) as cur:
+            curr_cs_id, prior_cs_id, c_mo = _resolve_snapshot_pair(
+                cur, "consumption_snapshots", year, curr_filter, prior_filter
+            )
+            curr_ss_id, prior_ss_id, s_mo = _resolve_snapshot_pair(
+                cur, "shipment_snapshots", year, curr_filter, prior_filter
+            )
+            bp_cs_id = _query_bp_snapshot(
+                cur, "consumption_snapshots", "consumption_planning_rows", "consumption_planning_values", year
+            )
+            bp_ss_id = _query_bp_snapshot(
+                cur, "shipment_snapshots", "shipment_planning_rows", "shipment_planning_values", year
+            )
+            active_cycle_month = c_mo or s_mo
+    except Exception as e:
+        logger.warning("Notice discovering cycle snapshot IDs for variance: %s", e)
+ 
+    if not active_cycle_month:
+        try:
+            d_info = KenvueCalendar.get_date_info(datetime.date.today())
+            if d_info and d_info.kv_month_num and 1 <= d_info.kv_month_num <= 12:
+                active_cycle_month = d_info.kv_month_num
+        except Exception:
+            active_cycle_month = datetime.date.today().month
+ 
+    return CycleSnapshotInfo(
+        curr_cs_id, prior_cs_id, curr_ss_id, prior_ss_id, bp_cs_id, bp_ss_id, active_cycle_month
+    )
+ 
+ 
+def _fetch_cycle_consumption_blocks(
+    models: list[str], year: int, baseline_mode: str = "CURRENT", snapshot_year: Optional[int] = None
+) -> tuple[dict[str, dict[int, float]], bool]:
+    """
+    Fetches consumption building blocks ($M POS) for year.
+    baseline_mode: 'CURRENT', 'PRIOR', or 'BP'.
+    Returns (monthly_data_dict, snapshot_found_flag).
+    """
+    monthly_data: dict[str, dict[int, float]] = {}
+    if not models:
+        return monthly_data, False
+ 
+    model_list = [str(m).strip() for m in models if m]
+    cycle_year = snapshot_year if snapshot_year is not None else year
+    snap_info = get_cycle_snapshot_ids(cycle_year)
+ 
+    if baseline_mode == "BP":
+        bp_cs_id = snap_info.bp_cs_id if cycle_year == year else get_cycle_snapshot_ids(year).bp_cs_id
+        if bp_cs_id is None:
+            return monthly_data, False
+        cpr_snap_filter = f"AND cpr.snapshot_id = {bp_cs_id}"
+    elif baseline_mode == "PRIOR":
+        if snap_info.prior_cs_id is None:
+            return monthly_data, False
+        cpr_snap_filter = f"AND cpr.snapshot_id = {snap_info.prior_cs_id}"
+    else:
+        cpr_snap_filter = f"AND (cpr.snapshot_id = {snap_info.curr_cs_id} OR cpr.snapshot_id IS NULL)" if snap_info.curr_cs_id else "AND cpr.snapshot_id IS NULL"
+ 
+    sql = f"""
+    SELECT
+        cbb.name AS building_block,
+        EXTRACT(MONTH FROM cpv.period_month)::int AS month_num,
+        SUM(cpv.value_in_thousands) AS value_in_thousands
+    FROM public.consumption_planning_rows cpr
+    INNER JOIN public.consumption_building_blocks cbb
+        ON cpr.building_block_id = cbb.block_id
+    INNER JOIN public.consumption_planning_values cpv
+        ON cpr.row_id = cpv.row_id
+    INNER JOIN public.master_models mm
+        ON cpr.model_id = mm.model_id
+    WHERE
+        mm.model_name = ANY(%s)
+        AND cpr.is_deleted = FALSE
+        AND cbb.is_active = TRUE
+        AND mm.is_active = TRUE
+        AND EXTRACT(YEAR FROM cpv.period_month) = %s
+        {cpr_snap_filter}
+    GROUP BY cbb.name, month_num
+    HAVING ABS(SUM(cpv.value_in_thousands)) > 1e-9;
+    """
+    try:
+        with get_db_cursor(commit=False) as cur:
+            cur.execute(sql, (model_list, year))
+            for r in cur.fetchall():
+                norm_name = normalize_text(r["building_block"])
+                m_num = int(r["month_num"])
+                val_m = float(r["value_in_thousands"] or 0.0) / 1000.0  # $K to $M
+                monthly_data.setdefault(norm_name, {})[m_num] = (
+                    monthly_data.setdefault(norm_name, {}).get(m_num, 0.0) + val_m
+                )
+    except Exception as e:
+        logger.warning("Notice querying consumption variance blocks (%s): %s", baseline_mode, e)
+        return monthly_data, False
+ 
+    return monthly_data, True
+ 
+ 
+def _fetch_cycle_shipment_blocks(
+    models: list[str], year: int, baseline_mode: str = "CURRENT", snapshot_year: Optional[int] = None
+) -> tuple[dict[str, dict[int, float]], bool]:
+    """
+    Fetches shipment building blocks ($M GTS) for year.
+    baseline_mode: 'CURRENT', 'PRIOR', or 'BP'.
+    Returns (monthly_data_dict, snapshot_found_flag).
+    """
+    monthly_data: dict[str, dict[int, float]] = {}
+    if not models:
+        return monthly_data, False
+ 
+    model_list = [str(m).strip() for m in models if m]
+    cycle_year = snapshot_year if snapshot_year is not None else year
+    snap_info = get_cycle_snapshot_ids(cycle_year)
+ 
+    if baseline_mode == "BP":
+        bp_ss_id = snap_info.bp_ss_id if cycle_year == year else get_cycle_snapshot_ids(year).bp_ss_id
+        if bp_ss_id is None:
+            return monthly_data, False
+        spr_snap_filter = f"AND spr.snapshot_id = {bp_ss_id}"
+    elif baseline_mode == "PRIOR":
+        if snap_info.prior_ss_id is None:
+            return monthly_data, False
+        spr_snap_filter = f"AND spr.snapshot_id = {snap_info.prior_ss_id}"
+    else:
+        spr_snap_filter = f"AND (spr.snapshot_id = {snap_info.curr_ss_id} OR spr.snapshot_id IS NULL)" if snap_info.curr_ss_id else "AND spr.snapshot_id IS NULL"
+ 
+    sql = f"""
+    SELECT
+        sbb.name AS building_block,
+        EXTRACT(MONTH FROM spv.period_month)::int AS month_num,
+        SUM(spv.value_in_thousands) AS value_in_thousands
+    FROM public.shipment_planning_rows spr
+    INNER JOIN public.shipment_building_blocks sbb
+        ON spr.building_block_id = sbb.block_id
+    INNER JOIN public.shipment_planning_values spv
+        ON spr.row_id = spv.row_id
+    INNER JOIN public.master_models mm
+        ON spr.model_id = mm.model_id
+    WHERE
+        mm.model_name = ANY(%s)
+        AND spr.is_deleted = FALSE
+        AND sbb.is_active = TRUE
+        AND mm.is_active = TRUE
+        AND EXTRACT(YEAR FROM spv.period_month) = %s
+        {spr_snap_filter}
+    GROUP BY sbb.name, month_num
+    HAVING ABS(SUM(spv.value_in_thousands)) > 1e-9;
+    """
+    try:
+        with get_db_cursor(commit=False) as cur:
+            cur.execute(sql, (model_list, year))
+            for r in cur.fetchall():
+                norm_name = normalize_text(r["building_block"])
+                m_num = int(r["month_num"])
+                val_m = float(r["value_in_thousands"] or 0.0) / 1000.0
+                monthly_data.setdefault(norm_name, {})[m_num] = (
+                    monthly_data.setdefault(norm_name, {}).get(m_num, 0.0) + val_m
+                )
+    except Exception as e:
+        logger.warning("Notice querying shipment variance blocks (%s): %s", baseline_mode, e)
+        return monthly_data, False
+ 
+    return monthly_data, True
+ 
+ 
+def _matches_consumption_driver_name(db_bb_name: str, match_key: str) -> bool:
+    norm = normalize_text(db_bb_name)
+    rules = {
+        "INNOVATION": lambda n: "INNOVATION" in n and "NET" not in n and "CANNIBAL" not in n,
+        "CANNIBALIZATION": lambda n: "CANNIBAL" in n,
+        "PRICE": lambda n: "PRICE" in n and "NET" not in n and "ELAST" not in n,
+        "ELASTICITY": lambda n: "ELAST" in n,
+        "OTHER": lambda n: "OTHER" in n and "OVERLAY" not in n,
+        "RENOVATION": lambda n: "RENOVAT" in n,
+        "DISCONTINUATIONS": lambda n: "DISCONTINU" in n,
+        MATCH_KEY_BASE_TREND: lambda n: "BASE" in n and "TREND" in n,
+        "SEASON": lambda n: "SEASON" in n,
+        "COMPETITION": lambda n: "COMPET" in n,
+        "DISTRIBUTION": lambda n: "DISTRIBUT" in n,
+        "MEDIA": lambda n: "MEDIA" in n,
+        "TRADE": lambda n: "TRADE" in n,
+        "CLUB": lambda n: "CLUB" in n,
+    }
+    matcher = rules.get(match_key)
+    return matcher(norm) if matcher else (match_key in norm)
+ 
+ 
+def _matches_shipment_driver_name(db_bb_name: str, grp: str, match_key: str) -> bool:
+    norm = normalize_text(db_bb_name)
+    c_key = normalize_text(match_key)
+    if "OTHER" in c_key:
+        if grp == GROUP_IBP_OVERLAYS:
+            return "OVERLAY" in norm
+        return "OTHER" in norm and "OVERLAY" not in norm
+    if "RETAILER" in c_key:
+        return "RETAIL" in norm or "INVENT" in norm
+    if "SUPPLY" in c_key:
+        return "SUPPLY" in norm
+    if "LIQUID
+
+Error: The stream was interrupted. Please continue the task you were working on. (Error ID: f94542d1-a9f8-49e9-aab1-9df7148ffe0e-14864)
+
+Aha — that error happened because the updated `services/variance_calculations.py` passes `snapshot_year=plan_year` to `load_consumption_variance_drivers(...)` and `load_shipment_variance_drivers(...)`, and only the incremental snippet (not the full file) was pasted for **`services/variance_service.py`** earlier.
+
+Replace your entire **`services/variance_service.py`** with the complete version below (verified with `py_compile` on [`fixed_var_srv.py`](file:///C:/Users/mania/.gemini/antigravity/brain/4b1c5677-372f-4c6d-b249-28717fd9eebd/scratch/fixed_var_srv.py) and mocked rollover tests in [`verify_var_calc.py`](file:///C:/Users/mania/.gemini/antigravity/brain/4b1c5677-372f-4c6d-b249-28717fd9eebd/scratch/verify_var_calc.py)), then restart your app and reload `/variance`:
+
+### Complete Corrected `services/variance_service.py`
+
+```python
+# pylint: disable=too-many-lines,too-many-locals,too-many-branches,broad-except
+"""
+NA IBP Planning Application — Variance Dashboard Data Service
+=============================================================
+Handles PostgreSQL connectivity (via get_db_cursor) and snapshot discovery
+for the Variance Dashboard:
+1. Consumption Variance (POS Building Blocks delta)
+2. Shipment Variance (Shipment Building Blocks delta)
+ 
+Comparison Modes:
+- IBP (Default): Current Cycle Building Block[m] - Prior Cycle (IBP-1) Building Block[m]
+- BP:            Current Cycle Building Block[m] - Annual BP Baseline Building Block[m]
+"""
+ 
+import os
+import re
+import datetime
+from typing import Optional, Dict, List, Any, NamedTuple
+ 
+from database.connection import get_db_cursor
+from services.kv_calendar import KenvueCalendar
+from services.validation_service import normalize_text
+from utils.logger import get_logger
+ 
+logger = get_logger(__name__)
+ 
+MONTH_NAME_MAP = {
+    "JAN": 1, "JANUARY": 1, "FEB": 2, "FEBRUARY": 2, "MAR": 3, "MARCH": 3,
+    "APR": 4, "APRIL": 4, "MAY": 5, "JUN": 6, "JUNE": 6,
+    "JUL": 7, "JULY": 7, "AUG": 8, "AUGUST": 8, "SEP": 9, "SEPTEMBER": 9,
+    "OCT": 10, "OCTOBER": 10, "NOV": 11, "NOVEMBER": 11, "DEC": 12, "DECEMBER": 12
+}
+ 
+DRIVER_BASE_TREND = "Base Trend"
+DRIVER_OTHER = "Other"
+MATCH_KEY_BASE_TREND = "BASE TREND"
+DRIVER_NET_INNOVATION = "Net Innovation"
+DRIVER_NET_PRICE = "Net Price"
+GROUP_IBP_OVERLAYS = "IBP Overlays"
+ 
+CONSUMPTION_VARIANCE_DRIVER_DEFINITIONS = [
+    ("External",     DRIVER_BASE_TREND,     MATCH_KEY_BASE_TREND),
+    ("External",     "Season",              "SEASON"),
+    ("External",     "Competition",         "COMPETITION"),
+    ("Distribution", "Distribution",        "DISTRIBUTION"),
+    ("Innovation",   DRIVER_NET_INNOVATION, "COMPOUND_NET_INNOVATION"),
+    ("Innovation",   "Innovation",          "INNOVATION"),
+    ("Innovation",   "Cannibalization",     "CANNIBALIZATION"),
+    ("Innovation",   "Discontinuations",    "DISCONTINUATIONS"),
+    ("Innovation",   "Renovation",          "RENOVATION"),
+    ("Investment",   "Media",               "MEDIA"),
+    ("Investment",   "Trade",               "TRADE"),
+    ("Price",        DRIVER_NET_PRICE,      "COMPOUND_NET_PRICE"),
+    ("Price",        "Price",               "PRICE"),
+    ("Price",        "Elasticity",          "ELASTICITY"),
+    ("Other",        "Club",                "CLUB"),
+    ("Other",        DRIVER_OTHER,          "OTHER"),
+]
+ 
+SHIPMENT_VARIANCE_DRIVER_DEFINITIONS = [
+    ("Inventory",         "Distribution",       "DISTRIBUTION"),
+    ("Inventory",         "Innovation",         "INNOVATION"),
+    ("Inventory",         "Trade",              "TRADE"),
+    ("Inventory",         "Club",               "CLUB"),
+    ("Inventory",         "Retailer Inventory", "RETAILER_INVENTORY"),
+    ("Inventory",         DRIVER_OTHER,         "OTHER"),
+    (GROUP_IBP_OVERLAYS,  "Supply Constraints", "SUPPLY_CONSTRAINTS"),
+    (GROUP_IBP_OVERLAYS,  "Liquidations",       "LIQUIDATIONS"),
+    (GROUP_IBP_OVERLAYS,  DRIVER_OTHER,         "OVERLAYS_OTHER"),
+]
+ 
+ 
+def get_active_years() -> tuple[int, int]:
+    """Dynamically determines (base_year, plan_year) using Kenvue 4-4-5 Fiscal Calendar."""
+    env_year = os.getenv("IBP_PLAN_YEAR")
+    if env_year and env_year.isdigit():
+        plan_year = int(env_year)
+    else:
+        today_info = KenvueCalendar.get_date_info(datetime.date.today())
+        plan_year = today_info.kv_year
+    base_year = plan_year - 1
+    return base_year, plan_year
+ 
+ 
+def parse_month_num(val: Any) -> Optional[int]:
+    """Extracts month number (1..12) from dates, numbers, or month names."""
+    if val is None:
+        return None
+    if isinstance(val, (datetime.date, datetime.datetime)):
+        return val.month
+    s = str(val).strip().upper()
+    if s.isdigit():
+        n = int(s)
+        if 1 <= n <= 12:
+            return n
+    for k, v in MONTH_NAME_MAP.items():
+        if k in s:
+            return v
+    m_iso = re.search(r"[-/](\d{1,2})", s)
+    if m_iso:
+        n = int(m_iso.group(1))
+        if 1 <= n <= 12:
+            return n
+    return None
+ 
+ 
+class CycleSnapshotInfo(NamedTuple):
+    curr_cs_id: Optional[int]
+    prior_cs_id: Optional[int]
+    curr_ss_id: Optional[int]
+    prior_ss_id: Optional[int]
+    bp_cs_id: Optional[int] = None
+    bp_ss_id: Optional[int] = None
+    active_cycle_month: Optional[int] = None
+ 
+ 
+def _query_cycle_snapshot(
+    cur: Any, table_name: str, year: int, snapshot_type_filter: str, prior_to_id: Optional[int] = None
+) -> tuple[Optional[int], Optional[int]]:
+    if prior_to_id is not None:
+        sql = f"""
+            SELECT s.snapshot_id, pc.cycle_month
+            FROM public.{table_name} s
+            JOIN public.planning_cycles pc ON s.cycle_id = pc.cycle_id
+            WHERE s.snapshot_id < %s
+              AND UPPER(COALESCE(pc.snapshot_type, '')) != 'BP'
+              AND (pc.planning_year_start <= %s OR pc.planning_year_start IS NULL)
+            ORDER BY pc.planning_year_start DESC NULLS LAST, pc.cycle_month DESC NULLS LAST, s.snapshot_id DESC
+            LIMIT 1;
+        """
+        cur.execute(sql, (prior_to_id, year))
+    else:
+        sql = f"""
+            SELECT s.snapshot_id, pc.cycle_month
+            FROM public.{table_name} s
+            JOIN public.planning_cycles pc ON s.cycle_id = pc.cycle_id
+            WHERE ({snapshot_type_filter})
+              AND (pc.planning_year_start <= %s OR pc.planning_year_start IS NULL)
+            ORDER BY pc.planning_year_start DESC NULLS LAST, pc.cycle_month DESC NULLS LAST, s.snapshot_id DESC
+            LIMIT 1;
+        """
+        cur.execute(sql, (year,))
+    row = cur.fetchone()
+    if not row:
+        return None, None
+    snap_id = row.get("snapshot_id") if isinstance(row, dict) else row["snapshot_id"]
+    c_mo = row.get("cycle_month") if isinstance(row, dict) else None
+    m_num = parse_month_num(c_mo) if c_mo else None
+    return snap_id, m_num if (m_num and 1 <= m_num <= 12) else None
+ 
+ 
+def _query_bp_snapshot(cur: Any, snap_table: str, rows_table: str, vals_table: str, year: int) -> Optional[int]:
+    """Finds the BP snapshot ID that holds BP values for the requested year."""
+    sql = f"""
+        SELECT s.snapshot_id
+        FROM public.{snap_table} s
+        JOIN public.planning_cycles pc ON s.cycle_id = pc.cycle_id
+        WHERE UPPER(COALESCE(pc.snapshot_type, '')) = 'BP'
+          AND EXISTS (
+              SELECT 1
+              FROM public.{rows_table} r
+              JOIN public.{vals_table} v ON v.row_id = r.row_id
+              WHERE r.snapshot_id = s.snapshot_id
+                AND r.is_deleted = FALSE
+                AND EXTRACT(YEAR FROM v.period_month) = %s
+          )
+        ORDER BY pc.planning_year_start DESC NULLS LAST, s.snapshot_id DESC
+        LIMIT 1;
+    """
+    cur.execute(sql, (year,))
+    row = cur.fetchone()
+    if not row:
+        return None
+    return row.get("snapshot_id") if isinstance(row, dict) else row["snapshot_id"]
+ 
+ 
+def _resolve_snapshot_pair(
+    cur, table_name: str, year: int, curr_filter: str, prior_filter: str
+) -> tuple[Optional[int], Optional[int], Optional[int]]:
+    curr_id, c_mo = _query_cycle_snapshot(cur, table_name, year, curr_filter)
+    prior_id, _ = _query_cycle_snapshot(cur, table_name, year, prior_filter)
+    if (not prior_id or prior_id == curr_id) and curr_id:
+        prior_id, _ = _query_cycle_snapshot(cur, table_name, year, "", prior_to_id=curr_id)
+    return curr_id, prior_id, c_mo
+ 
+ 
+def get_cycle_snapshot_ids(year: int) -> CycleSnapshotInfo:
+    """Detects Current, Prior (IBP-1), and BP snapshot IDs scoped to year."""
+    curr_cs_id, prior_cs_id, curr_ss_id, prior_ss_id = None, None, None, None
+    bp_cs_id, bp_ss_id = None, None
+    active_cycle_month = None
+ 
+    curr_filter = "(UPPER(COALESCE(pc.snapshot_type, '')) LIKE '%%CURRENT%%' OR (pc.is_active = TRUE AND UPPER(COALESCE(pc.snapshot_type, '')) != 'BP'))"
+    prior_filter = (
+        "("
+        "UPPER(COALESCE(pc.snapshot_type, '')) LIKE '%%PRIOR%%' "
+        "OR UPPER(COALESCE(pc.snapshot_type, '')) LIKE '%%PREV%%' "
+        "OR UPPER(COALESCE(pc.snapshot_type, '')) LIKE '%%IBP-1%%'"
+        ") AND UPPER(COALESCE(pc.snapshot_type, '')) != 'BP'"
+    )
+ 
+    try:
+        with get_db_cursor(commit=False) as cur:
+            curr_cs_id, prior_cs_id, c_mo = _resolve_snapshot_pair(
+                cur, "consumption_snapshots", year, curr_filter, prior_filter
+            )
+            curr_ss_id, prior_ss_id, s_mo = _resolve_snapshot_pair(
+                cur, "shipment_snapshots", year, curr_filter, prior_filter
+            )
+            bp_cs_id = _query_bp_snapshot(
+                cur, "consumption_snapshots", "consumption_planning_rows", "consumption_planning_values", year
+            )
+            bp_ss_id = _query_bp_snapshot(
+                cur, "shipment_snapshots", "shipment_planning_rows", "shipment_planning_values", year
+            )
+            active_cycle_month = c_mo or s_mo
+    except Exception as e:
+        logger.warning("Notice discovering cycle snapshot IDs for variance: %s", e)
+ 
+    if not active_cycle_month:
+        try:
+            d_info = KenvueCalendar.get_date_info(datetime.date.today())
+            if d_info and d_info.kv_month_num and 1 <= d_info.kv_month_num <= 12:
+                active_cycle_month = d_info.kv_month_num
+        except Exception:
+            active_cycle_month = datetime.date.today().month
+ 
+    return CycleSnapshotInfo(
+        curr_cs_id, prior_cs_id, curr_ss_id, prior_ss_id, bp_cs_id, bp_ss_id, active_cycle_month
+    )
+ 
+ 
+def _fetch_cycle_consumption_blocks(
+    models: list[str], year: int, baseline_mode: str = "CURRENT", snapshot_year: Optional[int] = None
+) -> tuple[dict[str, dict[int, float]], bool]:
+    """
+    Fetches consumption building blocks ($M POS) for year.
+    baseline_mode: 'CURRENT', 'PRIOR', or 'BP'.
+    Returns (monthly_data_dict, snapshot_found_flag).
+    """
+    monthly_data: dict[str, dict[int, float]] = {}
+    if not models:
+        return monthly_data, False
+ 
+    model_list = [str(m).strip() for m in models if m]
+    cycle_year = snapshot_year if snapshot_year is not None else year
+    snap_info = get_cycle_snapshot_ids(cycle_year)
+ 
+    if baseline_mode == "BP":
+        bp_cs_id = snap_info.bp_cs_id if cycle_year == year else get_cycle_snapshot_ids(year).bp_cs_id
+        if bp_cs_id is None:
+            return monthly_data, False
+        cpr_snap_filter = f"AND cpr.snapshot_id = {bp_cs_id}"
+    elif baseline_mode == "PRIOR":
+        if snap_info.prior_cs_id is None:
+            return monthly_data, False
+        cpr_snap_filter = f"AND cpr.snapshot_id = {snap_info.prior_cs_id}"
+    else:
+        cpr_snap_filter = f"AND (cpr.snapshot_id = {snap_info.curr_cs_id} OR cpr.snapshot_id IS NULL)" if snap_info.curr_cs_id else "AND cpr.snapshot_id IS NULL"
+ 
+    sql = f"""
+    SELECT
+        cbb.name AS building_block,
+        EXTRACT(MONTH FROM cpv.period_month)::int AS month_num,
+        SUM(cpv.value_in_thousands) AS value_in_thousands
+    FROM public.consumption_planning_rows cpr
+    INNER JOIN public.consumption_building_blocks cbb
+        ON cpr.building_block_id = cbb.block_id
+    INNER JOIN public.consumption_planning_values cpv
+        ON cpr.row_id = cpv.row_id
+    INNER JOIN public.master_models mm
+        ON cpr.model_id = mm.model_id
+    WHERE
+        mm.model_name = ANY(%s)
+        AND cpr.is_deleted = FALSE
+        AND cbb.is_active = TRUE
+        AND mm.is_active = TRUE
+        AND EXTRACT(YEAR FROM cpv.period_month) = %s
+        {cpr_snap_filter}
+    GROUP BY cbb.name, month_num
+    HAVING ABS(SUM(cpv.value_in_thousands)) > 1e-9;
+    """
+    try:
+        with get_db_cursor(commit=False) as cur:
+            cur.execute(sql, (model_list, year))
+            for r in cur.fetchall():
+                norm_name = normalize_text(r["building_block"])
+                m_num = int(r["month_num"])
+                val_m = float(r["value_in_thousands"] or 0.0) / 1000.0  # $K to $M
+                monthly_data.setdefault(norm_name, {})[m_num] = (
+                    monthly_data.setdefault(norm_name, {}).get(m_num, 0.0) + val_m
+                )
+    except Exception as e:
+        logger.warning("Notice querying consumption variance blocks (%s): %s", baseline_mode, e)
+        return monthly_data, False
+ 
+    return monthly_data, True
+ 
+ 
+def _fetch_cycle_shipment_blocks(
+    models: list[str], year: int, baseline_mode: str = "CURRENT", snapshot_year: Optional[int] = None
+) -> tuple[dict[str, dict[int, float]], bool]:
+    """
+    Fetches shipment building blocks ($M GTS) for year.
+    baseline_mode: 'CURRENT', 'PRIOR', or 'BP'.
+    Returns (monthly_data_dict, snapshot_found_flag).
+    """
+    monthly_data: dict[str, dict[int, float]] = {}
+    if not models:
+        return monthly_data, False
+ 
+    model_list = [str(m).strip() for m in models if m]
+    cycle_year = snapshot_year if snapshot_year is not None else year
+    snap_info = get_cycle_snapshot_ids(cycle_year)
+ 
+    if baseline_mode == "BP":
+        bp_ss_id = snap_info.bp_ss_id if cycle_year == year else get_cycle_snapshot_ids(year).bp_ss_id
+        if bp_ss_id is None:
+            return monthly_data, False
+        spr_snap_filter = f"AND spr.snapshot_id = {bp_ss_id}"
+    elif baseline_mode == "PRIOR":
+        if snap_info.prior_ss_id is None:
+            return monthly_data, False
+        spr_snap_filter = f"AND spr.snapshot_id = {snap_info.prior_ss_id}"
+    else:
+        spr_snap_filter = f"AND (spr.snapshot_id = {snap_info.curr_ss_id} OR spr.snapshot_id IS NULL)" if snap_info.curr_ss_id else "AND spr.snapshot_id IS NULL"
+ 
+    sql = f"""
+    SELECT
+        sbb.name AS building_block,
+        EXTRACT(MONTH FROM spv.period_month)::int AS month_num,
+        SUM(spv.value_in_thousands) AS value_in_thousands
+    FROM public.shipment_planning_rows spr
+    INNER JOIN public.shipment_building_blocks sbb
+        ON spr.building_block_id = sbb.block_id
+    INNER JOIN public.shipment_planning_values spv
+        ON spr.row_id = spv.row_id
+    INNER JOIN public.master_models mm
+        ON spr.model_id = mm.model_id
+    WHERE
+        mm.model_name = ANY(%s)
+        AND spr.is_deleted = FALSE
+        AND sbb.is_active = TRUE
+        AND mm.is_active = TRUE
+        AND EXTRACT(YEAR FROM spv.period_month) = %s
+        {spr_snap_filter}
+    GROUP BY sbb.name, month_num
+    HAVING ABS(SUM(spv.value_in_thousands)) > 1e-9;
+    """
+    try:
+        with get_db_cursor(commit=False) as cur:
+            cur.execute(sql, (model_list, year))
+            for r in cur.fetchall():
+                norm_name = normalize_text(r["building_block"])
+                m_num = int(r["month_num"])
+                val_m = float(r["value_in_thousands"] or 0.0) / 1000.0
+                monthly_data.setdefault(norm_name, {})[m_num] = (
+                    monthly_data.setdefault(norm_name, {}).get(m_num, 0.0) + val_m
+                )
+    except Exception as e:
+        logger.warning("Notice querying shipment variance blocks (%s): %s", baseline_mode, e)
+        return monthly_data, False
+ 
+    return monthly_data, True
+ 
+ 
+def _matches_consumption_driver_name(db_bb_name: str, match_key: str) -> bool:
+    norm = normalize_text(db_bb_name)
+    rules = {
+        "INNOVATION": lambda n: "INNOVATION" in n and "NET" not in n and "CANNIBAL" not in n,
+        "CANNIBALIZATION": lambda n: "CANNIBAL" in n,
+        "PRICE": lambda n: "PRICE" in n and "NET" not in n and "ELAST" not in n,
+        "ELASTICITY": lambda n: "ELAST" in n,
+        "OTHER": lambda n: "OTHER" in n and "OVERLAY" not in n,
+        "RENOVATION": lambda n: "RENOVAT" in n,
+        "DISCONTINUATIONS": lambda n: "DISCONTINU" in n,
+        MATCH_KEY_BASE_TREND: lambda n: "BASE" in n and "TREND" in n,
+        "SEASON": lambda n: "SEASON" in n,
+        "COMPETITION": lambda n: "COMPET" in n,
+        "DISTRIBUTION": lambda n: "DISTRIBUT" in n,
+        "MEDIA": lambda n: "MEDIA" in n,
+        "TRADE": lambda n: "TRADE" in n,
+        "CLUB": lambda n: "CLUB" in n,
+    }
+    matcher = rules.get(match_key)
+    return matcher(norm) if matcher else (match_key in norm)
+ 
+ 
+def _matches_shipment_driver_name(db_bb_name: str, grp: str, match_key: str) -> bool:
+    norm = normalize_text(db_bb_name)
+    c_key = normalize_text(match_key)
+    if "OTHER" in c_key:
+        if grp == GROUP_IBP_OVERLAYS:
+            return "OVERLAY" in norm
+        return "OTHER" in norm and "OVERLAY" not in norm
+    if "RETAILER" in c_key:
+        return "RETAIL" in norm or "INVENT" in norm
+    if "SUPPLY" in c_key:
+        return "SUPPLY" in norm
+    if "LIQUIDAT" in c_key:
+        return "LIQUIDAT" in norm
+    return c_key in norm
+ 
+ 
+def _compute_driver_variance_monthly(
+    curr_dict: dict[int, float], base_dict: dict[int, float]
+) -> list[Optional[float]]:
+    """
+    Computes delta: (Current Cycle - Baseline) WITHOUT Price Factor.
+    - If neither cycle has planned data -> None (Blank cell)
+    - If both values are explicitly 0.0 -> None (Blank cell)
+    - If data exists and current == baseline -> 0.0 ("0.00")
+    """
+    res: list[Optional[float]] = [None] * 12
+    for m in range(1, 13):
+        has_curr = m in curr_dict
+        has_base = m in base_dict
+        if not has_curr and not has_base:
+            res[m - 1] = None
+        else:
+            curr_val = curr_dict.get(m, 0.0)
+            base_val = base_dict.get(m, 0.0)
+            if abs(curr_val) < 1e-9 and abs(base_val) < 1e-9:
+                res[m - 1] = None
+            else:
+                res[m - 1] = round(curr_val - base_val, 9)
+    return res
+ 
+ 
+def load_consumption_variance_drivers(
+    models: str | list[str] | None, year: int, comparison_mode: str = "IBP", snapshot_year: Optional[int] = None
+) -> tuple[dict[str, list[Optional[float]]], bool]:
+    """
+    Loads Consumption Variance drivers:
+    - IBP: Current Cycle BB - Prior Cycle BB ($M POS)
+    - BP:  Current Cycle BB - Annual BP Baseline BB ($M POS)
+    Returns (driver_data, baseline_snapshot_exists).
+    """
+    empty_drivers = {disp: [None] * 12 for _, disp, _ in CONSUMPTION_VARIANCE_DRIVER_DEFINITIONS}
+    if not models:
+        return empty_drivers, True
+ 
+    model_list = [str(m).strip() for m in ([models] if isinstance(models, str) else models) if m]
+    if not model_list:
+        return empty_drivers, True
+ 
+    mode = (comparison_mode or "IBP").upper()
+    baseline_type = "BP" if mode == "BP" else "PRIOR"
+ 
+    current_raw, _ = _fetch_cycle_consumption_blocks(
+        model_list, year, baseline_mode="CURRENT", snapshot_year=snapshot_year
+    )
+    baseline_raw, has_baseline_snap = _fetch_cycle_consumption_blocks(
+        model_list, year, baseline_mode=baseline_type, snapshot_year=snapshot_year
+    )
+ 
+    if mode == "BP" and not has_baseline_snap:
+        return empty_drivers, False
+ 
+    driver_data: dict[str, list[Optional[float]]] = {}
+    for _, disp_name, match_key in CONSUMPTION_VARIANCE_DRIVER_DEFINITIONS:
+        if match_key.startswith("COMPOUND_"):
+            continue
+ 
+        curr_dict: dict[int, float] = {}
+        for k, v in current_raw.items():
+            if _matches_consumption_driver_name(k, match_key):
+                for m, val in v.items():
+                    curr_dict[m] = curr_dict.get(m, 0.0) + val
+ 
+        base_dict: dict[int, float] = {}
+        for k, v in baseline_raw.items():
+            if _matches_consumption_driver_name(k, match_key):
+                for m, val in v.items():
+                    base_dict[m] = base_dict.get(m, 0.0) + val
+ 
+        driver_data[disp_name] = _compute_driver_variance_monthly(curr_dict, base_dict)
+ 
+    # Compound drivers
+    for comp_name, p1, p2 in [
+        (DRIVER_NET_INNOVATION, "Innovation", "Cannibalization"),
+        (DRIVER_NET_PRICE, "Price", "Elasticity"),
+    ]:
+        v1_list = driver_data.get(p1, [None] * 12)
+        v2_list = driver_data.get(p2, [None] * 12)
+        res = [None] * 12
+        for i in range(12):
+            val1, val2 = v1_list[i], v2_list[i]
+            if val1 is not None or val2 is not None:
+                res[i] = round((float(val1) if val1 is not None else 0.0) + (float(val2) if val2 is not None else 0.0), 9)
+        driver_data[comp_name] = res
+ 
+    return driver_data, has_baseline_snap
+ 
+ 
+def load_shipment_variance_drivers(
+    models: str | list[str] | None, year: int, comparison_mode: str = "IBP", snapshot_year: Optional[int] = None
+) -> tuple[dict[Any, list[Optional[float]]], bool]:
+    """
+    Loads Shipment Variance drivers:
+    - IBP: Current Cycle BB - Prior Cycle BB ($M GTS)
+    - BP:  Current Cycle BB - Annual BP Baseline BB ($M GTS)
+    Returns (driver_data, baseline_snapshot_exists).
+    """
+    def _empty():
+        res = {}
+        for grp, disp, _ in SHIPMENT_VARIANCE_DRIVER_DEFINITIONS:
+            res[disp] = [None] * 12
+            res[(grp, disp)] = [None] * 12
+            res[f"{grp}_{disp}"] = [None] * 12
+        return res
+ 
+    if not models:
+        return _empty(), True
+ 
+    model_list = [str(m).strip() for m in ([models] if isinstance(models, str) else models) if m]
+    if not model_list:
+        return _empty(), True
+ 
+    mode = (comparison_mode or "IBP").upper()
+    baseline_type = "BP" if mode == "BP" else "PRIOR"
+ 
+    current_raw, _ = _fetch_cycle_shipment_blocks(
+        model_list, year, baseline_mode="CURRENT", snapshot_year=snapshot_year
+    )
+    baseline_raw, has_baseline_snap = _fetch_cycle_shipment_blocks(
+        model_list, year, baseline_mode=baseline_type, snapshot_year=snapshot_year
+    )
+ 
+    if mode == "BP" and not has_baseline_snap:
+        return _empty(), False
+ 
+    driver_data: dict[Any, list[Optional[float]]] = {}
+    for grp, disp_name, match_key in SHIPMENT_VARIANCE_DRIVER_DEFINITIONS:
+        curr_dict: dict[int, float] = {}
+        for k, v in current_raw.items():
+            if _matches_shipment_driver_name(k, grp, match_key):
+                for m, val in v.items():
+                    curr_dict[m] = curr_dict.get(m, 0.0) + val
+ 
+        base_dict: dict[int, float] = {}
+        for k, v in baseline_raw.items():
+            if _matches_shipment_driver_name(k, grp, match_key):
+                for m, val in v.items():
+                    base_dict[m] = base_dict.get(m, 0.0) + val
+ 
+        m_vals = _compute_driver_variance_monthly(curr_dict, base_dict)
+        driver_data[disp_name] = m_vals
+        driver_data[(grp, disp_name)] = m_vals
+        driver_data[f"{grp}_{disp_name}"] = m_vals
+ 
+    return driver_data, has_baseline_snap
