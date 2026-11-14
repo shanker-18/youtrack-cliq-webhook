@@ -1,18 +1,35 @@
-.audit-entry-card {
-    border-left: 3px solid var(--g);
-    margin-bottom: 8px;
-}
+    function selectCell(td) {
+        if (editingCell) return; // Don't change selection while editing
+        clearSelection();
+        if (!td) return;
 
-/* ── Spreadsheet-Style Cell Selection & Focus Indicator (AC1 & AC7) ── */
-td.cell-selected,
-td.cell-num.cell-selected,
-td.cell-subbrand.cell-selected,
-td.cell-desc.cell-selected,
-td.cell-num:focus {
-    outline: 2px solid var(--trust-green, #019881) !important;
-    outline-offset: -2px !important;
-    background-color: rgba(1, 152, 129, 0.09) !important;
-    position: relative !important;
-    z-index: 5 !important;
-    box-shadow: inset 0 0 0 1px var(--trust-green, #019881) !important;
-}
+        // Ensure cell has tabindex so browser focus() works on all table cells
+        if (!td.hasAttribute("tabindex") || td.getAttribute("tabindex") === "-1") {
+            td.setAttribute("tabindex", "0");
+        }
+
+        td.classList.add("cell-selected");
+        if (document.activeElement !== td && (!td.contains(document.activeElement))) {
+            try { 
+                td.focus({ preventScroll: true }); 
+            } catch (err) {
+                try { td.focus(); } catch (e) {}
+            }
+        }
+
+        var info = getCellInfo(td);
+        selectedCell = {
+            td: td,
+            rowId: info.row_id,
+            month: info.month,
+            yearIdx: info.year_idx,
+            colType: info.col_type || "month",
+        };
+        dispatch(EVT_SELECTED, {
+            row_id:   info.row_id,
+            month:    info.month,
+            year_idx: info.year_idx,
+            col_type: info.col_type || "month",
+            ts:       Date.now(),
+        });
+    }
