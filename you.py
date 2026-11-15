@@ -1,74 +1,3 @@
-    /* ── Navigation Helpers (AC2: Full Row Arrow Navigation) ───────────────── */
-    function getNavigableCellsInRow(tr) {
-        if (!tr || tr.classList.contains("row-deleted")) return [];
-        var cells = [];
-        // 1. Item cell
-        var itemTd = tr.querySelector("td.cell-subbrand");
-        if (itemTd) cells.push(itemTd);
-        // 2. Description cell
-        var descTd = tr.querySelector("td.cell-desc");
-        if (descTd) cells.push(descTd);
-        // 3. Month cells (JAN - DEC)
-        var monthTds = tr.querySelectorAll("td.cell-num");
-        monthTds.forEach(function (td) {
-            cells.push(td);
-        });
-        return cells;
-    }
-
-    function getAllEditableRows() {
-        var rows = [];
-        var tables = document.querySelectorAll(".planning-table");
-        tables.forEach(function (tbl) {
-            var trs = tbl.querySelectorAll("tbody tr:not(.row-deleted)");
-            trs.forEach(function (tr) {
-                rows.push(tr);
-            });
-        });
-        return rows;
-    }
-
-    function navigateArrow(direction) {
-        if (!selectedCell || !selectedCell.td || editingCell) return;
-
-        var currentTd = selectedCell.td;
-        var currentTr = currentTd.closest("tr");
-        if (!currentTr) return;
-
-        var cellsInRow = getNavigableCellsInRow(currentTr);
-        var colIdx = cellsInRow.indexOf(currentTd);
-
-        // Move Left / Right
-        if (direction === "ArrowRight") {
-            if (colIdx !== -1 && colIdx < cellsInRow.length - 1) {
-                var nextCell = cellsInRow[colIdx + 1];
-                selectCell(nextCell);
-                if (nextCell.scrollIntoViewIfNeeded) nextCell.scrollIntoViewIfNeeded(false);
-            }
-            return;
-        }
-
-        if (direction === "ArrowLeft") {
-            if (colIdx > 0) {
-                var prevCell = cellsInRow[colIdx - 1];
-                selectCell(prevCell);
-                if (prevCell.scrollIntoViewIfNeeded) prevCell.scrollIntoViewIfNeeded(false);
-            }
-            return;
-        }
-
-        // Move Up / Down
-        var allRows = getAllEditableRows();
-        var rowIdx = allRows.indexOf(currentTr);
-        if (rowIdx === -1) return;
-
-        var targetTr = null;
-        if (direction === "ArrowDown" && rowIdx < allRows.length - 1) {
-            targetTr = allRows[rowIdx + 1];
-        } else if (direction === "ArrowUp" && rowIdx > 0) {
-            targetTr = allRows[rowIdx - 1];
-        }
-
         if (targetTr) {
             var targetCells = getNavigableCellsInRow(targetTr);
             if (colIdx >= 0 && colIdx < targetCells.length) {
@@ -78,3 +7,55 @@
             }
         }
     }
+
+    /* ── Tab & Shift+Tab Navigation (AC3, AC4, AC5, AC9) ─────────────────── */
+    function navigateTab(isShift) {
+        if (!selectedCell || !selectedCell.td) return;
+        var currentTd = selectedCell.td;
+
+        // Build continuous flat list of all navigable cells across all rows & tables
+        var allRows = getAllEditableRows();
+        var allCells = [];
+        allRows.forEach(function (tr) {
+            var rowCells = getNavigableCellsInRow(tr);
+            rowCells.forEach(function (td) {
+                // Include text cells (item/desc) and editable month cells
+                if (isCellEditable(td) || td.classList.contains("cell-subbrand") || td.classList.contains("cell-desc")) {
+                    allCells.push(td);
+                }
+            });
+        });
+
+        if (allCells.length === 0) return;
+
+        var currentIndex = allCells.indexOf(currentTd);
+        var targetIndex = -1;
+
+        if (!isShift) {
+            // Forward Tab: Next cell -> End of row wraps to next row (AC3, AC5, AC9)
+            if (currentIndex === -1) {
+                targetIndex = 0;
+            } else if (currentIndex < allCells.length - 1) {
+                targetIndex = currentIndex + 1;
+            } else {
+                targetIndex = 0; // Wrap around to top
+            }
+        } else {
+            // Reverse Shift + Tab: Previous cell -> Start of row wraps to previous row (AC4)
+            if (currentIndex === -1) {
+                targetIndex = allCells.length - 1;
+            } else if (currentIndex > 0) {
+                targetIndex = currentIndex - 1;
+            } else {
+                targetIndex = allCells.length - 1; // Wrap around to bottom
+            }
+        }
+
+        if (targetIndex >= 0 && targetIndex < allCells.length) {
+            var targetCell = allCells[targetIndex];
+            selectCell(targetCell);
+            if (targetCell.scrollIntoViewIfNeeded) targetCell.scrollIntoViewIfNeeded(false);
+        }
+    }
+
+    /* ── Selection ───────────────────────────────────────────────────────── */
