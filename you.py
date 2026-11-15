@@ -1,15 +1,20 @@
-        // Arrow Key Navigation (AC2)
-        if (selectedCell && !editingCell) {
-            if (e.key === "ArrowUp" || e.key === "ArrowDown" || e.key === "ArrowLeft" || e.key === "ArrowRight") {
-                e.preventDefault();
-                navigateArrow(e.key);
-                return;
-            }
-        }
-
-        // Tab & Shift+Tab Navigation (AC3, AC4, AC5, AC9)
-        if (e.key === "Tab" && selectedCell && !editingCell) {
+    function onEditKeydown(e) {
+        if (e.key === "Enter") {
             e.preventDefault();
-            navigateTab(e.shiftKey);
-            return;
+            e.stopPropagation();
+            commitEdit();
+            // Enter moves down to next row (Excel standard)
+            navigateArrow("ArrowDown");
+        } else if (e.key === "Tab") {
+            e.preventDefault();
+            e.stopPropagation();
+            var isShift = e.shiftKey;
+            commitEdit();
+            // Tab advances to next cell
+            navigateTab(isShift);
+        } else if (e.key === "Escape") {
+            e.preventDefault();
+            e.stopPropagation();
+            cancelEdit();
         }
+    }
