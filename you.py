@@ -1,13 +1,4 @@
-    function navigateTab(isShift) {
-        if (!selectedCell || !selectedCell.td) return;
-        var currentTd = selectedCell.td;
+No, that's not correct:
 
-        // Build continuous flat list of all navigable cells across all rows & tables
-        var allRows = getAllEditableRows();
-        var allCells = [];
-        allRows.forEach(function (tr) {
-            var rowCells = getNavigableCellsInRow(tr);
-            rowCells.forEach(function (td) {
-                allCells.push(td);
-            });
-        });
+Base Year is 2025 (prior year), while 2026 is the Planning Year.
+Previous Cycle (e.g. October cycle) is a Prior Cycle Snapshot / CoC plan, not 'Historical'. Historical value refers strictly to Actuals from Snowflake (e.g., 2025 actuals or completed actuals months)."
