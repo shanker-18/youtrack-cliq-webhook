@@ -1,21 +1,9 @@
-        // Ctrl+Z / Cmd+Z — Undo (AC1)
-        if ((e.ctrlKey || e.metaKey) && (e.key === "z" || e.key === "Z") && !e.shiftKey) {
-            if (selectedCell || !editingCell) {
-                e.preventDefault();
-                var undoEntry = popUndo();
-                if (undoEntry) {
-                    if (undoEntry.type === "cell_value") {
-                        dispatch(EVT_SAVE, {
-                            row_id:   undoEntry.row_id,
-                            month:    undoEntry.month,
-                            year_idx: undoEntry.year_idx,
-                            new_val:  undoEntry.old_val,
-                            ts:       Date.now(),
-                        });
-                    } else {
-                        dispatch(EVT_UNDO, undoEntry);
-                    }
-                }
-            }
-            return;
-        }
+        // AC5: Push before-state to undo stack for paste
+        pushUndo({
+            type: "paste",
+            row_id:    selectedCell.rowId,
+            month:     selectedCell.month || "JAN",
+            year_idx:  selectedCell.yearIdx || 1,
+            col_type:  selectedCell.colType || "month",
+            ts:        now,
+        });
