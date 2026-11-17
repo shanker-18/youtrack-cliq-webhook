@@ -1,86 +1,71 @@
-def _render_nocomment_confirm_modal():
-    """Render confirmation pop-up when user clicks Save Changes without entering a comment."""
-    return dbc.Modal(
-        id="modal-audit-nocomment-confirm",
-        size="md",
-        is_open=False,
-        centered=True,
-        backdrop="static",
-        zIndex=1065,
-        style={
-            "--bs-modal-width": "580px",
-            "fontFamily": "'Segoe UI', sans-serif",
-        },
-        children=[
-            dbc.ModalHeader(
-                dbc.ModalTitle(
-                    html.Span(
-                        [
-                            html.I(
-                                className="bi bi-chat-left-text-fill me-2",
-                                style={"color": "var(--trust-green, #019881)"},
-                            ),
-                            "No Comment Entered",
-                        ]
-                    ),
-                    className="fw-bold fs-5",
-                    style={"fontFamily": "'Segoe UI', sans-serif", "color": _COLOR_B700},
-                ),
-                close_button=False,
-                className="pb-2",
-                style={"borderBottom": _BORDER_GREEN_100},
-            ),
-            dbc.ModalBody(
-                style={"fontFamily": "'Segoe UI', sans-serif"},
-                children=[
-                    html.Div(
-                        className="p-3",
-                        style={
-                            "background": "var(--green-50, #E6F5F2)",
-                            "border": _BORDER_GREEN_100,
-                            "borderRadius": "6px",
-                            "color": _COLOR_B600,
-                            "lineHeight": "1.6",
-                        },
-                        children=[
-                            html.P(
-                                "You have not entered any comment in Adjustment Rationale / Comment.",
-                                className="mb-1 fw-semibold",
-                                style={"fontSize": "13px", "color": _COLOR_B700},
-                            ),
-                            html.P(
-                                "Would you like to go back and add a comment, or save the changes without a comment?",
-                                className="mb-0",
-                                style={"fontSize": "12px", "color": _COLOR_B600},
+                            html.Button(
+                                [html.I(className="bi bi-check2 me-1"), "Save Changes"],
+                                id="btn-modal-save-action",
+                                type="button",
+                                className="btn-modal-save",
                             ),
                         ],
-                    )
-                ],
-            ),
-            dbc.ModalFooter(
-                className="d-flex justify-content-end gap-2 pt-2 pb-2",
-                style={"fontFamily": "'Segoe UI', sans-serif"},
-                children=[
-                    html.Button(
-                        [html.I(className="bi bi-chat-text me-1"), "Comments"],
-                        id="btn-audit-nocomment-add",
-                        type="button",
-                        className="btn-modal-cancel",
-                        style={"fontFamily": "'Segoe UI', sans-serif"},
-                    ),
-                    html.Button(
-                        [html.I(className="bi bi-check2 me-1"), "Save Without Comment"],
-                        id="btn-audit-nocomment-save",
-                        type="button",
-                        className="btn-modal-save",
-                        style={"fontFamily": "'Segoe UI', sans-serif"},
                     ),
                 ],
             ),
         ],
     )
+    return html.Div([audit_modal, _render_nocomment_confirm_modal()])
 
 
-def render_audit_modal():
-    """Render pure Python Dash cell audit and change lineage modal matching HTML prototype."""
-    audit_modal = dbc.Modal(
+def render_comment_modal():
+    """Render modal dialog for adding/viewing cell comments."""
+    return dbc.Modal(
+        id="modal-cell-comment",
+        size="lg",
+        is_open=False,
+        centered=True,
+        children=[
+            dcc.Store(id="comment-target-row-id"),
+            dcc.Store(id="comment-target-period"),
+            dcc.Store(id="comment-target-cur-val"),
+            dbc.ModalHeader(
+                dbc.ModalTitle(
+                    [html.I(className="bi bi-chat-left-text-fill me-2", style={"color": "#019881"}), "Cell Comment"],
+                    className="fw-bold fs-5",
+                ),
+                close_button=True,
+            ),
+            dbc.ModalBody([
+                html.Div(
+                    className="modal-context-box p-3 mb-3 small",
+                    style={"background": "#E6F5F2", "border": _BORDER_GREEN_100, "borderRadius": "6px"},
+                    children=[
+                        html.Div([html.Strong("Model: "), html.Span(id="comment-model-label")]),
+                        html.Div([html.Strong("Line Item: "), html.Span(id="comment-row-label")]),
+                        html.Div([html.Strong("Period: "), html.Span(id="comment-period-label")]),
+                        html.Div([html.Strong("Current Value: "), html.Span(id="comment-curval-label", className="fw-bold")]),
+                        html.Div(id="comment-status-line", className="mt-1 small"),
+                    ],
+                ),
+                html.Label("Comment / Rationale (Optional)", className="fw-bold small mb-1", style={"color": _COLOR_GREEN_800}),
+                dbc.Textarea(
+                    id="comment-modal-textarea",
+                    rows=3,
+                    className="form-control-sm mb-3",
+                    placeholder="Enter comment for this cell...",
+                ),
+                html.Label("Comment History", className="fw-bold small mb-1", style={"color": _COLOR_GREEN_800}),
+                html.Div(
+                    id="comment-history-table-container",
+                    style={"maxHeight": "180px", "overflowY": "auto"},
+                    className="border rounded bg-white",
+                ),
+            ]),
+            dbc.ModalFooter([
+                html.Button("Cancel", id="btn-close-comment-modal", type="button", className="btn-modal-cancel"),
+                html.Button(
+                    [html.I(className="bi bi-check2 me-1"), "Save"],
+                    id="btn-save-comment-modal",
+                    type="button",
+                    className="btn-modal-save",
+                ),
+            ]),
+        ],
+    )
+    
