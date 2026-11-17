@@ -1,6 +1,6 @@
 def save_paste_changes(n_save, cells_preview, comment, context_data):
     """
-    Plain (non-callback) save helper.
+    Plain (non-callback) save helper. Persists all changed cells from the paste preview.
     Returns (modal_open, refresh_token, toast).
     """
     if not n_save or not cells_preview or not context_data:
