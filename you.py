@@ -3,4 +3,5 @@ window.__IBP_LAST_EVENTS__ = {
     dblclick: null,
     save:     null,
     paste:    null,
+    undo:     null,
 };
