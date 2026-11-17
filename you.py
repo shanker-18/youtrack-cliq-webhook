@@ -1,7 +1,6 @@
-function pushUndo(entry) {
-    window.__IBP_UNDO_STACK__.push(entry);
-    if (window.__IBP_UNDO_STACK__.length > MAX_UNDO) {
-        window.__IBP_UNDO_STACK__.shift();
-    }
-    _syncUndoButton();
-}
+@callback(
+    Output("modal-paste-preview", "is_open", allow_duplicate=True),
+    Output("modal-paste-nocomment-confirm", "is_open", allow_duplicate=True),
+    Output("active-grid-rows-store", "data", allow_duplicate=True),
+    Output("toast-message-store", "data", allow_duplicate=True),
+    Output("paste-undo-cells-store", "data", allow_duplicate=True),
