@@ -1,15 +1,21 @@
-        var formattedVal = newNum.toFixed(2);
-        cleanupEdit(formattedVal);
-
-        // AC2: Push before-state to undo stack
-        pushUndo({
-            type: "cell_value",
-            row_id: ctx.rowId,
-            month: ctx.month,
-            year_idx: ctx.yearIdx,
-            old_val: oldNum,
-            new_val: newNum,
-            ts: Date.now(),
-        });
-
-        dispatch(EVT_SAVE, {
+        // Ctrl+Z / Cmd+Z — Undo (AC1)
+        if ((e.ctrlKey || e.metaKey) && (e.key === "z" || e.key === "Z") && !e.shiftKey) {
+            if (selectedCell || !editingCell) {
+                e.preventDefault();
+                var undoEntry = popUndo();
+                if (undoEntry) {
+                    if (undoEntry.type === "cell_value") {
+                        dispatch(EVT_SAVE, {
+                            row_id:   undoEntry.row_id,
+                            month:    undoEntry.month,
+                            year_idx: undoEntry.year_idx,
+                            new_val:  undoEntry.old_val,
+                            ts:       Date.now(),
+                        });
+                    } else {
+                        dispatch(EVT_UNDO, undoEntry);
+                    }
+                }
+            }
+            return;
+        }
