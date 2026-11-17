@@ -1,24 +1,56 @@
-
-
-# ── Ctrl+Z Global Shortcut Listener ──────────────────────────────────────────
-dash.clientside_callback(
-    """
-    function(id) {
-        if (!window.__IBP_UNDO_KEY_ATTACHED__) {
-            window.__IBP_UNDO_KEY_ATTACHED__ = true;
-            document.addEventListener("keydown", function(e) {
-                if ((e.ctrlKey || e.metaKey) && (e.key === 'z' || e.key === 'Z') && !e.shiftKey) {
-                    var btn = document.getElementById("btn-planning-undo");
-                    if (btn && !btn.disabled) {
-                        e.preventDefault();
-                        btn.click();
-                    }
-                }
-            });
-        }
-        return window.dash_clientside.no_update;
-    }
-    """,
-    dash.Output("btn-planning-undo", "id"),
-    dash.Input("btn-planning-undo", "id"),
-)
+                                            html.Span(
+                                                id="ribbon-countdown-badge",
+                                                className="badge border",
+                                                style={
+                                                    "display": "inline-flex",
+                                                    "backgroundColor": "#3B3B3B",
+                                                    "borderColor": "rgba(250, 204, 21, 0.35)",
+                                                    "color": "#FACC15",
+                                                    "borderRadius": "6px",
+                                                    "padding": "4px 11px",
+                                                    "boxShadow": "0 1px 3px rgba(0, 0, 0, 0.2)",
+                                                    "fontSize": "11px",
+                                                    "fontFamily": "monospace",
+                                                    "fontWeight": "700",
+                                                },
+                                                children=[
+                                                    html.I(className="bi bi-clock-history me-1", style={"color": "#FACC15"}),
+                                                    html.Span(
+                                                        id="countdown-timer",
+                                                        children=init_countdown_text,
+                                                        style={
+                                                            "color": "#FACC15",
+                                                            "fontFamily": "'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace",
+                                                            "fontWeight": "700",
+                                                            "letterSpacing": "0.3px",
+                                                        },
+                                                    ),
+                                                ],
+                                            ),
+                                            html.Button(
+                                                [
+                                                    html.I(className="bi bi-arrow-counterclockwise me-1"),
+                                                    html.Span("Undo"),
+                                                    html.Span(
+                                                        id="undo-count-badge",
+                                                        className="badge bg-secondary ms-1 d-none",
+                                                        children="0",
+                                                    ),
+                                                ],
+                                                id="btn-planning-undo",
+                                                type="button",
+                                                className="btn btn-sm btn-outline-secondary d-inline-flex align-items-center ms-2",
+                                                style={
+                                                    "height": "28px",
+                                                    "fontSize": "11.5px",
+                                                    "fontWeight": "600",
+                                                    "borderRadius": "6px",
+                                                    "padding": "2px 10px",
+                                                    "cursor": "not-allowed",
+                                                    "opacity": "0.55",
+                                                },
+                                                disabled=True,
+                                                title="Undo last action (Ctrl+Z)",
+                                            ),
+                                        ],
+                                    ),
