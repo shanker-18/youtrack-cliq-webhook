@@ -1,11 +1,13 @@
-    // Focus into text cell input
-    document.addEventListener("focusin", function (e) {
-        if (isInsideModal(e.target)) return;
-        var textTd = e.target.closest ? e.target.closest("td.cell-subbrand, td.cell-desc") : null;
-        if (textTd) {
-            if (editingCell) commitEdit();
-            selectCell(textTd);
-        }
-    }, true);
-
-    // AC3 + AC4: Capture text field before-state for undo
+app.clientside_callback(
+    """
+    function(n) {
+        var evts = window.__IBP_LAST_EVENTS__;
+        if (!evts || !evts.undo) return window.dash_clientside.no_update;
+        var d = evts.undo;
+        evts.undo = null;
+        return d;
+    }
+    """,
+    dash.Output("undo-action-store", "data"),
+    dash.Input("cell-interaction-interval", "n_intervals"),
+)
