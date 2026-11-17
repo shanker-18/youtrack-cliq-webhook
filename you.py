@@ -1,32 +1,23 @@
+    document.addEventListener(EVT_UNDO, function (e) {
+        window.__IBP_LAST_EVENTS__.undo = e.detail;
+    });
 
-    // AC3 + AC4: Capture text field before-state for undo
-    document.addEventListener("focusin", function (e) {
-        if (isInsideModal(e.target)) return;
-        var inp = e.target;
-        if (!inp || !inp.tagName || inp.tagName.toUpperCase() !== "INPUT") return;
-        var td = inp.closest ? inp.closest("td.cell-subbrand, td.cell-desc") : null;
-        if (!td) return;
-        var info = getCellInfo(td);
-        if (!info || !info.row_id) return;
-        inp.__ibp_undo_before = {
-            type: "text_edit",
-            row_id: info.row_id,
-            col_type: td.classList.contains("cell-subbrand") ? "item" : "desc",
-            old_val: inp.value || "",
-            ts: Date.now(),
-        };
-    }, true);
-
-    document.addEventListener("change", function (e) {
-        if (isInsideModal(e.target)) return;
-        var inp = e.target;
-        if (!inp || !inp.__ibp_undo_before) return;
-        var before = inp.__ibp_undo_before;
-        var newVal = (inp.value || "").trim();
-        var oldVal = (before.old_val || "").trim();
-        if (newVal !== oldVal) {
-            before.new_val = newVal;
-            pushUndo(before);
+    // AC1: Undo Button Click
+    document.addEventListener("click", function (e) {
+        var btn = e.target.closest("#btn-undo-action");
+        if (!btn) return;
+        var undoEntry = popUndo();
+        if (undoEntry) {
+            if (undoEntry.type === "cell_value") {
+                dispatch(EVT_SAVE, {
+                    row_id:   undoEntry.row_id,
+                    month:    undoEntry.month,
+                    year_idx: undoEntry.year_idx,
+                    new_val:  undoEntry.old_val,
+                    ts:       Date.now(),
+                });
+            } else {
+                dispatch(EVT_UNDO, undoEntry);
+            }
         }
-        inp.__ibp_undo_before = null;
-    }, true);
+    }, false);
