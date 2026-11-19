@@ -1,60 +1,64 @@
-def _parse_batch_cell(c: dict) -> Optional[Tuple]:
-    """Parse and validate a single cell for batch save. Returns (rid, period, old, new) or None on error."""
-    try:
-        old_val = round(float(str(c.get("old_val", "0")).replace(",", "")), 2)
-        new_val = round(float(str(c.get("new_val", "0")).replace(",", "")), 2)
-        period_month = datetime.strptime(c["period_iso"], "%Y-%m-%d").date()
-        rid = int(c["row_id"]) if str(c["row_id"]).isdigit() else c["row_id"]
-    except (ValueError, TypeError, KeyError):
-        return None
-    if old_val == new_val:
-        return ()
-    return rid, period_month, old_val, new_val
+"""
+NA IBP Planning Application — Hybrid Cache Store
+=================================================
+Thread-safe in-memory TTL cache for Snowflake historical actuals
+and computed summary matrices. Centralizes all dashboard caching
+into a single reusable module.
+"""
+
+import time
+from typing import Dict, Any, Optional
+from utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 
-def _upsert_and_audit_cell(is_consumption, cursor, rid, period_month, old_val, new_val, snapshot_id, user_id, dept_id, comment):
-    """Upsert one cell value and insert its audit record using a shared cursor."""
-    upsert_fn = upsert_consumption_value if is_consumption else upsert_shipment_value
-    audit_fn = insert_consumption_audit_record if is_consumption else insert_shipment_audit_record
-    val_record = upsert_fn(row_id=rid, period_month=period_month, value=new_val, user_id=user_id, cursor=cursor)
-    val_id = val_record["value_id"] if val_record else None
-    audit_fn(
-        snapshot_id=snapshot_id, row_id=rid, value_id=val_id,
-        event_type="BULK_PASTE_SAVED", old_value=old_val, new_value=new_val,
-        comment=comment, performed_by=user_id, dept_id=dept_id, cursor=cursor,
-    )
+class HybridCacheStore:
+    """Thread-safe in-memory TTL cache for Snowflake historical actuals."""
+
+    def __init__(self, ttl_seconds: int = 86400) -> None:
+        self._store: Dict[str, Any] = {}
+        self._expiry: Dict[str, float] = {}
+        self._ttl = ttl_seconds
+
+    def get(self, key: str) -> Optional[Any]:
+        """Return cached value if not expired, else None."""
+        if key not in self._store:
+            return None
+        if time.time() > self._expiry.get(key, 0):
+            self._store.pop(key, None)
+            self._expiry.pop(key, None)
+            return None
+        return self._store[key]
+
+    def set(self, key: str, value: Any) -> None:
+        """Store value with TTL expiry."""
+        self._store[key] = value
+        self._expiry[key] = time.time() + self._ttl
+
+    def invalidate(self, prefix: str = "") -> None:
+        """Remove all entries matching prefix, or all entries if prefix is empty."""
+        if not prefix:
+            self._store.clear()
+            self._expiry.clear()
+            return
+        keys = [k for k in self._store if k.startswith(prefix)]
+        for k in keys:
+            self._store.pop(k, None)
+            self._expiry.pop(k, None)
+
+    def has(self, key: str) -> bool:
+        """Check if a non-expired entry exists."""
+        return self.get(key) is not None
+
+    def size(self) -> int:
+        """Return count of cached entries."""
+        return len(self._store)
 
 
-def batch_save_cell_edits(cells: list, ctx: dict) -> dict:
-    """Save multiple cell edits in a single database transaction instead of one per cell."""
-    domain = ctx.get("domain", "CONSUMPTION")
-    is_consumption = domain.upper() == "CONSUMPTION"
-    snapshot_id = ctx["snapshot_id"]
-    comment = ctx.get("comment") or "Bulk paste saved by planner"
+# ── Singleton Instances ──────────────────────────────────────────────────────
+# Snowflake actuals: 24-hour TTL (external data, rarely changes)
+snowflake_cache = HybridCacheStore(ttl_seconds=86400)
 
-    changed_cells = [
-        c for c in cells
-        if not c.get("skipped") and c.get("changed") and not c.get("is_text")
-    ]
-    if not changed_cells:
-        return {"saved": 0, "errors": 0}
-
-    saved = 0
-    errors = 0
-    with get_db_cursor(commit=True) as cursor:
-        valid_user_id = _resolve_valid_user_id(cursor, ctx.get("user_id", 1))
-        for c in changed_cells:
-            parsed = _parse_batch_cell(c)
-            if parsed is None:
-                errors += 1
-                continue
-            if not parsed:
-                continue
-            rid, period_month, old_val, new_val = parsed
-            _upsert_and_audit_cell(
-                is_consumption, cursor, rid, period_month, old_val, new_val,
-                snapshot_id, valid_user_id, ctx.get("dept_id", 2), comment,
-            )
-            saved += 1
-
-    return {"saved": saved, "errors": errors}
+# Summary matrices: 30-minute TTL (includes live PostgreSQL building blocks)
+summary_cache = HybridCacheStore(ttl_seconds=1800)
