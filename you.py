@@ -1,11 +1,12 @@
-                    FROM shipment_audit_history
-                    WHERE snapshot_id = %s
-                      AND value_id IS NOT NULL
-                      AND value_id IN (
-                          SELECT v2.value_id
-                          FROM shipment_planning_values v2
-                          JOIN shipment_planning_rows r2 ON v2.row_id = r2.row_id
-                          WHERE r2.snapshot_id = %s
-                            AND r2.building_block_id = %s
-                      )
-                    GROUP BY value_id
+_LAST_CONTEXT_FINGERPRINT: Dict[str, Any] = {"key": None, "ts": 0.0}
+
+
+def _is_duplicate_refresh(cache_key: str, debounce_ms: float = 150.0) -> bool:
+    """Return True if the same context was processed within debounce_ms."""
+    now = time.time()
+    if (_LAST_CONTEXT_FINGERPRINT["key"] == cache_key
+            and (now - _LAST_CONTEXT_FINGERPRINT["ts"]) * 1000 < debounce_ms):
+        return True
+    _LAST_CONTEXT_FINGERPRINT["key"] = cache_key
+    _LAST_CONTEXT_FINGERPRINT["ts"] = now
+    return False
