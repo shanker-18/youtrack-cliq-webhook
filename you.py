@@ -1,7 +1,2 @@
-def _get_mutation_year_idx(refresh_trigger: Any) -> Optional[int]:
-    """Extract which year (1 or 2) was mutated, or None if full refresh needed."""
-    if not isinstance(refresh_trigger, dict):
-        return None
-    if refresh_trigger.get("trigger") not in ("cell_edit",):
-        return None
-    return refresh_trigger.get("year_idx")
+            year_idx = 1 if cell_year <= (cell_year if month_num <= 12 else cell_year) else 2
+            out_grid = {"trigger": "cell_edit", "timestamp": time.time(), "row_id": row_id, "year_idx": year_idx}
