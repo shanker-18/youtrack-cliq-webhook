@@ -1,12 +1,7 @@
-_LAST_CONTEXT_FINGERPRINT: Dict[str, Any] = {"key": None, "ts": 0.0}
+    cache_key = f"{domain}:{snapshot_id}:{building_block_id}:{model_id}:{year}:{is_editable}:{plan_type}:{is_historical}:{is_demand}"
 
+    if _is_duplicate_refresh(cache_key):
+        return (no_update, no_update, no_update, no_update, no_update, no_update)
 
-def _is_duplicate_refresh(cache_key: str, debounce_ms: float = 150.0) -> bool:
-    """Return True if the same context was processed within debounce_ms."""
-    now = time.time()
-    if (_LAST_CONTEXT_FINGERPRINT["key"] == cache_key
-            and (now - _LAST_CONTEXT_FINGERPRINT["ts"]) * 1000 < debounce_ms):
-        return True
-    _LAST_CONTEXT_FINGERPRINT["key"] = cache_key
-    _LAST_CONTEXT_FINGERPRINT["ts"] = now
-    return False
+    # If cached and not explicitly bypassed by a fresh mutation event
+    is_mutation_refresh = isinstance(refresh_trigger, dict) and bool(refresh_trigger.get("trigger"))
