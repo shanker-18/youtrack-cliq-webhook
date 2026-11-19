@@ -7,6 +7,5 @@
                           JOIN consumption_planning_rows r2 ON v2.row_id = r2.row_id
                           WHERE r2.snapshot_id = %s
                             AND r2.building_block_id = %s
-                            AND r2.model_id = %s
                       )
                     GROUP BY value_id
