@@ -1,11 +1,21 @@
-def _get_or_compute_summary_matrix(
-    domain: str, clean_models: list[str], cache_key: str
-) -> tuple[dict[str, Any], bool]:
-    """Retrieve matrix data from server cache or compute and store."""
-    cached = summary_cache.get(cache_key)
-    if cached is not None:
-        return cached, True
+# ─── Snowflake Warehouse Pre-Warming ─────────────────────────────────────────
+# Establish Snowflake connection at startup so the warehouse is awake
+# before any user hits Summary or Validation dashboards.
+try:
+    import threading as _sf_threading
+    from services.validation_service import get_snowflake_connection
 
-    matrix_data = _compute_summary_matrix_for_domain(domain, clean_models)
-    summary_cache.set(cache_key, matrix_data)
-    return matrix_data, False
+    def _warm_snowflake():
+        try:
+            conn = get_snowflake_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT 1")
+            cur.close()
+        except Exception:
+            pass
+
+    _sf_thread = _sf_threading.Thread(target=_warm_snowflake, daemon=True)
+    _sf_thread.start()
+    logger.info("Snowflake warehouse pre-warm initiated")
+except Exception as _sf_init_err:
+    logger.warning("Snowflake will be initialized on first request: %s", _sf_init_err)
