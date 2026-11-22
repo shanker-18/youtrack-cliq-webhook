@@ -1,22 +1,39 @@
-def clear_summary_cache() -> None:
-    """Clears the server-side summary cache and triggers background re-computation."""
-    import threading
-    stale_keys = list(_SUM_SNOWFLAKE_CACHE.keys())
-    _SUM_SNOWFLAKE_CACHE.clear()
-    _SUM_SNOWFLAKE_CACHE_TS.clear()
+# ─── Snowflake & Summary Cache Keep-Alive ────────────────────────────────────
+try:
+    import threading as _sf_threading
+    from services.validation_service import get_snowflake_connection
 
-    def _recompute():
-        for key in stale_keys:
+    def _snowflake_keep_alive():
+        import time as _time
+        # Warm Snowflake warehouse
+        try:
+            conn = get_snowflake_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT 1")
+            cur.close()
+            logger.info("Snowflake warehouse warmed up")
+        except Exception:
+            pass
+        # Pre-compute default summary cache on startup
+        try:
+            from services.summary_calculations import compute_consumption_summary_matrix
+            compute_consumption_summary_matrix(["Children's Motrin"])
+            logger.info("Default summary cache pre-warmed at startup")
+        except Exception:
+            pass
+        # Keep-alive loop
+        while True:
+            _time.sleep(300)
             try:
-                parts = key.split(":")
-                domain = parts[0].lower() if parts else "consumption"
-                models_str = parts[-1] if len(parts) >= 2 else ""
-                models = [m.strip() for m in models_str.split(",") if m.strip()]
-                if models:
-                    matrix = _compute_summary_matrix_for_domain(domain, models)
-                    _SUM_SNOWFLAKE_CACHE[key] = matrix
-                    _SUM_SNOWFLAKE_CACHE_TS[key] = time.monotonic()
+                conn = get_snowflake_connection()
+                cur = conn.cursor()
+                cur.execute("SELECT 1")
+                cur.close()
             except Exception:
                 pass
 
-    threading.Thread(target=_recompute, daemon=True).start()
+    _sf_thread = _sf_threading.Thread(target=_snowflake_keep_alive, daemon=True)
+    _sf_thread.start()
+    logger.info("Snowflake keep-alive thread started")
+except Exception as _sf_init_err:
+    logger.warning("Keep-alive could not start: %s", _sf_init_err)
