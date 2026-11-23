@@ -1,41 +1,810 @@
-def _matches_shipment_keyword(c_key: str, c_db: str, c_code: str) -> bool:
-    """Check if any known shipment keyword matches between key and DB name/code."""
-    keywords = ["LIQUIDAT", "SUPPLY", "RETAIL", "DISTRIB", "INNOVAT", "TRADE", "CLUB"]
-    return any(kw in c_key and (kw in c_db or kw in c_code) for kw in keywords)
+# pylint: disable=too-many-lines,too-many-return-statements,too-many-locals,broad-except
+"""
+NA IBP Planning Application -- Variance Dashboard Callbacks
+==========================================================
+Handles all interactive callbacks for the Variance Dashboard:
+- 2-Domain card toggling (Consumption Variance, Shipment Variance) in Left Sidebar
+- Baseline comparison mode selector (IBP [default] vs BP) next to Model
+- Cascading hierarchy in native Dash HTML (Squad -> Peach Model) governed by active AD Group
+- Pure HTML dropdown menu toggles via fast clientside callback (<1ms)
+"""
+import os
+import time
+from datetime import date
+from typing import Optional, Dict, Any, List, Tuple
+import psycopg2
+from dash import callback, clientside_callback, Output, Input, State, callback_context, no_update, html, ALL
+from services.kv_calendar import KenvueCalendar
+from services.variance_calculations import (
+    compute_consumption_variance_matrix,
+    compute_shipment_variance_matrix,
+)
+from repositories.hierarchy_repository import (
+    get_squads_by_gbu,
+    get_models_by_squad,
+)
+from repositories.security_repository import get_ad_group_mapping
+from callbacks.filter_callbacks import AD_PERSONAS
+from components.variance_grid import render_variance_matrix_table
+from pages.variance import (
+    build_var_ad_switcher_menu_items,
+    build_var_squad_menu_items,
+    build_var_model_menu_items,
+    build_var_mode_menu_items,
+    format_var_squad_pill_label,
+    format_var_model_pill_label,
+    render_empty_selection_card,
+    TILE_ACTIVE_STYLE,
+    TILE_INACTIVE_STYLE,
+)
+from utils.constants import GBU_PAIN_CARE
+from utils.logger import get_logger
+from auth.session import get_current_user, set_user_session
+
+logger = get_logger(__name__)
+_SELECT_MODEL = "Select Model"
+_SELECT_SQUAD = "Select Squad"
 
 
-def _matches_shipment_fallback(c_key: str, c_disp: str, c_db: str, c_code: str) -> bool:
-    """Fallback fuzzy matching between cleaned tokens."""
-    if c_key in c_db or c_disp in c_db:
-        return True
-    if c_db and (c_db in c_key or c_db in c_disp):
-        return True
-    if c_code and (c_key in c_code or c_code in c_key):
-        return True
-    return False
+def _build_variance_user_identity_elem(persona_email: str) -> list:
+    user = get_current_user() or {}
+    user_name = user.get("display_name", "")
+    user_email = user.get("email") or persona_email
+    if not user_name and user_email:
+        user_name = user_email.split("@")[0].replace(".", " ").title()
+    elif not user_name:
+        user_name = "User"
+    return [
+        html.Span(user_name, className="fw-bold text-dark lh-sm", style={"fontSize": "12px"}),
+        html.Span(user_email, className="text-muted lh-sm", style={"fontSize": "11px"}),
+    ]
 
 
-def _matches_shipment_driver(
-    db_name: str,
-    grp: str,
-    disp_name: str,
-    match_key: str,
-    db_section: str = "",
-    db_code: str = "",
-) -> bool:
-    """Matches a PostgreSQL building block (by section, code, and name) to a defined dashboard driver."""
-    c_db = _clean_token(db_name)
-    c_disp = _clean_token(disp_name)
-    c_key = _clean_token(match_key)
-    c_sec = _clean_token(db_section)
-    c_code = _clean_token(db_code)
-    c_grp = _clean_token(grp)
-    if not c_db and not c_code:
+_VAR_CACHE: Dict[str, Dict[str, Any]] = {}
+_VAR_CACHE_TS: Dict[str, float] = {}
+_VAR_CACHE_TTL_SECONDS = 86400.0
+
+
+def _get_var_fiscal_context() -> tuple[str, str]:
+    """Return (cache_fiscal_tag, live_fiscal_badge_text) derived dynamically from KenvueCalendar."""
+    today_dt = date.today()
+    env_year = os.getenv("IBP_PLAN_YEAR")
+    try:
+        d_info = KenvueCalendar.get_date_info(today_dt)
+        plan_yr = int(env_year) if (env_year and env_year.isdigit()) else d_info.kv_year
+        fiscal_tag = f"{plan_yr}:{d_info.kv_mo_id}"
+        badge_text = f"Fiscal: {d_info.kv_month_abbr} {plan_yr}"
+        return fiscal_tag, badge_text
+    except Exception:
+        yr_str = env_year if (env_year and env_year.isdigit()) else today_dt.strftime("%Y")
+        return f"{yr_str}:{today_dt.strftime('%Y-%m')}", f"Fiscal: {today_dt.strftime('%b')} {yr_str}"
+
+
+def _is_var_cache_valid(cache_key: str) -> bool:
+    """Check whether cached Variance matrix entry exists and is within TTL."""
+    if cache_key not in _VAR_CACHE:
         return False
-    if c_sec and c_sec != c_grp:
+    ts = _VAR_CACHE_TS.get(cache_key, 0.0)
+    if (time.monotonic() - ts) > _VAR_CACHE_TTL_SECONDS:
+        _VAR_CACHE.pop(cache_key, None)
+        _VAR_CACHE_TS.pop(cache_key, None)
         return False
-    if c_disp == "OTHER":
-        return _matches_other_shipment_driver(c_db, c_code, c_sec, c_key, grp)
-    if _matches_shipment_keyword(c_key, c_db, c_code):
-        return True
-    return _matches_shipment_fallback(c_key, c_disp, c_db, c_code)
+    return True
+
+
+def clear_variance_cache() -> None:
+    """Clears the server-side variance cache and triggers background re-computation."""
+    import threading
+    stale_keys = list(_VAR_CACHE.keys())
+    _VAR_CACHE.clear()
+    _VAR_CACHE_TS.clear()
+
+    def _recompute():
+        for key in stale_keys:
+            try:
+                parts = key.split(":")
+                mode = parts[0] if parts else "IBP"
+                domain = parts[1].lower() if len(parts) >= 2 else "consumption"
+                models_str = parts[-1] if len(parts) >= 4 else ""
+                models = [m.strip() for m in models_str.split(",") if m.strip()]
+                if models:
+                    if domain == "shipment":
+                        matrix = compute_shipment_variance_matrix(models, comparison_mode=mode)
+                    else:
+                        matrix = compute_consumption_variance_matrix(models, comparison_mode=mode)
+                    _VAR_CACHE[key] = matrix
+                    _VAR_CACHE_TS[key] = time.monotonic()
+            except Exception:
+                pass
+
+    threading.Thread(target=_recompute, daemon=True).start()
+
+
+# --- 0. Pure HTML Dropdown Menu Open/Close State Manager (Clientside) ---------
+clientside_callback(
+    """
+    function(n_ad, n_squad, n_model, n_mode,
+             ad_clicks, squad_clicks, model_clicks, mode_clicks,
+             action_clicks, squad_action_clicks, currentOpen) {
+        var MENU_MAP = {
+            "btn-var-ad-group-switcher": { key: "ad",    menuId: "menu-var-ad-switcher", baseCls: "header-dropdown-menu" },
+            "pill-var-squad":            { key: "squad", menuId: "menu-var-squad",       baseCls: "sidebar-dropdown-menu" },
+            "pill-var-model":            { key: "model", menuId: "menu-var-model",       baseCls: "sidebar-dropdown-menu" },
+            "pill-var-mode":             { key: "mode",  menuId: "menu-var-mode",        baseCls: "sidebar-dropdown-menu" }
+        };
+        var ALL_MENUS = [
+            { id: "menu-var-ad-switcher", baseCls: "header-dropdown-menu",  key: "ad" },
+            { id: "menu-var-squad",       baseCls: "sidebar-dropdown-menu", key: "squad" },
+            { id: "menu-var-model",       baseCls: "sidebar-dropdown-menu", key: "model" },
+            { id: "menu-var-mode",        baseCls: "sidebar-dropdown-menu", key: "mode" }
+        ];
+        var ctx = window.dash_clientside.callback_context;
+        if (!ctx || !ctx.triggered || ctx.triggered.length === 0) {
+            return window.dash_clientside.no_update;
+        }
+        var clickTrigger = ctx.triggered.find(function(t) {
+            return t.value !== null && t.value !== undefined && t.value > 0;
+        });
+        if (!clickTrigger) {
+            return window.dash_clientside.no_update;
+        }
+        var triggeredId = clickTrigger.prop_id.split(".")[0];
+        var parsedId = null;
+        try { parsedId = JSON.parse(triggeredId); } catch(e) {}
+        var newOpenKey = null;
+        if (parsedId && typeof parsedId === "object" && parsedId.type) {
+            if (parsedId.type === "var-model-select-item") {
+                newOpenKey = "model";
+                var mBodySel = document.getElementById("var-model-dropdown-body");
+                if (mBodySel) { window._varModelScroll = mBodySel.scrollTop; }
+            } else if (parsedId.type === "var-model-action") {
+                if (parsedId.action === "apply") {
+                    newOpenKey = null;
+                    window._varModelScroll = 0;
+                } else if (parsedId.action === "reset") {
+                    newOpenKey = "model";
+                    window._varModelScroll = 0;
+                    var mBodyRst = document.getElementById("var-model-dropdown-body");
+                    if (mBodyRst) { mBodyRst.scrollTop = 0; }
+                } else {
+                    newOpenKey = "model";
+                    var mBodyAct = document.getElementById("var-model-dropdown-body");
+                    if (mBodyAct) { window._varModelScroll = mBodyAct.scrollTop; }
+                }
+            } else if (parsedId.type === "var-squad-select-item") {
+                newOpenKey = "squad";
+                var sBodySel = document.getElementById("var-squad-dropdown-body");
+                if (sBodySel) { window._varSquadScroll = sBodySel.scrollTop; }
+            } else if (parsedId.type === "var-squad-action") {
+                if (parsedId.action === "apply") {
+                    newOpenKey = null;
+                    window._varSquadScroll = 0;
+                } else if (parsedId.action === "reset") {
+                    newOpenKey = "squad";
+                    window._varSquadScroll = 0;
+                    var sBodyRst = document.getElementById("var-squad-dropdown-body");
+                    if (sBodyRst) { sBodyRst.scrollTop = 0; }
+                } else {
+                    newOpenKey = "squad";
+                    var sBodyAct = document.getElementById("var-squad-dropdown-body");
+                    if (sBodyAct) { window._varSquadScroll = sBodyAct.scrollTop; }
+                }
+            } else {
+                newOpenKey = null;
+            }
+        } else {
+            var entry = MENU_MAP[triggeredId];
+            if (entry) {
+                newOpenKey = (currentOpen === entry.key) ? null : entry.key;
+                if (newOpenKey === "squad" && currentOpen !== "squad") {
+                    window._varSquadScroll = 0;
+                    var sBodyOpen = document.getElementById("var-squad-dropdown-body");
+                    if (sBodyOpen) { sBodyOpen.scrollTop = 0; }
+                }
+                if (newOpenKey === "model" && currentOpen !== "model") {
+                    window._varModelScroll = 0;
+                    var mBodyOpen = document.getElementById("var-model-dropdown-body");
+                    if (mBodyOpen) { mBodyOpen.scrollTop = 0; }
+                }
+            }
+        }
+        ALL_MENUS.forEach(function(m) {
+            var el = document.getElementById(m.id);
+            if (!el) return;
+            var shouldShow = (newOpenKey === m.key);
+            el.className = shouldShow ? m.baseCls + " show" : m.baseCls;
+        });
+        return [
+            newOpenKey,
+            ALL_MENUS[0].baseCls + (newOpenKey === "ad"    ? " show" : ""),
+            ALL_MENUS[1].baseCls + (newOpenKey === "squad" ? " show" : ""),
+            ALL_MENUS[2].baseCls + (newOpenKey === "model" ? " show" : ""),
+            ALL_MENUS[3].baseCls + (newOpenKey === "mode"  ? " show" : "")
+        ];
+    }
+    """,
+    Output("var-open-menu-store", "data"),
+    Output("menu-var-ad-switcher", "className"),
+    Output("menu-var-squad", "className"),
+    Output("menu-var-model", "className"),
+    Output("menu-var-mode", "className"),
+    Input("btn-var-ad-group-switcher", "n_clicks"),
+    Input("pill-var-squad", "n_clicks"),
+    Input("pill-var-model", "n_clicks"),
+    Input("pill-var-mode", "n_clicks"),
+    Input({"type": "var-ad-select-item", "key": ALL}, "n_clicks"),
+    Input({"type": "var-squad-select-item", "name": ALL, "disp": ALL}, "n_clicks"),
+    Input({"type": "var-model-select-item", "id": ALL, "name": ALL}, "n_clicks"),
+    Input({"type": "var-mode-select-item", "mode": ALL}, "n_clicks"),
+    Input({"type": "var-model-action", "action": ALL}, "n_clicks"),
+    Input({"type": "var-squad-action", "action": ALL}, "n_clicks"),
+    State("var-open-menu-store", "data"),
+    prevent_initial_call=True,
+)
+
+
+def _normalize_squad_list(active_squads: str | list[str] | None) -> list[str]:
+    if not active_squads:
+        return []
+    if isinstance(active_squads, str):
+        return [active_squads] if active_squads != _SELECT_SQUAD else []
+    return [str(s) for s in active_squads if s and str(s) != _SELECT_SQUAD]
+
+
+def _normalize_model_list(models: str | list[str] | None) -> list[str]:
+    if not models:
+        return []
+    if isinstance(models, str):
+        return [models] if models != _SELECT_MODEL else []
+    return [str(m) for m in models if m and str(m) != _SELECT_MODEL]
+
+
+def _pick_active_models(
+    current_model: str | list[str] | None,
+    avail_models: List[Dict[str, Any]],
+    all_models: List[Dict[str, Any]],
+) -> Tuple[List[str], Optional[int]]:
+    curr_list = _normalize_model_list(current_model)
+    pool = avail_models or all_models
+    pool_names = {m["model_name"].upper(): m for m in pool if m.get("model_name")}
+    matched = [m for m in curr_list if m.upper() in pool_names]
+    if matched:
+        first_m = pool_names[matched[0].upper()]
+        return matched, first_m.get("model_id")
+    if pool:
+        first = pool[0]
+        return [first["model_name"]], first.get("model_id")
+    return [], None
+
+
+def _safe_get_squads_by_gbu(gbu_codes: list) -> list:
+    try:
+        return get_squads_by_gbu(gbu_codes) or []
+    except (psycopg2.Error, KeyError, IndexError, ValueError):
+        return []
+
+
+def _get_models_for_squads(squad_names: List[str], gbu_codes: Optional[list]) -> List[Dict[str, Any]]:
+    clean_squads = [s for s in squad_names if s and s != _SELECT_SQUAD]
+    if not clean_squads:
+        return []
+    combined = []
+    seen = set()
+    for s_name in clean_squads:
+        try:
+            m_list = get_models_by_squad(s_name, gbu_codes) or []
+            for m in m_list:
+                m_id = m.get("model_id")
+                if m_id not in seen:
+                    seen.add(m_id)
+                    combined.append(m)
+        except (psycopg2.Error, KeyError, IndexError, ValueError):
+            pass
+    return combined
+
+
+def _resolve_var_squad_selection(gbu_codes: list, current_squad: Any) -> Tuple[list, str, list]:
+    squad_rows = _safe_get_squads_by_gbu(gbu_codes)
+    default_gbu = gbu_codes[0] if gbu_codes else ""
+    squad_list = [
+        {
+            "squad_name": s["squad_name"],
+            "display_name": s["squad_name"].title(),
+            "gbu": s.get("gbu_code", default_gbu),
+            "gbu_short": (s.get("gbu_name", "")).split()[0].title() if s.get("gbu_name") else "",
+        }
+        for s in squad_rows
+    ]
+    curr_list = _normalize_squad_list(current_squad)
+    avail_names = {s["squad_name"].upper(): s["squad_name"] for s in squad_list}
+    matched = [avail_names[s.upper()] for s in curr_list if s.upper() in avail_names]
+    active_squads = matched if matched else ([squad_list[0]["squad_name"]] if squad_list else [])
+    squad_disp = format_var_squad_pill_label(active_squads, total_squads=len(squad_list))
+    squad_items = build_var_squad_menu_items(squad_list, active_squad_name=active_squads)
+    return active_squads, squad_disp, squad_items
+
+
+def _resolve_var_model_selection(
+    active_squads: list, gbu_codes: list, domain: str, current_model: Any
+) -> Tuple[list, Optional[int], list, str]:
+    flag_key = "has_shipment" if domain == "shipment" else "has_pos"
+    all_models = _get_models_for_squads(active_squads, gbu_codes)
+    avail_models = [m for m in all_models if m.get(flag_key)]
+    display_pool = avail_models or all_models
+    active_models, primary_id = _pick_active_models(current_model, avail_models, all_models)
+    pill_lbl = format_var_model_pill_label(active_models, total_models=len(display_pool))
+    model_items = build_var_model_menu_items(
+        display_pool,
+        active_model_name=active_models,
+        has_squad=bool(active_squads),
+    )
+    return active_models, primary_id, model_items, pill_lbl
+
+
+def _resolve_staging_gbu_codes(persona_key: Optional[str]) -> list:
+    persona = AD_PERSONAS.get(persona_key, AD_PERSONAS["COM-APP-NA-IBP-SELFCARE"])
+    mapping = get_ad_group_mapping([persona_key]) if persona_key else None
+    return mapping["gbu_codes"] if mapping and mapping.get("gbu_codes") else persona["gbus"]
+
+
+def _is_staging_callback_active(select_clicks: Any, action_clicks: Any, trig: Any) -> bool:
+    has_sel = any(c for c in (select_clicks or []) if c)
+    has_act = any(c for c in (action_clicks or []) if c)
+    return bool((has_sel or has_act) and isinstance(trig, dict))
+
+
+def _get_staging_squads_list(staging_store: Any, committed_squad: Any) -> List[str]:
+    if staging_store is not None:
+        return _normalize_squad_list(staging_store)
+    return _normalize_squad_list(committed_squad)
+
+
+def _get_staging_models_list(staging_store: Any, committed_model: Any) -> List[str]:
+    if staging_store is not None:
+        return _normalize_model_list(staging_store)
+    return _normalize_model_list(committed_model)
+
+
+def _build_squad_list_from_gbu(gbu_codes: list) -> list:
+    """Builds squad list dicts from GBU codes for reuse across callbacks."""
+    squad_rows = _safe_get_squads_by_gbu(gbu_codes)
+    default_gbu = gbu_codes[0] if gbu_codes else ""
+    return [
+        {
+            "squad_name": s["squad_name"],
+            "display_name": s["squad_name"].title(),
+            "gbu": s.get("gbu_code", default_gbu),
+            "gbu_short": (s.get("gbu_name", "")).split()[0].title() if s.get("gbu_name") else "",
+        }
+        for s in squad_rows
+    ]
+
+
+def _calculate_next_squad_staging(trig: dict, current_staging: List[str], all_squad_names: List[str]) -> Optional[List[str]]:
+    trig_type = trig.get("type")
+    if trig_type == "var-squad-select-item":
+        s_name = trig.get("name")
+        staging_set = {s.upper() for s in current_staging}
+        if s_name.upper() in staging_set:
+            staging_set.remove(s_name.upper())
+            return [s for s in all_squad_names if s.upper() in staging_set]
+        return current_staging + [s_name]
+    if trig_type == "var-squad-action":
+        action = trig.get("action")
+        if action == "select-all":
+            return [] if len(current_staging) == len(all_squad_names) else list(all_squad_names)
+        if action == "reset":
+            return []
+    return None
+
+
+def _calculate_next_model_staging(trig: dict, current_staging: List[str], all_avail_names: List[str]) -> Optional[List[str]]:
+    trig_type = trig.get("type")
+    if trig_type == "var-model-select-item":
+        m_name = trig.get("name")
+        staging_set = {m.upper() for m in current_staging}
+        if m_name.upper() in staging_set:
+            staging_set.remove(m_name.upper())
+            return [m for m in all_avail_names if m.upper() in staging_set]
+        return current_staging + [m_name]
+    if trig_type == "var-model-action":
+        action = trig.get("action")
+        if action == "select-all":
+            return [] if len(current_staging) == len(all_avail_names) else list(all_avail_names)
+        if action == "reset":
+            return []
+    return None
+
+
+def _resolve_available_staging_models(persona_key: Optional[str], domain: str, squad_name: Any) -> list:
+    gbu_codes = _resolve_staging_gbu_codes(persona_key)
+    squad_list = [squad_name] if isinstance(squad_name, str) else list(squad_name or [])
+    all_models = _get_models_for_squads(squad_list, gbu_codes)
+    flag_key = "has_shipment" if domain == "shipment" else "has_pos"
+    avail_models = [m for m in all_models if m.get(flag_key)]
+    return avail_models or all_models
+
+
+def _build_model_apply_session_data(
+    primary_model: str,
+    primary_squad: str,
+    avail_models: list[dict],
+    selected_models: Optional[list[str]] = None,
+    selected_squads: Optional[list[str]] = None,
+) -> dict:
+    primary_id = None
+    if primary_model:
+        matched = next((m for m in avail_models if m.get("model_name", "").upper() == primary_model.upper()), None)
+        if matched:
+            primary_id = matched.get("model_id")
+    s_mods = [str(m) for m in selected_models if m] if selected_models else ([primary_model] if primary_model else [])
+    s_sqs = [str(s) for s in selected_squads if s] if selected_squads else ([primary_squad] if primary_squad else [])
+    return {
+        "model_id": primary_id,
+        "model_name": primary_model,
+        "squad_name": primary_squad,
+        "selected_models": s_mods,
+        "selected_squads": s_sqs,
+        "source": "variance",
+    }
+
+
+# --- 1. Comparison Mode Selection (IBP vs BP) --------------------------------
+@callback(
+    Output("filter-var-mode", "data"),
+    Output("selected-var-mode-label", "children"),
+    Output("menu-var-mode", "children"),
+    Input({"type": "var-mode-select-item", "mode": ALL}, "n_clicks"),
+    State("filter-var-mode", "data"),
+    prevent_initial_call=True,
+)
+def handle_var_mode_selection(n_clicks, current_mode):
+    trig = callback_context.triggered_id
+    if not isinstance(trig, dict) or not any(c for c in (n_clicks or []) if c):
+        return no_update, no_update, no_update
+    new_mode = (trig.get("mode") or "IBP").upper()
+    if new_mode == (current_mode or "IBP").upper():
+        return no_update, no_update, no_update
+    return new_mode, new_mode, build_var_mode_menu_items(new_mode)
+
+
+# --- 2. AD Persona Switcher in Variance Dashboard ----------------------------
+@callback(
+    Output("var-header-ad-switcher", "data"),
+    Output("var-header-ad-badge", "children"),
+    Output("var-header-role-badge", "children"),
+    Output("var-header-role-badge", "color"),
+    Output("var-header-user-email", "children"),
+    Output("menu-var-ad-switcher", "children"),
+    Output("menu-var-squad", "children", allow_duplicate=True),
+    Output("selected-var-squad-label", "children", allow_duplicate=True),
+    Output("filter-var-squad", "data", allow_duplicate=True),
+    Output("menu-var-model", "children", allow_duplicate=True),
+    Output("selected-var-model-label", "children", allow_duplicate=True),
+    Output("filter-var-model", "data", allow_duplicate=True),
+    Output("session-active-ad-group-store", "data", allow_duplicate=True),
+    Output("var-model-staging-store", "data", allow_duplicate=True),
+    Output("var-squad-staging-store", "data", allow_duplicate=True),
+    Output("session-active-model-store", "data", allow_duplicate=True),
+    Input({"type": "var-ad-select-item", "key": ALL}, "n_clicks"),
+    State("var-header-ad-switcher", "data"),
+    State("filter-var-domain", "data"),
+    State("filter-var-squad", "data"),
+    State("filter-var-model", "data"),
+    prevent_initial_call=True,
+)
+def handle_var_ad_persona_selection(n_clicks, current_key, domain, current_squad, current_model):
+    trig = callback_context.triggered_id
+    if not isinstance(trig, dict) or not any(n_clicks):
+        return (no_update,) * 16
+    key = trig.get("key", "COM-APP-NA-IBP-SELFCARE")
+    if current_key and key == current_key:
+        return (no_update,) * 16
+    curr_user = get_current_user()
+    user_groups = curr_user.get("all_ad_groups", []) if curr_user else []
+    if user_groups and key not in user_groups:
+        return (no_update,) * 16
+    persona = AD_PERSONAS.get(key, AD_PERSONAS["COM-APP-NA-IBP-SELFCARE"])
+    mapping = get_ad_group_mapping([key])
+    gbu_codes = mapping["gbu_codes"] if mapping and mapping.get("gbu_codes") else persona["gbus"]
+    ad_items = build_var_ad_switcher_menu_items(active_key=key)
+    active_squads, active_squad_disp, squad_items = _resolve_var_squad_selection(gbu_codes, current_squad)
+    active_models, _, model_items, active_pill_lbl = _resolve_var_model_selection(
+        active_squads, gbu_codes, domain, current_model
+    )
+    user_email_elem = _build_variance_user_identity_elem(persona["email"])
+    session_ad_data = {"persona_key": key, "source": "variance"}
+    curr_user = get_current_user()
+    if curr_user:
+        curr_user["ad_group"] = key
+        set_user_session(curr_user)
+    p_squad = active_squads[0] if active_squads else ""
+    p_model = active_models[0] if active_models else ""
+    session_model_data = {
+        "model_id": None,
+        "model_name": p_model,
+        "squad_name": p_squad,
+        "selected_models": active_models,
+        "selected_squads": active_squads,
+        "source": "variance",
+    }
+    return (
+        key, persona["name"], persona["role_label"], persona["role_color"],
+        user_email_elem, ad_items, squad_items, active_squad_disp, active_squads,
+        model_items, active_pill_lbl, active_models, session_ad_data, None, None,
+        session_model_data,
+    )
+
+
+# --- 3. Multi-Squad Dropdown Checkbox Staging & Apply -------------------------
+@callback(
+    Output("var-squad-staging-store", "data", allow_duplicate=True),
+    Output("menu-var-squad", "children", allow_duplicate=True),
+    Input({"type": "var-squad-select-item", "name": ALL, "disp": ALL}, "n_clicks"),
+    Input({"type": "var-squad-action", "action": ALL}, "n_clicks"),
+    State("var-squad-staging-store", "data"),
+    State("filter-var-squad", "data"),
+    State("var-header-ad-switcher", "data"),
+    prevent_initial_call=True,
+)
+def handle_var_squad_staging(select_clicks, action_clicks, staging_store, committed_squad, persona_key):
+    trig = callback_context.triggered_id
+    if not _is_staging_callback_active(select_clicks, action_clicks, trig):
+        return no_update, no_update
+    gbu_codes = _resolve_staging_gbu_codes(persona_key)
+    squad_list = _build_squad_list_from_gbu(gbu_codes)
+    all_squad_names = [s["squad_name"] for s in squad_list]
+    current_staging = _get_staging_squads_list(staging_store, committed_squad)
+    new_staging = _calculate_next_squad_staging(trig, current_staging, all_squad_names)
+    if new_staging is None:
+        return no_update, no_update
+    squad_items = build_var_squad_menu_items(squad_list, active_squad_name=new_staging)
+    return new_staging, squad_items
+
+
+@callback(
+    Output("filter-var-squad", "data", allow_duplicate=True),
+    Output("selected-var-squad-label", "children", allow_duplicate=True),
+    Output("menu-var-squad", "children", allow_duplicate=True),
+    Output("var-squad-staging-store", "data", allow_duplicate=True),
+    Output("filter-var-model", "data", allow_duplicate=True),
+    Output("selected-var-model-label", "children", allow_duplicate=True),
+    Output("menu-var-model", "children", allow_duplicate=True),
+    Output("var-model-staging-store", "data", allow_duplicate=True),
+    Output("session-active-model-store", "data", allow_duplicate=True),
+    Input({"type": "var-squad-action", "action": ALL}, "n_clicks"),
+    State("var-squad-staging-store", "data"),
+    State("filter-var-squad", "data"),
+    State("filter-var-model", "data"),
+    State("var-header-ad-switcher", "data"),
+    State("filter-var-domain", "data"),
+    prevent_initial_call=True,
+)
+def handle_var_squad_apply(action_clicks, staging_store, committed_squad, current_model, persona_key, domain):
+    has_action_click = any(c for c in (action_clicks or []) if c)
+    trig = callback_context.triggered_id
+    if not isinstance(trig, dict) or trig.get("action") != "apply" or not has_action_click:
+        return (no_update,) * 9
+    gbu_codes = _resolve_staging_gbu_codes(persona_key)
+    squad_list = _build_squad_list_from_gbu(gbu_codes)
+    selected_squads = _get_staging_squads_list(staging_store, committed_squad)
+    squad_pill_lbl = format_var_squad_pill_label(selected_squads, total_squads=len(squad_list))
+    squad_items = build_var_squad_menu_items(squad_list, active_squad_name=selected_squads)
+    selected_models, primary_id, model_items, model_pill_lbl = _resolve_var_model_selection(
+        selected_squads, gbu_codes, domain, current_model
+    )
+    primary_squad = selected_squads[0] if selected_squads else ""
+    primary_model = selected_models[0] if selected_models else ""
+    session_model_data = {
+        "model_id": primary_id,
+        "model_name": primary_model,
+        "squad_name": primary_squad,
+        "selected_models": selected_models,
+        "selected_squads": selected_squads,
+        "source": "variance",
+    }
+    return (
+        selected_squads, squad_pill_lbl, squad_items, None,
+        selected_models, model_pill_lbl, model_items, None,
+        session_model_data,
+    )
+
+
+# --- 4. Multi-Model Dropdown Checkbox Staging & Apply -------------------------
+@callback(
+    Output("var-model-staging-store", "data", allow_duplicate=True),
+    Output("menu-var-model", "children", allow_duplicate=True),
+    Output("session-active-model-store", "data", allow_duplicate=True),
+    Input({"type": "var-model-select-item", "id": ALL, "name": ALL}, "n_clicks"),
+    Input({"type": "var-model-action", "action": ALL}, "n_clicks"),
+    State("var-model-staging-store", "data"),
+    State("filter-var-model", "data"),
+    State("var-header-ad-switcher", "data"),
+    State("filter-var-domain", "data"),
+    State("filter-var-squad", "data"),
+    prevent_initial_call=True,
+)
+def handle_var_model_staging(select_clicks, action_clicks, staging_store, committed_model, persona_key, domain, squad_name):
+    trig = callback_context.triggered_id
+    if not _is_staging_callback_active(select_clicks, action_clicks, trig):
+        return no_update, no_update, no_update
+    avail_models = _resolve_available_staging_models(persona_key, domain, squad_name)
+    all_avail_names = [m["model_name"] for m in avail_models if m.get("model_name")]
+    current_staging = _get_staging_models_list(staging_store, committed_model)
+    new_staging = _calculate_next_model_staging(trig, current_staging, all_avail_names)
+    if new_staging is None:
+        return no_update, no_update, no_update
+    model_items = build_var_model_menu_items(avail_models, active_model_name=new_staging)
+    session_data = no_update
+    if new_staging:
+        squad_list = [squad_name] if isinstance(squad_name, str) else list(squad_name or [])
+        session_data = _build_model_apply_session_data(
+            new_staging[0], squad_list[0] if squad_list else "",
+            avail_models, selected_models=new_staging, selected_squads=squad_list,
+        )
+    return new_staging, model_items, session_data
+
+
+@callback(
+    Output("filter-var-model", "data", allow_duplicate=True),
+    Output("selected-var-model-label", "children", allow_duplicate=True),
+    Output("session-active-model-store", "data", allow_duplicate=True),
+    Output("var-model-staging-store", "data", allow_duplicate=True),
+    Output("menu-var-model", "children", allow_duplicate=True),
+    Input({"type": "var-model-action", "action": ALL}, "n_clicks"),
+    State("var-model-staging-store", "data"),
+    State("filter-var-model", "data"),
+    State("filter-var-squad", "data"),
+    State("var-header-ad-switcher", "data"),
+    State("filter-var-domain", "data"),
+    prevent_initial_call=True,
+)
+def handle_var_model_apply(action_clicks, staging_store, committed_model, squad_name, persona_key, domain):
+    has_action_click = any(c for c in (action_clicks or []) if c)
+    trig = callback_context.triggered_id
+    if not isinstance(trig, dict) or trig.get("action") != "apply" or not has_action_click:
+        return (no_update,) * 5
+    avail_models = _resolve_available_staging_models(persona_key, domain, squad_name)
+    selected_models = _get_staging_models_list(staging_store, committed_model)
+    pill_label = format_var_model_pill_label(selected_models, total_models=len(avail_models))
+    squad_list = [squad_name] if isinstance(squad_name, str) else list(squad_name or [])
+    primary_model = selected_models[0] if selected_models else ""
+    primary_squad = squad_list[0] if squad_list else ""
+    session_model_data = _build_model_apply_session_data(
+        primary_model, primary_squad, avail_models,
+        selected_models=selected_models, selected_squads=squad_list,
+    )
+    model_items = build_var_model_menu_items(avail_models, active_model_name=selected_models)
+    return selected_models, pill_label, session_model_data, None, model_items
+
+
+# --- 5. Domain Toggle Callback (Consumption vs Shipment in Left Dock) ---------
+@callback(
+    Output("card-var-consumption", "className"),
+    Output("card-var-shipment", "className"),
+    Output("card-var-consumption", "style"),
+    Output("card-var-shipment", "style"),
+    Output("filter-var-domain", "data"),
+    Output("menu-var-model", "children", allow_duplicate=True),
+    Output("selected-var-model-label", "children", allow_duplicate=True),
+    Output("filter-var-model", "data", allow_duplicate=True),
+    Input("card-var-consumption", "n_clicks"),
+    Input("card-var-shipment", "n_clicks"),
+    State("filter-var-domain", "data"),
+    State("var-header-ad-switcher", "data"),
+    State("filter-var-squad", "data"),
+    State("filter-var-model", "data"),
+    prevent_initial_call=True,
+)
+def handle_var_domain_toggle(n_cons, n_ship, current_domain, persona_key, squad_name, current_model):
+    trig = callback_context.triggered_id
+    active_domain = "shipment" if trig == "card-var-shipment" else "consumption"
+    c_cls = "val-tile-stacked active-domain" if active_domain == "consumption" else "val-tile-stacked inactive-domain"
+    s_cls = "val-tile-stacked active-domain" if active_domain == "shipment" else "val-tile-stacked inactive-domain"
+    c_stl = TILE_ACTIVE_STYLE if active_domain == "consumption" else TILE_INACTIVE_STYLE
+    s_stl = TILE_ACTIVE_STYLE if active_domain == "shipment" else TILE_INACTIVE_STYLE
+    persona = AD_PERSONAS.get(persona_key, AD_PERSONAS["COM-APP-NA-IBP-SELFCARE"])
+    mapping = get_ad_group_mapping([persona_key]) if persona_key else None
+    gbu_codes = mapping["gbu_codes"] if mapping and mapping.get("gbu_codes") else persona["gbus"]
+    flag_key = "has_shipment" if active_domain == "shipment" else "has_pos"
+    squad_list = [squad_name] if isinstance(squad_name, str) else list(squad_name or [])
+    all_models = _get_models_for_squads(squad_list or [GBU_PAIN_CARE], gbu_codes)
+    avail_models = [m for m in all_models if m.get(flag_key)]
+    display_pool = avail_models or all_models
+    clean_models = _normalize_model_list(current_model)
+    active_models, _ = _pick_active_models(clean_models, avail_models, all_models)
+    pill_lbl = format_var_model_pill_label(active_models, total_models=len(display_pool))
+    model_items = build_var_model_menu_items(
+        display_pool, active_model_name=active_models, has_squad=bool(squad_list),
+    )
+    return c_cls, s_cls, c_stl, s_stl, active_domain, model_items, pill_lbl, active_models
+
+
+# --- 6. Automatic Data Load & Render Grid (IBP & BP) -------------------------
+def _resolve_clean_models(model: Any) -> list[str]:
+    if not model:
+        return []
+    if isinstance(model, str):
+        return [model.strip()] if model.strip() and model.strip() != _SELECT_MODEL else []
+    return [str(m).strip() for m in model if m and str(m).strip() != _SELECT_MODEL]
+
+
+@callback(
+    Output("var-grid-container", "children"),
+    Output("var-status-badge", "children"),
+    Output("ribbon-var-domain-title", "children"),
+    Output("ribbon-var-model-title", "children"),
+    Output("var-cache-store", "data"),
+    Output("var-fiscal-badge", "children"),
+    Input("filter-var-model", "data"),
+    Input("filter-var-domain", "data"),
+    Input("filter-var-squad", "data"),
+    Input("filter-var-mode", "data"),
+    State("var-cache-store", "data"),
+    prevent_initial_call=False,
+)
+def handle_var_auto_load_grid(model, domain, squad_name, mode, cache_store):
+    """Automatically calculates and renders the Variance matrix table for IBP or BP."""
+    domain = (domain or "consumption").lower()
+    mode = (mode or "IBP").upper()
+    domain_ribbon = f"{domain.upper()} VARIANCE ({mode})"
+    if model is None or squad_name is None:
+        return no_update, no_update, domain_ribbon, no_update, no_update, no_update
+    fiscal_tag, fiscal_badge = _get_var_fiscal_context()
+    squad_list = _normalize_squad_list(squad_name)
+    if not squad_list:
+        empty_card = render_empty_selection_card("squad", domain)
+        status_msg = "Please select a squad from the Squad dropdown above."
+        return empty_card, status_msg, domain_ribbon, _SELECT_SQUAD, {"status": "empty_squad"}, fiscal_badge
+    clean_models = _resolve_clean_models(model)
+    if not clean_models:
+        empty_card = render_empty_selection_card("model", domain)
+        status_msg = "Please select a model above to view variance data."
+        return empty_card, status_msg, domain_ribbon, _SELECT_MODEL, {"status": "empty_model"}, fiscal_badge
+    model_disp = clean_models[0] if len(clean_models) == 1 else f"Consolidated ({len(clean_models)} Models)"
+    cache_key = f"{mode}:{domain.upper()}:{fiscal_tag}:{','.join(sorted(clean_models)).upper()}"
+    try:
+        if _is_var_cache_valid(cache_key):
+            matrix_data = _VAR_CACHE[cache_key]
+        else:
+            if domain == "shipment":
+                matrix_data = compute_shipment_variance_matrix(clean_models, comparison_mode=mode)
+            else:
+                matrix_data = compute_consumption_variance_matrix(clean_models, comparison_mode=mode)
+            _VAR_CACHE[cache_key] = matrix_data
+            _VAR_CACHE_TS[cache_key] = time.monotonic()
+        grid_elem = render_variance_matrix_table(matrix_data, domain=domain.upper(), model_name=model_disp)
+        baseline_txt = "Current Cycle vs Annual BP" if mode == "BP" else "Current Cycle vs Prior Cycle"
+        unit_txt = "Factory POS $ and GTS $ are in millions." if domain == "shipment" else "POS $ are in millions."
+        status_text = f"{baseline_txt} | {unit_txt}"
+        return grid_elem, status_text, domain_ribbon, model_disp, {"last_loaded": cache_key}, fiscal_badge
+    except Exception as err:
+        logger.error("Error computing variance matrix (%s) for models %s in domain %s: %s", mode, clean_models, domain, err)
+        err_elem = html.Div(html.P(f"Notice: {str(err)}", className="text-danger p-4"), className="summary-grid-card")
+        return err_elem, f"Error: {str(err)[:60]}...", domain_ribbon, model_disp, {"error": str(err)[:100]}, fiscal_badge
+
+
+# --- 7. Two-Way State Persistence with Session Stores -------------------------
+@callback(
+    Output("session-active-model-store", "data", allow_duplicate=True),
+    Input("filter-var-model", "data"),
+    Input("filter-var-squad", "data"),
+    State("session-active-model-store", "data"),
+    prevent_initial_call=True,
+)
+def sync_variance_initial_model_to_session(current_model, current_squad, session_data):
+    clean_mods = _normalize_model_list(current_model)
+    clean_sqs = _normalize_squad_list(current_squad)
+    if not clean_mods and not clean_sqs:
+        return no_update
+    p_mod = clean_mods[0] if clean_mods else ""
+    p_sq = clean_sqs[0] if clean_sqs else ""
+    existing = session_data if isinstance(session_data, dict) else {}
+    return {
+        **existing,
+        "model_name": p_mod,
+        "squad_name": p_sq,
+        "selected_models": clean_mods,
+        "selected_squads": clean_sqs,
+        "source": "variance",
+    }
