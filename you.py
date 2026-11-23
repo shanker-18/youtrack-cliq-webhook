@@ -1,39 +1,10 @@
-# ─── Snowflake & Summary Cache Keep-Alive ────────────────────────────────────
-try:
-    import threading as _sf_threading
-    from services.validation_service import get_snowflake_connection
-
-    def _snowflake_keep_alive():
-        import time as _time
-        # Warm Snowflake warehouse
-        try:
-            conn = get_snowflake_connection()
-            cur = conn.cursor()
-            cur.execute("SELECT 1")
-            cur.close()
-            logger.info("Snowflake warehouse warmed up")
-        except Exception:
-            pass
-        # Pre-compute default summary cache on startup
-        try:
-            from services.summary_calculations import compute_consumption_summary_matrix
-            compute_consumption_summary_matrix(["Children's Motrin"])
-            logger.info("Default summary cache pre-warmed at startup")
-        except Exception:
-            pass
-        # Keep-alive loop
-        while True:
-            _time.sleep(300)
-            try:
-                conn = get_snowflake_connection()
-                cur = conn.cursor()
-                cur.execute("SELECT 1")
-                cur.close()
-            except Exception:
-                pass
-
-    _sf_thread = _sf_threading.Thread(target=_snowflake_keep_alive, daemon=True)
-    _sf_thread.start()
-    logger.info("Snowflake keep-alive thread started")
-except Exception as _sf_init_err:
-    logger.warning("Keep-alive could not start: %s", _sf_init_err)
+def _parse_batch_cell(c: dict) -> Optional[Tuple]:
+    """Parse and validate a single cell for batch save. Returns (rid, period, old, new) or None on error."""
+    try:
+        old_val = round(float(str(c.get("old_val", "0")).replace(",", "")), 2)
+        new_val = round(float(str(c.get("new_val", "0")).replace(",", "")), 2)
+        period_month = datetime.strptime(c["period_iso"], "%Y-%m-%d").date()
+        rid = int(c["row_id"]) if str(c["row_id"]).isdigit() else c["row_id"]
+    except (ValueError, TypeError, KeyError):
+        return None
+    return rid, period_month, old_val, new_val
