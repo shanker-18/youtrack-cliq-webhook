@@ -1,5 +1,2 @@
-            dcc.Link(
-                "Variance",
-                href=VARIANCE_ROUTE,
-                className=f"nav-segmented-item{' active' if active_page == 'variance' else ''}",
-            ),
+        elif page == "variance":
+            badge_id = "var-header-role-badge"
