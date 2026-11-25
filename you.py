@@ -1,6 +1,12 @@
-    if matched:
-        active_squads = matched
-    elif squad_list:
-        active_squads = [squad_list[0]["squad_name"]]
+    if selected_models:
+        s_mods = [str(m) for m in selected_models if m]
+    elif primary_model:
+        s_mods = [primary_model]
     else:
-        active_squads = []
+        s_mods = []
+    if selected_squads:
+        s_sqs = [str(s) for s in selected_squads if s]
+    elif primary_squad:
+        s_sqs = [primary_squad]
+    else:
+        s_sqs = []
