@@ -1,12 +1,13 @@
-    if selected_models:
-        s_mods = [str(m) for m in selected_models if m]
-    elif primary_model:
-        s_mods = [primary_model]
-    else:
-        s_mods = []
-    if selected_squads:
-        s_sqs = [str(s) for s in selected_squads if s]
-    elif primary_squad:
-        s_sqs = [primary_squad]
-    else:
-        s_sqs = []
+        if s_sqs:
+            target_squads = s_sqs
+        elif session_model.get("squad_name"):
+            target_squads = [session_model.get("squad_name")]
+        else:
+            target_squads = current_squad
+        s_mods = session_model.get("selected_models")
+        if s_mods:
+            target_models = s_mods
+        elif session_model.get("model_name"):
+            target_models = [session_model.get("model_name")]
+        else:
+            target_models = current_model
