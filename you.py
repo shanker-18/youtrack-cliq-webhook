@@ -40,3 +40,44 @@ def _assemble_variance_sync_outputs(new_ad, persona, gbu_codes, target_squad, ta
         user_email_elem, ad_items, active_squad, active_squad_disp, squad_items,
         active_models, active_model_lbl, model_items, None, None,
     )
+
+
+@callback(
+    Output("var-header-ad-switcher", "data", allow_duplicate=True),
+    Output("var-header-ad-badge", "children", allow_duplicate=True),
+    Output("var-header-role-badge", "children", allow_duplicate=True),
+    Output("var-header-role-badge", "color", allow_duplicate=True),
+    Output("var-header-user-email", "children", allow_duplicate=True),
+    Output("menu-var-ad-switcher", "children", allow_duplicate=True),
+    Output("filter-var-squad", "data", allow_duplicate=True),
+    Output("selected-var-squad-label", "children", allow_duplicate=True),
+    Output("menu-var-squad", "children", allow_duplicate=True),
+    Output("filter-var-model", "data", allow_duplicate=True),
+    Output("selected-var-model-label", "children", allow_duplicate=True),
+    Output("menu-var-model", "children", allow_duplicate=True),
+    Output("var-model-staging-store", "data", allow_duplicate=True),
+    Output("var-squad-staging-store", "data", allow_duplicate=True),
+    Input("url", "pathname"),
+    Input("session-active-model-store", "data"),
+    Input("session-active-ad-group-store", "data"),
+    State("var-header-ad-switcher", "data"),
+    State("filter-var-squad", "data"),
+    State("filter-var-model", "data"),
+    State("filter-var-domain", "data"),
+    prevent_initial_call="initial_duplicate",
+)
+def sync_session_to_variance(pathname, session_model, session_ad, current_ad, current_squad, current_model, domain):
+    """Synchronize model and AD group from other pages to Variance Dashboard."""
+    if not pathname or not pathname.startswith("/variance"):
+        return (no_update,) * 14
+    if not session_model and not session_ad:
+        return (no_update,) * 14
+    resolved = _build_variance_sync_result(
+        session_model, session_ad, current_ad, current_squad, current_model, domain
+    )
+    if resolved is None:
+        return (no_update,) * 14
+    new_ad, persona, gbu_codes, target_squad, target_model = resolved
+    return _assemble_variance_sync_outputs(
+        new_ad, persona, gbu_codes, target_squad, target_model, domain
+    )
